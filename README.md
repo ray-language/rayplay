@@ -63,7 +63,8 @@ destino y Run (la primera vez, el equipo de firma en `RayPlay-ios/App.xcconfig` 
 development_team`). Tras un cambio en `src/` o `www/`, basta `make ios-lib` y Run.
 
 **La prueba**: Play, cambiar de app (o bloquear el teléfono) y esperar; al volver, el display
-dice cuánto sonó en segundo plano y la posición ha avanzado.
+dice cuánto sonó en segundo plano y la posición ha avanzado. Verificada en un iPhone real y en
+el emulador Android.
 
 ## Estado
 
@@ -73,7 +74,7 @@ dice cuánto sonó en segundo plano y la posición ha avanzado.
 | Programa completo | `ray run` headless: monta `www/` y abre `ray://app/index.html` |
 | iOS | simulador iPhone 16 Pro (`ray bundle --ios --ios-target sim`, shell 1.27.19 con sesión `playback` y `UIBackgroundModes = audio`): arranca, la página llega por `ray://app`, el puente responde y el display muestra el `lifecycle` del shell; `audio.open` abre el dispositivo dentro del shell (comprobado con una mini app) |
 | Android | emulador arm64 (`ray bundle --android`, shell 1.27.19 con *foreground service* `mediaPlayback`): Play por `adb`, Home durante 10 s, vuelta: la posición pasó de 0:05 a 0:17 y el display dice «played in the background: 0:09». **El audio sigue en segundo plano** |
-| Segundo plano en iPhone real | **pendiente**: es lo que esta app existe para probar |
+| Segundo plano en iPhone real | **verificado** (29 sep 2026): Play, cambio de app, vuelta: el audio sigue y el display muestra lo reproducido en segundo plano |
 
 ## Limitaciones
 
