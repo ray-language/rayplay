@@ -1,0 +1,68 @@
+// Renders assets/icon.png (1024×1024 RGBA): a dark rounded tile with an orange play mark.
+//
+//   ray run scripts/make-icon.ray
+
+import std/fs;
+import std/image;
+
+const SIZE: int = 1024;
+
+fn inside_triangle(x: int, y: int) -> bool {
+    // A play triangle: left edge at x = 380, tip at (720, 512), from y = 300 to 724.
+    let dx = x - 380;
+    let dy = if (y < 512) { 512 - y } else { y - 512 };
+    dx >= 0 && dx <= 340 && dy * 340 <= (340 - dx) * 212
+}
+
+fn inside_tile(x: int, y: int) -> bool {
+    // Rounded corners with radius 180, as the iOS mask expects a full square anyway.
+    let r = 180;
+    let cx = if (x < r) { r - x } else if (x >= SIZE - r) { x - (SIZE - r - 1) } else { 0 };
+    let cy = if (y < r) { r - y } else if (y >= SIZE - r) { y - (SIZE - r - 1) } else { 0 };
+    cx * cx + cy * cy <= r * r
+}
+
+fn main() -> int {
+    var px: [int] = [];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            if (!inside_tile(x, y)) {
+                px.push(0);
+                px.push(0);
+                px.push(0);
+                px.push(0);
+            } else if (inside_triangle(x, y)) {
+                px.push(255);
+                px.push(140);
+                px.push(66);
+                px.push(255);
+            } else {
+                // A subtle vertical gradient over the dark panel color.
+                let shade = 16 + y * 12 / SIZE;
+                px.push(shade);
+                px.push(shade + 4);
+                px.push(shade + 8);
+                px.push(255);
+            }
+        }
+    }
+    let img = image.Image { width: SIZE, height: SIZE, pixels: bytes_of(px) };
+    match (image.encode_png(img)) {
+        Result.Ok(png) => {
+            match (fs.write_file_bytes("assets/icon.png", png)) {
+                Result.Ok(_) => {
+                    print("assets/icon.png: " + to_string(png.len()) + " bytes");
+                    0
+                },
+                Result.Err(e) => {
+                    eprint("make-icon: " + e);
+                    1
+                },
+            }
+        },
+        Result.Err(e) => {
+            eprint("make-icon: " + e);
+            1
+        },
+    }
+}

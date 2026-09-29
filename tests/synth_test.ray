@@ -1,0 +1,45 @@
+import synth;
+import wav;
+
+@test
+fn a_chunk_has_frames_times_channels_times_two_bytes() {
+    let t = synth.builtin()[0];
+    let c = synth.chunk(t, 0, 441, 80);
+    assert_eq(c.len(), 441 * 2 * 2);
+}
+
+@test
+fn past_the_end_a_chunk_is_silence() {
+    let t = synth.builtin()[2];
+    let c = synth.chunk(t, synth.total_frames(t), 10, 100);
+    assert_eq(c.len(), 40);
+    for i in 0..c.len() {
+        assert_eq(c[i], 0);
+    }
+}
+
+@test
+fn volume_zero_is_silence_and_full_volume_is_not() {
+    let t = synth.builtin()[1];
+    let quiet = synth.chunk(t, 44100, 100, 0);
+    var loud_energy = 0;
+    let loud = synth.chunk(t, 44100, 100, 100);
+    for i in 0..quiet.len() {
+        assert_eq(quiet[i], 0);
+        loud_energy = loud_energy + loud[i];
+    }
+    assert(loud_energy > 0);
+}
+
+@test
+fn a_loaded_wav_plays_its_own_samples_scaled() {
+    // One stereo frame at +16384 / -16384, at full volume comes back unchanged.
+    let p = wav.Pcm { rate: 8000, channels: 2, data: bytes_of([0, 64, 0, 192]) };
+    let t = synth.loaded("t", p);
+    assert_eq(t.duration_ms, 0);
+    let c = synth.chunk(t, 0, 1, 100);
+    assert_eq(c[0], 0);
+    assert_eq(c[1], 64);
+    assert_eq(c[2], 0);
+    assert_eq(c[3], 192);
+}

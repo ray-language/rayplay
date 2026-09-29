@@ -1,0 +1,26 @@
+[package]
+name = "rayplay"
+version = "0.1.0"
+# 1.27.19: std/audio plays inside the iOS shell (AudioQueue) and `background_audio` keeps it
+# going when the app leaves the screen — the two things this app exists to exercise.
+raylang = "1.27.19"
+
+# The page (www/) is plain HTML served by the process itself over ray://app; no Vite, no
+# local server. `ui.mount_embed_at("", "www")` puts www/index.html at ray://app/index.html.
+[native]
+embed = ["www"]
+
+[app]
+name = "RayPlay"
+id = "org.raylang.rayplay"
+icon = "assets/icon.png"
+copyright = "© 2026 Rayala"
+
+# The sound comes from the raylang program (std/audio), never from the page, so these keep it
+# playing in the background: iOS takes the `playback` audio session + UIBackgroundModes = audio,
+# Android runs the program under a mediaPlayback foreground service (raylang 1.27.19, M324).
+[ios]
+background_audio = true
+
+[android]
+background_audio = true

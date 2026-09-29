@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RayPlay</title>
+<style>
+  :root { color-scheme: dark; --bg: #101418; --panel: #1a2028; --fg: #e8ecf1; --dim: #8b95a3; --accent: #ff8c42; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.4 -apple-system, system-ui, sans-serif; }
+  body { padding: calc(env(safe-area-inset-top) + 16px) 16px calc(env(safe-area-inset-bottom) + 16px); }
+  h1 { font-size: 20px; margin: 0 0 12px; letter-spacing: .08em; }
+  h1 span { color: var(--accent); }
+  .now { background: var(--panel); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+  .title { font-size: 18px; font-weight: 600; min-height: 1.4em; }
+  .time { color: var(--dim); font-variant-numeric: tabular-nums; margin: 6px 0; }
+  .bar { height: 10px; border-radius: 5px; background: #2a323d; overflow: hidden; touch-action: none; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); }
+  .controls { display: flex; gap: 10px; margin-top: 14px; }
+  button { flex: 1; min-height: 56px; border: 0; border-radius: 12px; background: #2a323d; color: var(--fg); font-size: 22px; }
+  button.main { background: var(--accent); color: #101418; flex: 2; }
+  button:active { filter: brightness(1.2); }
+  .vol { display: flex; align-items: center; gap: 10px; margin-top: 14px; color: var(--dim); }
+  .vol input { flex: 1; }
+  .list { background: var(--panel); border-radius: 14px; overflow: hidden; }
+  .list div { padding: 14px 16px; border-bottom: 1px solid #242b35; display: flex; justify-content: space-between; }
+  .list div:last-child { border-bottom: 0; }
+  .list div.on { color: var(--accent); }
+  .list small { color: var(--dim); }
+  .status { margin-top: 14px; color: var(--dim); font-size: 14px; white-space: pre-line; min-height: 3.6em; }
+  .status b { color: var(--fg); }
+  label.load { display: block; margin-top: 14px; padding: 14px; text-align: center; border: 1px dashed #3a4450; border-radius: 12px; color: var(--dim); }
+  label.load input { display: none; }
+</style>
+</head>
+<body>
+<h1>RAY<span>PLAY</span></h1>
+<div class="now">
+  <div class="title" id="title">…</div>
+  <div class="time"><span id="pos">0:00</span> / <span id="dur">0:00</span></div>
+  <div class="bar" id="bar"><i id="fill"></i></div>
+  <div class="controls">
+    <button id="prev" aria-label="previous">⏮</button>
+    <button id="toggle" class="main" aria-label="play or pause">▶</button>
+    <button id="next" aria-label="next">⏭</button>
+    <button id="stop" aria-label="stop">■</button>
+  </div>
+  <div class="vol">🔈<input id="vol" type="range" min="0" max="100" value="80">🔊</div>
+</div>
+<div class="list" id="list"></div>
+<label class="load">Load a 16-bit WAV<input id="file" type="file" accept=".wav,audio/wav,audio/x-wav"></label>
+<div class="status" id="status"></div>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  let state = null;
+  let volTimer = 0;
+
+  function fmt(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  async function call(op, args) {
+    if (!window.ray || !window.ray.request) {
+      $('status').textContent = 'no bridge: open this page inside the RayPlay app';
+      return null;
+    }
+    const r = await window.ray.request(Object.assign({ op }, args || {}));
+    const reply = typeof r === 'string' ? JSON.parse(r) : r;
+    if (!reply.ok) { $('status').textContent = 'error: ' + reply.error; return null; }
+    state = reply;
+    render();
+    return reply;
+  }
+
+  function render() {
+    if (!state) return;
+    const t = state.tracks[state.current];
+    $('title').textContent = t ? t.name : '(no tracks)';
+    $('pos').textContent = fmt(state.position_ms);
+    $('dur').textContent = fmt(t ? t.duration_ms : 0);
+    $('fill').style.width = t && t.duration_ms ? (100 * state.position_ms / t.duration_ms) + '%' : '0';
+    $('toggle').textContent = state.playing && !state.paused ? '⏸' : '▶';
+    if (document.activeElement !== $('vol')) $('vol').value = state.volume;
+    const list = $('list');
+    list.innerHTML = '';
+    state.tracks.forEach((tr, i) => {
+      const row = document.createElement('div');
+      row.className = i === state.current ? 'on' : '';
+      row.innerHTML = '<span></span><small></small>';
+      row.firstChild.textContent = (i === state.current && state.playing && !state.paused ? '▶ ' : '') + tr.name;
+      row.lastChild.textContent = fmt(tr.duration_ms);
+      row.onclick = () => call('play', { index: i });
+      list.appendChild(row);
+    });
+    let s = '';
+    if (state.note) s += 'last lifecycle: ' + state.note + '\n';
+    if (state.background_ms > 0) s += 'played in the background: ' + fmt(state.background_ms) + '\n';
+    if (state.error) s += 'error: ' + state.error;
+    $('status').innerHTML = '';
+    $('status').textContent = s || 'sound comes from the raylang program: switch apps and it keeps playing';
+  }
+
+  $('toggle').onclick = () => call('toggle');
+  $('stop').onclick = () => call('stop');
+  $('next').onclick = () => call('next');
+  $('prev').onclick = () => call('prev');
+  $('vol').oninput = (e) => {
+    clearTimeout(volTimer);
+    volTimer = setTimeout(() => call('volume', { value: Number(e.target.value) }), 80);
+  };
+  $('bar').onpointerdown = (e) => {
+    if (!state) return;
+    const t = state.tracks[state.current];
+    if (!t) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    call('seek', { ms: Math.round(frac * t.duration_ms) });
+  };
+  $('file').onchange = async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    $('status').textContent = 'loading ' + f.name + '…';
+    const buf = new Uint8Array(await f.arrayBuffer());
+    let bin = '';
+    for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+    await call('add', { name: f.name.replace(/\.wav$/i, ''), data: btoa(bin) });
+    e.target.value = '';
+  };
+
+  call('state');
+  // The page only paints: while it is on screen it asks for the position; in the
+  // background its timers stop, the program does not.
+  setInterval(() => { if (!document.hidden) call('state'); }, 500);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) call('state'); });
+})();
+</script>
+</body>
+</html>

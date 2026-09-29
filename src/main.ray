@@ -1,0 +1,84 @@
+// RayPlay — a small audio player whose sound comes from the raylang program (std/audio), not
+// from the page: the point is to exercise playback in the background on iOS and Android
+// (`[ios] background_audio`, `[android] background_audio` in ray.toml). The page (www/) is
+// plain HTML served over ray://app and talks to the player through `window.ray.request`.
+
+import std/ui;
+import api;
+import player;
+import synth;
+
+const APP_NAME: string = "RayPlay";
+
+fn page_url() -> Result<string, string> {
+    let url = ui.app_url("app://index.html");
+    if (url.starts_with("ray://")) {
+        let files = ui.mount_embed_at("", "www")?;
+        if (files == 0) {
+            return Result.Err("no embedded page under www/");
+        }
+    }
+    Result.Ok(url)
+}
+
+fn main() -> int {
+    let url = match (page_url()) {
+        Result.Ok(u) => u,
+        Result.Err(e) => {
+            eprint("rayplay: " + e);
+            return 1;
+        },
+    };
+    let cmds: Channel<player.Cmd> = Channel.bounded(64);
+    let _actor = spawn(fn() {
+        player.run(cmds, synth.builtin());
+    });
+
+    var o = ui.options(420, 760);
+    o.min_width = 320;
+    o.min_height = 480;
+    o.autosave = "rayplay.main";
+    o.titlebar_color = "#101418";
+    let window = match (ui.open_with(APP_NAME, url, o)) {
+        Result.Ok(w) => w,
+        Result.Err(e) => {
+            eprint("rayplay: " + e);
+            return 1;
+        },
+    };
+
+    while (true) {
+        let e = match (ui.next_event()) {
+            Result.Ok(e) => e,
+            Result.Err(err) => {
+                eprint("rayplay: " + err);
+                return 1;
+            },
+        };
+        if (e.kind == "closed" && e.window == window) {
+            send(cmds, player.Cmd.Quit);
+            return 0;
+        }
+        if (e.kind == "lifecycle") {
+            // The mobile shells report background/foreground; the player keeps playing
+            // and counts how much sounded meanwhile, which the page shows on return.
+            let note = e.tag + " " + player.stamp();
+            eprint("rayplay: lifecycle " + note);
+            send(cmds, player.Cmd.Note(note));
+        }
+        if (e.kind == "message") {
+            match (ui.as_request(e)) {
+                Option.Some(req) => {
+                    // Shells older than raylang 1.27.17 cannot be answered on window 0.
+                    let target = if (e.window == 0) { window } else { e.window };
+                    match (ui.reply_json(target, req.0, api.handle(cmds, req.1))) {
+                        Result.Err(err) => eprint("rayplay: reply: " + err),
+                        Result.Ok(_) => { },
+                    }
+                },
+                Option.None => { },
+            }
+        }
+    }
+    0
+}

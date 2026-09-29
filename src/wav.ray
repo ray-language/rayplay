@@ -1,0 +1,95 @@
+// RIFF/WAVE reader and writer for 16-bit PCM: the one format the player decodes itself.
+// Everything is little-endian; `b[i]` is the octet at `i`.
+
+/// Interleaved s16le samples with their format.
+pub struct Pcm {
+    rate: int,
+    channels: int,
+    data: bytes,
+}
+
+pub fn frames(p: Pcm) -> int {
+    p.data.len() / (2 * p.channels)
+}
+
+pub fn duration_ms(p: Pcm) -> int {
+    if (p.rate == 0) { 0 } else { frames(p) * 1000 / p.rate }
+}
+
+fn read_u16(b: bytes, at: int) -> int {
+    b[at] + b[at + 1] * 256
+}
+
+fn read_u32(b: bytes, at: int) -> int {
+    b[at] + b[at + 1] * 256 + b[at + 2] * 65536 + b[at + 3] * 16777216
+}
+
+fn tag(b: bytes, at: int) -> string {
+    from_utf8(b.sub_bytes(at, at + 4)).unwrap_or("")
+}
+
+/// Parses a WAV file: PCM (format 1) or WAVE_FORMAT_EXTENSIBLE (0xFFFE) with 16-bit samples.
+pub fn parse(b: bytes) -> Result<Pcm, string> {
+    if (b.len() < 12 || tag(b, 0) != "RIFF" || tag(b, 8) != "WAVE") {
+        return Result.Err("not a WAV file");
+    }
+    var rate = 0;
+    var channels = 0;
+    var bits = 0;
+    var format = 0;
+    var at = 12;
+    while (at + 8 <= b.len()) {
+        let id = tag(b, at);
+        let size = read_u32(b, at + 4);
+        let body = at + 8;
+        if (id == "fmt " && body + 16 <= b.len()) {
+            format = read_u16(b, body);
+            channels = read_u16(b, body + 2);
+            rate = read_u32(b, body + 4);
+            bits = read_u16(b, body + 14);
+        } else if (id == "data") {
+            if (format != 1 && format != 65534) {
+                return Result.Err("unsupported WAV format ${to_string(format)} (only PCM)");
+            }
+            if (bits != 16) {
+                return Result.Err("unsupported WAV: ${to_string(bits)}-bit samples (only 16-bit)");
+            }
+            if (channels < 1 || channels > 2 || rate < 8000 || rate > 192000) {
+                return Result.Err(
+                    "unsupported WAV: ${to_string(channels)} channels at ${to_string(rate)} Hz"
+                );
+            }
+            let end = if (body + size <= b.len()) { body + size } else { b.len() };
+            let whole = (end - body) / (2 * channels) * (2 * channels);
+            return Result.Ok(
+                Pcm { rate: rate, channels: channels, data: b.sub_bytes(body, body + whole) }
+            );
+        }
+        // Chunks are word-aligned: an odd size carries one pad byte.
+        at = body + size + size % 2;
+    }
+    Result.Err("WAV without a data chunk")
+}
+
+fn le16(v: int) -> [int] {
+    [v % 256, v / 256 % 256]
+}
+
+fn le32(v: int) -> [int] {
+    [v % 256, v / 256 % 256, v / 65536 % 256, v / 16777216 % 256]
+}
+
+/// Encodes PCM as a canonical 44-byte-header WAV (tests, and the export of a loaded track).
+pub fn encode(p: Pcm) -> bytes {
+    let block = 2 * p.channels;
+    var head: [int] = [];
+    head = head + [82, 73, 70, 70] + le32(36 + p.data.len()) + [87, 65, 86, 69];
+    head = head + [102, 109, 116, 32] + le32(16) + le16(1) + le16(p.channels);
+    head = head + le32(p.rate) + le32(p.rate * block) + le16(block) + le16(16);
+    head = head + [100, 97, 116, 97] + le32(p.data.len());
+    var out = head;
+    for i in 0..p.data.len() {
+        out.push(p.data[i]);
+    }
+    bytes_of(out)
+}

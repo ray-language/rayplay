@@ -1,0 +1,90 @@
+// The page ↔ program protocol over `window.ray.request({op, …})`: every request is answered
+// with the player's snapshot as JSON (`ok: true`) or `{ok: false, error}`.
+//
+//   state                      → the snapshot
+//   play {index}               → start that track from the beginning
+//   toggle                     → play / pause / resume the current track
+//   stop · next · prev
+//   seek {ms} · volume {value}
+//   add {name, data}           → a 16-bit WAV (base64) appended to the playlist
+
+import std/base64;
+import std/json;
+import player;
+import synth;
+import wav;
+
+fn fail(msg: string) -> string {
+    json.obj().field("ok", false).field("error", msg).render()
+}
+
+fn track_json(t: (string, int)) -> string {
+    json.obj().field("name", t.0).field("duration_ms", t.1).render()
+}
+
+/// The snapshot as the page reads it.
+pub fn snapshot_json(s: player.Snapshot) -> string {
+    var items: [string] = [];
+    for t in s.tracks {
+        items.push(track_json(t));
+    }
+    let tracks = "[" + items.join(",") + "]";
+    let head = json.obj()
+        .field("ok", true)
+        .field("current", s.current)
+        .field("playing", s.playing)
+        .field("paused", s.paused)
+        .field("position_ms", s.position_ms)
+        .field("volume", s.volume)
+        .field("note", s.note)
+        .field("background_ms", s.background_ms)
+        .field("error", s.error)
+        .render();
+    // Splice the array in: the builder has no raw-JSON field.
+    head.substring(0, head.len() - 1) + ",\"tracks\":" + tracks + "}"
+}
+
+fn int_field(req: json.Json, key: string) -> Result<int, string> {
+    match (json.get_int(req, key)) {
+        Option.Some(n) => Result.Ok(n),
+        Option.None => Result.Err("missing field '${key}'"),
+    }
+}
+
+fn str_field(req: json.Json, key: string) -> Result<string, string> {
+    match (json.get_string(req, key)) {
+        Option.Some(s) => Result.Ok(s),
+        Option.None => Result.Err("missing field '${key}'"),
+    }
+}
+
+fn dispatch(cmds: Channel<player.Cmd>, body: string) -> Result<string, string> {
+    let req = json.parse(body)?;
+    let op = str_field(req, "op")?;
+    match (op) {
+        "state" => { },
+        "play" => send(cmds, player.Cmd.Play(int_field(req, "index")?)),
+        "toggle" => send(cmds, player.Cmd.Toggle),
+        "stop" => send(cmds, player.Cmd.Stop),
+        "next" => send(cmds, player.Cmd.Next),
+        "prev" => send(cmds, player.Cmd.Prev),
+        "seek" => send(cmds, player.Cmd.Seek(int_field(req, "ms")?)),
+        "volume" => send(cmds, player.Cmd.Volume(int_field(req, "value")?)),
+        "add" => {
+            let name = str_field(req, "name")?;
+            let data = base64.base64_decode(str_field(req, "data")?)?;
+            let pcm = wav.parse(data)?;
+            send(cmds, player.Cmd.Add(synth.loaded(name, pcm)));
+        },
+        _ => return Result.Err("unknown op: ${op}"),
+    }
+    Result.Ok(snapshot_json(player.query(cmds)))
+}
+
+/// Handles one request body; always returns a JSON reply.
+pub fn handle(cmds: Channel<player.Cmd>, body: string) -> string {
+    match (dispatch(cmds, body)) {
+        Result.Ok(reply) => reply,
+        Result.Err(e) => fail(e),
+    }
+}

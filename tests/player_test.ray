@@ -1,0 +1,73 @@
+// The actor, driven through its channel. `make test` sets RAY_AUDIO_SINK=null so the audio
+// output is a real-time null sink: no sound card needed, the clock still runs.
+
+import std/time;
+import player;
+import synth;
+
+fn start_player() -> Channel<player.Cmd> {
+    let cmds: Channel<player.Cmd> = Channel.bounded(64);
+    let _a = spawn(fn() {
+        player.run(cmds, synth.builtin());
+    });
+    cmds
+}
+
+@test
+fn playing_advances_the_position_and_pause_holds_it() {
+    let cmds = start_player();
+    let idle = player.query(cmds);
+    assert_eq(idle.tracks.len(), 3);
+    assert(!idle.playing);
+    send(cmds, player.Cmd.Play(1));
+    time.sleep(600);
+    let s = player.query(cmds);
+    assert_eq(s.current, 1);
+    assert(s.playing);
+    assert(s.position_ms > 100);
+    send(cmds, player.Cmd.Toggle);
+    time.sleep(50);
+    let paused = player.query(cmds);
+    assert(paused.paused);
+    let at = paused.position_ms;
+    time.sleep(300);
+    assert_eq(player.query(cmds).position_ms, at);
+    send(cmds, player.Cmd.Toggle);
+    time.sleep(400);
+    assert(player.query(cmds).position_ms > at);
+    send(cmds, player.Cmd.Quit);
+}
+
+@test
+fn next_and_prev_wrap_around_and_stop_rewinds() {
+    let cmds = start_player();
+    send(cmds, player.Cmd.Prev);
+    assert_eq(player.query(cmds).current, 2);
+    send(cmds, player.Cmd.Next);
+    assert_eq(player.query(cmds).current, 0);
+    send(cmds, player.Cmd.Play(0));
+    time.sleep(400);
+    send(cmds, player.Cmd.Stop);
+    let s = player.query(cmds);
+    assert(!s.playing);
+    assert_eq(s.position_ms, 0);
+    send(cmds, player.Cmd.Quit);
+}
+
+@test
+fn seek_and_volume_are_clamped_and_notes_are_kept() {
+    let cmds = start_player();
+    send(cmds, player.Cmd.Seek(999999999));
+    assert_eq(player.query(cmds).position_ms, 180000);
+    send(cmds, player.Cmd.Seek(-5));
+    assert_eq(player.query(cmds).position_ms, 0);
+    send(cmds, player.Cmd.Volume(140));
+    assert_eq(player.query(cmds).volume, 100);
+    send(cmds, player.Cmd.Note("background 12:00:00"));
+    send(cmds, player.Cmd.Play(2));
+    time.sleep(500);
+    let s = player.query(cmds);
+    assert_eq(s.note, "background 12:00:00");
+    assert(s.background_ms >= 100);
+    send(cmds, player.Cmd.Quit);
+}

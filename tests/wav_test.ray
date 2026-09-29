@@ -1,0 +1,41 @@
+import wav;
+
+fn tiny() -> wav.Pcm {
+    // Two stereo frames: (1, -1) and (32767, -32768).
+    wav.Pcm { rate: 8000, channels: 2, data: bytes_of([1, 0, 255, 255, 255, 127, 0, 128]) }
+}
+
+@test
+fn a_wav_round_trips_through_encode_and_parse() {
+    let p = tiny();
+    let file = wav.encode(p);
+    assert_eq(file.len(), 44 + 8);
+    let back = wav.parse(file).unwrap();
+    assert_eq(back.rate, 8000);
+    assert_eq(back.channels, 2);
+    assert_eq(wav.frames(back), 2);
+    assert_eq(back.data.len(), 8);
+    assert_eq(back.data[6], 0);
+    assert_eq(back.data[7], 128);
+}
+
+@test
+fn duration_follows_rate_and_frames() {
+    let p = wav.Pcm { rate: 1000, channels: 1, data: bytes_of([0, 0, 0, 0, 0, 0]) };
+    assert_eq(wav.frames(p), 3);
+    assert_eq(wav.duration_ms(p), 3);
+}
+
+@test
+fn garbage_and_unsupported_files_are_refused() {
+    assert(wav.parse(bytes_of([1, 2, 3])).is_err());
+    assert(wav.parse("RIFF....WAVEjunk".to_bytes()).is_err());
+    // An 8-bit file: same header with bits = 8.
+    var eight = wav.encode(tiny());
+    var octets: [int] = [];
+    for i in 0..eight.len() {
+        octets.push(eight[i]);
+    }
+    octets[34] = 8;
+    assert(wav.parse(bytes_of(octets)).is_err());
+}

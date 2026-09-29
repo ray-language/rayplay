@@ -1,0 +1,317 @@
+// The player: ONE fiber owns the audio output and the playlist, and everything else talks
+// to it through a channel of commands (the actor pattern — fibers do not share a heap).
+// Sound is written to std/audio in 50 ms chunks; `write` parks the fiber while the device
+// is full, so the device sets the pace and commands are picked up between chunks.
+//
+// Position keeping: the device is (re)opened at every play, seek and resume, so
+// `audio.played_ms` counts from that point and `base_ms` remembers where the track was.
+
+import std/audio;
+import std/time;
+import synth;
+
+pub enum Cmd {
+    Play(int),
+    Toggle,
+    Stop,
+    Next,
+    Prev,
+    Seek(int),
+    Volume(int),
+    Add(synth.Track),
+    Note(string),
+    Query(Channel<Snapshot>),
+    Quit,
+}
+
+/// What the page shows: the playlist and where playback is.
+pub struct Snapshot {
+    tracks: [(string, int)],
+    current: int,
+    playing: bool,
+    paused: bool,
+    position_ms: int,
+    volume: int,
+    /// The last lifecycle note ("background 12:01:03") and how much sounded since it.
+    note: string,
+    background_ms: int,
+    error: string,
+}
+
+const CHUNK_MS: int = 50;
+
+const LATENCY_MS: int = 120;
+
+struct State {
+    tracks: [synth.Track],
+    current: int,
+    playing: bool,
+    paused: bool,
+    volume: int,
+    handle: int,
+    base_ms: int,
+    frame: int,
+    note: string,
+    in_background: bool,
+    background_ms: int,
+    error: string,
+}
+
+fn position_ms(s: State) -> int {
+    if (s.playing && !s.paused && s.handle != 0) {
+        s.base_ms + audio.played_ms(s.handle).unwrap_or(0)
+    } else {
+        s.base_ms
+    }
+}
+
+fn snapshot(s: State) -> Snapshot {
+    var tracks: [(string, int)] = [];
+    for t in s.tracks {
+        tracks.push((t.name, t.duration_ms));
+    }
+    Snapshot {
+        tracks: tracks,
+        current: s.current,
+        playing: s.playing,
+        paused: s.paused,
+        position_ms: position_ms(s),
+        volume: s.volume,
+        note: s.note,
+        background_ms: s.background_ms,
+        error: s.error
+    }
+}
+
+fn close_output(s: State) -> unit {
+    if (s.handle != 0) {
+        close(s.handle);
+        s.handle = 0;
+    }
+}
+
+/// Opens the device for the current track at `ms` into it.
+fn open_at(s: State, ms: int) -> unit {
+    close_output(s);
+    let t = s.tracks[s.current];
+    match (audio.open_latency(t.rate, t.channels, LATENCY_MS)) {
+        Result.Ok(h) => {
+            s.handle = h;
+            s.error = "";
+        },
+        Result.Err(e) => {
+            s.error = "audio: " + e;
+            s.playing = false;
+            s.paused = false;
+            eprint("rayplay: " + s.error);
+        },
+    }
+    s.base_ms = ms;
+    s.frame = ms * t.rate / 1000;
+}
+
+fn start(s: State, index: int, ms: int) -> unit {
+    if (s.tracks.len() == 0) {
+        return;
+    }
+    s.current = (index % s.tracks.len() + s.tracks.len()) % s.tracks.len();
+    s.playing = true;
+    s.paused = false;
+    open_at(s, ms);
+}
+
+fn stop(s: State) -> unit {
+    close_output(s);
+    s.playing = false;
+    s.paused = false;
+    s.base_ms = 0;
+    s.frame = 0;
+}
+
+fn pause(s: State) -> unit {
+    let at = position_ms(s);
+    close_output(s);
+    s.paused = true;
+    s.base_ms = at;
+}
+
+fn handle(s: State, cmd: Cmd) -> bool {
+    match (cmd) {
+        Cmd.Play(i) => start(s, i, 0),
+        Cmd.Toggle => {
+            if (!s.playing) {
+                start(s, s.current, 0);
+            } else if (s.paused) {
+                start(s, s.current, s.base_ms);
+            } else {
+                pause(s);
+            }
+        },
+        Cmd.Stop => stop(s),
+        Cmd.Next => {
+            let was = s.playing;
+            stop(s);
+            s.current = (s.current + 1) % s.tracks.len();
+            if (was) {
+                start(s, s.current, 0);
+            }
+        },
+        Cmd.Prev => {
+            let was = s.playing;
+            stop(s);
+            s.current = (s.current + s.tracks.len() - 1) % s.tracks.len();
+            if (was) {
+                start(s, s.current, 0);
+            }
+        },
+        Cmd.Seek(ms) => {
+            let t = s.tracks[s.current];
+            let clamped = if (ms < 0) {
+                0
+            } else if (ms > t.duration_ms) {
+                t.duration_ms
+            } else {
+                ms
+            };
+            if (s.playing && !s.paused) {
+                start(s, s.current, clamped);
+            } else {
+                s.base_ms = clamped;
+                s.frame = clamped * t.rate / 1000;
+            }
+        },
+        Cmd.Volume(v) => {
+            s.volume = if (v < 0) { 0 } else if (v > 100) { 100 } else { v };
+        },
+        Cmd.Add(t) => {
+            s.tracks.push(t);
+        },
+        Cmd.Note(n) => {
+            s.note = n;
+            s.in_background = n.starts_with("background");
+            if (s.in_background) {
+                s.background_ms = 0;
+            }
+        },
+        Cmd.Query(reply) => send(reply, snapshot(s)),
+        Cmd.Quit => {
+            stop(s);
+            return false;
+        },
+    }
+    true
+}
+
+/// Writes the next chunk of the current track; at the end, moves to the next track.
+fn feed(s: State) -> unit {
+    let t = s.tracks[s.current];
+    let frames = t.rate * CHUNK_MS / 1000;
+    let total = synth.total_frames(t);
+    if (s.frame >= total) {
+        let _d = audio.drain(s.handle);
+        let next = (s.current + 1) % s.tracks.len();
+        stop(s);
+        start(s, next, 0);
+        return;
+    }
+    let data = synth.chunk(t, s.frame, frames, s.volume);
+    match (audio.write(s.handle, data)) {
+        Result.Ok(_) => {
+            s.frame = s.frame + frames;
+            if (s.in_background) {
+                s.background_ms = s.background_ms + CHUNK_MS;
+            }
+        },
+        Result.Err(e) => {
+            s.error = "audio: " + e;
+            eprint("rayplay: " + s.error);
+            stop(s);
+        },
+    }
+}
+
+/// The actor loop: run it in its own fiber with `spawn`.
+pub fn run(cmds: Channel<Cmd>, tracks: [synth.Track]) -> unit {
+    let s = State {
+        tracks: tracks,
+        current: 0,
+        playing: false,
+        paused: false,
+        volume: 80,
+        handle: 0,
+        base_ms: 0,
+        frame: 0,
+        note: "",
+        in_background: false,
+        background_ms: 0,
+        error: ""
+    };
+    var alive = true;
+    while (alive) {
+        if (s.playing && !s.paused && s.handle != 0) {
+            // Playing: take what is queued without blocking, then feed the device (which
+            // parks us for about a chunk when its buffer is full).
+            var more = true;
+            while (more) {
+                match (try_recv(cmds)) {
+                    Received.Got(c) => {
+                        alive = handle(s, c);
+                    },
+                    Received.Empty => {
+                        more = false;
+                    },
+                    Received.Closed => {
+                        alive = false;
+                        more = false;
+                    },
+                }
+            }
+            if (alive && s.playing && !s.paused && s.handle != 0) {
+                feed(s);
+            }
+        } else {
+            match (recv(cmds)) {
+                Option.Some(c) => {
+                    alive = handle(s, c);
+                },
+                Option.None => {
+                    alive = false;
+                },
+            }
+        }
+    }
+    close_output(s);
+}
+
+/// Asks the actor for a snapshot (from any other fiber).
+pub fn query(cmds: Channel<Cmd>) -> Snapshot {
+    let reply: Channel<Snapshot> = Channel.bounded(1);
+    send(cmds, Cmd.Query(reply));
+    match (recv(reply)) {
+        Option.Some(snap) => snap,
+        Option.None => Snapshot {
+            tracks: [],
+            current: 0,
+            playing: false,
+            paused: false,
+            position_ms: 0,
+            volume: 0,
+            note: "",
+            background_ms: 0,
+            error: "player gone"
+        },
+    }
+}
+
+/// A clock stamp for lifecycle notes ("12:01:03").
+pub fn stamp() -> string {
+    let secs = time.now() / 1000 % 86400;
+    let h = secs / 3600;
+    let m = secs / 60 % 60;
+    let sec = secs % 60;
+    two(h) + ":" + two(m) + ":" + two(sec)
+}
+
+fn two(n: int) -> string {
+    if (n < 10) { "0" + to_string(n) } else { to_string(n) }
+}

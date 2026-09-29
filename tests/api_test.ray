@@ -1,0 +1,61 @@
+import std/json;
+import api;
+import player;
+import synth;
+
+fn start_player() -> Channel<player.Cmd> {
+    let cmds: Channel<player.Cmd> = Channel.bounded(64);
+    let _a = spawn(fn() {
+        player.run(cmds, synth.builtin());
+    });
+    cmds
+}
+
+@test
+fn state_lists_the_playlist_as_json() {
+    let cmds = start_player();
+    let reply = json.parse(api.handle(cmds, "{\"op\":\"state\"}")).unwrap();
+    assert_eq(json.get_int(reply, "current"), Option.Some(0));
+    assert_eq(json.get_int(reply, "volume"), Option.Some(80));
+    let tracks = json.member(reply, "tracks").unwrap();
+    match (tracks) {
+        json.Json.JArray(items) => {
+            assert_eq(items.len(), 3);
+            assert_eq(json.get_string(items[0], "name"), Option.Some("Pentatonic Etude"));
+        },
+        _ => panic("tracks is not an array"),
+    }
+    send(cmds, player.Cmd.Quit);
+}
+
+@test
+fn bad_requests_fail_cleanly() {
+    let cmds = start_player();
+    let r1 = json.parse(api.handle(cmds, "{\"op\":\"nope\"}")).unwrap();
+    assert_eq(json.get_string(r1, "error"), Option.Some("unknown op: nope"));
+    let r2 = json.parse(api.handle(cmds, "{\"op\":\"seek\"}")).unwrap();
+    assert_eq(json.get_string(r2, "error"), Option.Some("missing field 'ms'"));
+    let r3 = json.parse(api.handle(cmds, "not json")).unwrap();
+    assert(json.get_string(r3, "error").is_some());
+    let r4 = json.parse(api.handle(cmds, "{\"op\":\"add\",\"name\":\"x\",\"data\":\"AQID\"}"))
+        .unwrap();
+    assert_eq(json.get_string(r4, "error"), Option.Some("not a WAV file"));
+    send(cmds, player.Cmd.Quit);
+}
+
+@test
+fn a_loaded_wav_joins_the_playlist() {
+    let cmds = start_player();
+    // RIFF header of a 2-frame stereo 8 kHz file, base64.
+    let file = "UklGRiwAAABXQVZFZm10IBAAAAABAAIAQB8AAAB9AAAEABAAZGF0YQgAAAABAP///38AgA==";
+    let reply = json.parse(api.handle(cmds, "{\"op\":\"add\",\"name\":\"tiny\",\"data\":\"" + file + "\"}"))
+        .unwrap();
+    match (json.member(reply, "tracks").unwrap()) {
+        json.Json.JArray(items) => {
+            assert_eq(items.len(), 4);
+            assert_eq(json.get_string(items[3], "name"), Option.Some("tiny"));
+        },
+        _ => panic("tracks is not an array"),
+    }
+    send(cmds, player.Cmd.Quit);
+}
