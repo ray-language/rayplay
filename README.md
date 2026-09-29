@@ -71,9 +71,9 @@ dice cuánto sonó en segundo plano y la posición ha avanzado.
 |---|---|
 | Backend | `make test`: 13 tests, VM |
 | Programa completo | `ray run` headless: monta `www/` y abre `ray://app/index.html` |
-| iOS | simulador iPhone 16 Pro: arranca, `audio.open` abre el dispositivo dentro del shell 1.27.19 |
-| Android | pendiente |
-| Segundo plano en dispositivo real | **pendiente**: es lo que esta app existe para probar |
+| iOS | simulador iPhone 16 Pro (`ray bundle --ios --ios-target sim`, shell 1.27.19 con sesión `playback` y `UIBackgroundModes = audio`): arranca, la página llega por `ray://app`, el puente responde y el display muestra el `lifecycle` del shell; `audio.open` abre el dispositivo dentro del shell (comprobado con una mini app) |
+| Android | emulador arm64 (`ray bundle --android`, shell 1.27.19 con *foreground service* `mediaPlayback`): Play por `adb`, Home durante 10 s, vuelta: la posición pasó de 0:05 a 0:17 y el display dice «played in the background: 0:09». **El audio sigue en segundo plano** |
+| Segundo plano en iPhone real | **pendiente**: es lo que esta app existe para probar |
 
 ## Limitaciones
 
@@ -85,5 +85,10 @@ dice cuánto sonó en segundo plano y la posición ha avanzado.
 
 ## Hallazgos de dogfood
 
-(los que salgan de probarla en dispositivo; ver también `RAYLANG-FINDINGS.md` y el README de
-Ray808, hallazgo 18)
+Ver también `RAYLANG-FINDINGS.md` y el README de Ray808 (hallazgo 18, el origen de esta app).
+
+1. **Android pide el permiso de notificaciones nada más arrancar** (raylang 1.27.19,
+   `[android] background_audio`): el shell lo solicita en `onCreate` para el *foreground
+   service*, antes de que suene nada; el diálogo tapa la página y, si se rechaza, no vuelve a
+   preguntar. Propuesta: pedirlo al primer `audio.open` (o exponer al programa cuándo pedirlo),
+   con el texto de la notificación configurable (`[android] background_audio_title`).
