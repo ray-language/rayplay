@@ -3,7 +3,9 @@ name = "rayplay"
 version = "0.1.0"
 # 1.27.19: std/audio plays inside the iOS shell (AudioQueue) and `background_audio` keeps it
 # going when the app leaves the screen — the two things this app exists to exercise.
-raylang = "1.27.19"
+# 1.27.25: live development on the phone — `ray bundle --ios|--android --dev` builds the
+# development shell (org.raylang.rayplay.dev) and `ray dev --device` reloads the program on it.
+raylang = "1.27.25"
 
 # The page (www/) is plain HTML served by the process itself over ray://app; no Vite, no
 # local server. `ui.mount_embed_at("", "www")` puts www/index.html at ray://app/index.html.
