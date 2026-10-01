@@ -43,3 +43,29 @@ fn a_loaded_wav_plays_its_own_samples_scaled() {
     assert_eq(c[2], 0);
     assert_eq(c[3], 192);
 }
+
+fn left(c: bytes, frame: int) -> int {
+    var v = c[frame * 4] + c[frame * 4 + 1] * 256;
+    if (v >= 32768) {
+        v = v - 65536;
+    }
+    v
+}
+
+@test
+fn a_ramp_between_equal_volumes_is_the_plain_chunk() {
+    let t = synth.builtin()[1];
+    assert(synth.chunk_ramp(t, 1000, 2205, 60, 60) == synth.chunk(t, 1000, 2205, 60));
+}
+
+@test
+fn a_volume_ramp_ends_at_the_new_volume() {
+    // The last frame of the ramp is already at the target gain, so the next chunk (played
+    // at that volume) continues it without a step.
+    let t = synth.builtin()[1];
+    let ramp = synth.chunk_ramp(t, 0, 2205, 20, 90);
+    let target = synth.chunk(t, 0, 2205, 90);
+    assert_eq(left(ramp, 2204), left(target, 2204));
+    let start = synth.chunk(t, 0, 2205, 20);
+    assert(left(ramp, 1100) != left(start, 1100));
+}

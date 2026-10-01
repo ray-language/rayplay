@@ -124,7 +124,16 @@ fn clamp16(x: float) -> int {
 /// `frames` frames of `t` starting at `from` (frames), as s16le at `volume` (0–100).
 /// Past the end of the track it renders silence, so a caller can always ask for a full chunk.
 pub fn chunk(t: Track, from: int, frames: int, volume: int) -> bytes {
-    let gain = (volume as float) / 100.0;
+    chunk_ramp(t, from, frames, volume, volume)
+}
+
+/// Like `chunk`, but the gain ramps linearly from `volume_from` to `volume` across the chunk,
+/// reaching `volume` on its last frame: a volume change becomes a slope instead of a step at
+/// a chunk edge (which is heard as a click).
+pub fn chunk_ramp(t: Track, from: int, frames: int, volume_from: int, volume: int) -> bytes {
+    let gain_from = (volume_from as float) / 100.0;
+    let gain_to = (volume as float) / 100.0;
+    let step = if (frames > 0) { (gain_to - gain_from) / (frames as float) } else { 0.0 };
     var out: [int] = [];
     let end = total_frames(t);
     match (t.kind) {
@@ -132,6 +141,7 @@ pub fn chunk(t: Track, from: int, frames: int, volume: int) -> bytes {
             let block = 2 * p.channels;
             for i in 0..frames {
                 let fr = from + i;
+                let gain = gain_from + step * ((i + 1) as float);
                 for ch in 0..t.channels {
                     var sample = 0;
                     if (fr < end) {
@@ -150,6 +160,7 @@ pub fn chunk(t: Track, from: int, frames: int, volume: int) -> bytes {
         _ => {
             for i in 0..frames {
                 let fr = from + i;
+                let gain = gain_from + step * ((i + 1) as float);
                 var l = 0.0;
                 var r = 0.0;
                 if (fr < end) {
