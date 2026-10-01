@@ -20,8 +20,8 @@ fn page_url() -> Result<string, string> {
                 }
             },
             // Under `ray dev --device` (the dev shell, `ray dev-client`) std/embed does not
-            // see `[native] embed` although www/ arrives with the snapshot (raylang 1.27.25,
-            // RAYLANG-FINDINGS #109): serve it from disk. mount_dir answers 0 on success and
+            // see `[native] embed` although www/ arrives with the snapshot (raylang 1.27.25 and
+            // 1.27.26, RAYLANG-FINDINGS #109): serve it from disk. mount_dir answers 0 on success and
             // fails only if www/ is missing.
             Result.Err(_) => {
                 ui.mount_dir("", "www")?;
