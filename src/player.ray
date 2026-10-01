@@ -48,6 +48,8 @@ struct State {
     playing: bool,
     paused: bool,
     volume: int,
+    /// The volume the last chunk ended at: the next one ramps from it to `volume`.
+    volume_prev: int,
     handle: int,
     base_ms: int,
     frame: int,
@@ -214,7 +216,8 @@ fn feed(s: State) -> unit {
         start(s, next, 0);
         return;
     }
-    let data = synth.chunk(t, s.frame, frames, s.volume);
+    let data = synth.chunk_ramp(t, s.frame, frames, s.volume_prev, s.volume);
+    s.volume_prev = s.volume;
     match (audio.write(s.handle, data)) {
         Result.Ok(_) => {
             s.frame = s.frame + frames;
@@ -238,6 +241,7 @@ pub fn run(cmds: Channel<Cmd>, tracks: [synth.Track]) -> unit {
         playing: false,
         paused: false,
         volume: 80,
+        volume_prev: 80,
         handle: 0,
         base_ms: 0,
         frame: 0,

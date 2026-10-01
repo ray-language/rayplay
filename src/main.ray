@@ -13,9 +13,19 @@ const APP_NAME: string = "RayPlay";
 fn page_url() -> Result<string, string> {
     let url = ui.app_url("app://index.html");
     if (url.starts_with("ray://")) {
-        let files = ui.mount_embed_at("", "www")?;
-        if (files == 0) {
-            return Result.Err("no embedded page under www/");
+        match (ui.mount_embed_at("", "www")) {
+            Result.Ok(files) => {
+                if (files == 0) {
+                    return Result.Err("no embedded page under www/");
+                }
+            },
+            // Under `ray dev --device` (the dev shell, `ray dev-client`) std/embed does not
+            // see `[native] embed` although www/ arrives with the snapshot (raylang 1.27.25,
+            // RAYLANG-FINDINGS #109): serve it from disk. mount_dir answers 0 on success and
+            // fails only if www/ is missing.
+            Result.Err(_) => {
+                ui.mount_dir("", "www")?;
+            },
         }
     }
     Result.Ok(url)

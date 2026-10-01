@@ -13,7 +13,8 @@ con `std/audio`, y la página es solo la interfaz.
 - **Cargar un WAV de 16 bits** desde la página (selector de archivos del webview) y añadirlo a
   la lista: el programa lo analiza (`src/wav.ray`) y lo reproduce a su frecuencia y canales.
 - Play/pausa, stop, anterior/siguiente (con vuelta), **seek** tocando la barra, volumen, y al
-  acabar una pista sigue con la siguiente.
+  acabar una pista sigue con la siguiente. Un cambio de volumen se aplica como una rampa a lo
+  largo del siguiente trozo de 50 ms (`synth.chunk_ramp`), no como un escalón que suena a clic.
 - El display muestra el último evento `lifecycle` del shell (`background 12:01:03`) y **cuánto
   audio se reprodujo en segundo plano** desde entonces: la prueba de que no se paró.
 
@@ -46,21 +47,38 @@ con `std/audio`, y la página es solo la interfaz.
   *foreground service* `mediaPlayback` en Android. La página deja de pedir el estado cuando no
   se ve (sus timers se paran igualmente); el programa ni se entera.
 - **Sin servidor local**: la página va embebida (`[native] embed = ["www"]`) y se sirve por
-  `ray://app` con `ui.mount_embed_at("", "www")`; bajo `ray run` se lee del disco.
+  `ray://app` con `ui.mount_embed_at("", "www")`; bajo `ray run` se lee del disco. Bajo
+  `ray dev --device` el embebido no está disponible (hallazgo 2) y la página se monta con
+  `ui.mount_dir("", "www")` desde la copia que llega al teléfono.
 
 ## Uso
 
 ```bash
-make test            # 13 tests: WAV, pistas, el actor (con RAY_AUDIO_SINK=null), protocolo
+make test            # 15 tests: WAV, pistas, el actor (con RAY_AUDIO_SINK=null), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
+make dev-device      # desarrollo en vivo en el teléfono (ver abajo)
 make icon            # assets/icon.png, dibujado con std/image
 ```
 
 Para el iPhone: `make bundle-ios`, abrir `RayPlay-ios/RayPlay.xcodeproj`, elegir el iPhone como
 destino y Run (la primera vez, el equipo de firma en `RayPlay-ios/App.xcconfig` o en `[ios]
 development_team`). Tras un cambio en `src/` o `www/`, basta `make ios-lib` y Run.
+
+### Desarrollo en vivo en el teléfono (raylang 1.27.25)
+
+Sin recompilar ni reinstalar en cada cambio:
+
+1. Una vez: `make bundle-ios-dev` (Xcode, `RayPlay-dev-ios/`) o `make bundle-android-dev` +
+   `make android-dev-apk` (`RayPlay-dev-android/`), e instalar la app **RayPlay-dev**
+   (`org.raylang.rayplay.dev`). Convive con RayPlay y conserva `background_audio`.
+2. `make dev-device`: imprime el enlace `org.raylang.rayplay.dev://ip:puerto/token` y su QR.
+   Escanearlo con la cámara abre la shell y la empareja (teléfono y Mac en la misma red).
+3. Cada cambio guardado en `src/`, `www/` o `ray.toml` que compile reinicia el programa en el
+   teléfono; sus `print`/`eprint` salen en la terminal.
+
+Sin teléfono, `ray dev-client <ray-dev://…> <dir>` hace de dispositivo en el escritorio.
 
 **La prueba**: Play, cambiar de app (o bloquear el teléfono) y esperar; al volver, el display
 dice cuánto sonó en segundo plano y la posición ha avanzado. Verificada en un iPhone real y en
@@ -70,10 +88,11 @@ el emulador Android.
 
 | Qué | Verificado |
 |---|---|
-| Backend | `make test`: 13 tests, VM |
+| Backend | `make test`: 15 tests, VM y nativo (`make test-native`) |
 | Programa completo | `ray run` headless: monta `www/` y abre `ray://app/index.html` |
 | iOS | simulador iPhone 16 Pro (`ray bundle --ios --ios-target sim`, shell 1.27.19 con sesión `playback` y `UIBackgroundModes = audio`): arranca, la página llega por `ray://app`, el puente responde y el display muestra el `lifecycle` del shell; `audio.open` abre el dispositivo dentro del shell (comprobado con una mini app) |
 | Android | emulador arm64 (`ray bundle --android`, shell 1.27.19 con *foreground service* `mediaPlayback`): Play por `adb`, Home durante 10 s, vuelta: la posición pasó de 0:05 a 0:17 y el display dice «played in the background: 0:09». **El audio sigue en segundo plano** |
+| Desarrollo en vivo | `ray dev --device` + `ray dev-client` en el escritorio (1.27.25, headless): recibe los 12 archivos, monta `www/` y abre `ray://app/index.html`. Las shells `--dev` de iOS y Android se generan con `background_audio`; en un **iPhone real**, la shell de desarrollo arranca la app y suena (con los chasquidos del hallazgo 4) |
 | Segundo plano en iPhone real | **verificado** (29 sep 2026): Play, cambio de app, vuelta: el audio sigue y el display muestra lo reproducido en segundo plano |
 
 ## Limitaciones
@@ -93,3 +112,12 @@ Ver también `RAYLANG-FINDINGS.md` y el README de Ray808 (hallazgo 18, el origen
    service*, antes de que suene nada; el diálogo tapa la página y, si se rechaza, no vuelve a
    preguntar. Propuesta: pedirlo al primer `audio.open` (o exponer al programa cuándo pedirlo),
    con el texto de la notificación configurable (`[android] background_audio_title`).
+2. **`std/embed` no ve `[native] embed` bajo `ray dev --device`** (raylang 1.27.25): el
+   snapshot trae `ray.toml` y `www/`, pero `ui.mount_embed_at` / `embed.list()` fallan con
+   «no embedded assets configured», y la app moría al arrancar. Rodeo en `src/main.ray`:
+   `ui.mount_dir("", "www")`. Detalle en `RAYLANG-FINDINGS.md` (#109).
+3. **`ray dev --device` guarda el token de emparejamiento en `.ray-dev`**, en la raíz del
+   proyecto, sin documentarlo ni ignorarlo: aquí va en `.gitignore`. Ver #111.
+4. **Chasquidos en el iPhone con 1.27.25**, en la shell de desarrollo y en la app normal. Con
+   1.27.19 sonaba limpio y en el Mac no se reproduce: es del backend de audio de iOS. Corregido
+   en raylang, pendiente de la próxima versión. Ver #112.
