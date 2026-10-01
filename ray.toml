@@ -5,7 +5,8 @@ version = "0.1.0"
 # going when the app leaves the screen — the two things this app exists to exercise.
 # 1.27.25: live development on the phone — `ray bundle --ios|--android --dev` builds the
 # development shell (org.raylang.rayplay.dev) and `ray dev --device` reloads the program on it.
-raylang = "1.27.25"
+# 1.27.26: fixes the audio clicks 1.27.25 had on the iPhone (RAYLANG-FINDINGS #112).
+raylang = "1.27.26"
 
 # The page (www/) is plain HTML served by the process itself over ray://app; no Vite, no
 # local server. `ui.mount_embed_at("", "www")` puts www/index.html at ray://app/index.html.

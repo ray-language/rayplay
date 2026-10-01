@@ -114,10 +114,10 @@ Ver también `RAYLANG-FINDINGS.md` y el README de Ray808 (hallazgo 18, el origen
    con el texto de la notificación configurable (`[android] background_audio_title`).
 2. **`std/embed` no ve `[native] embed` bajo `ray dev --device`** (raylang 1.27.25): el
    snapshot trae `ray.toml` y `www/`, pero `ui.mount_embed_at` / `embed.list()` fallan con
-   «no embedded assets configured», y la app moría al arrancar. Rodeo en `src/main.ray`:
+   «no embedded assets configured», y la app moría al arrancar. Sigue igual en 1.27.26. Rodeo en `src/main.ray`:
    `ui.mount_dir("", "www")`. Detalle en `RAYLANG-FINDINGS.md` (#109).
 3. **`ray dev --device` guarda el token de emparejamiento en `.ray-dev`**, en la raíz del
    proyecto, sin documentarlo ni ignorarlo: aquí va en `.gitignore`. Ver #111.
 4. **Chasquidos en el iPhone con 1.27.25**, en la shell de desarrollo y en la app normal. Con
    1.27.19 sonaba limpio y en el Mac no se reproduce: es del backend de audio de iOS. Corregido
-   en raylang, pendiente de la próxima versión. Ver #112.
+   en 1.27.26; falta comprobarlo en el iPhone. Ver #112.
