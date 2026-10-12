@@ -47,9 +47,8 @@ con `std/audio`, y la página es solo la interfaz.
   *foreground service* `mediaPlayback` en Android. La página deja de pedir el estado cuando no
   se ve (sus timers se paran igualmente); el programa ni se entera.
 - **Sin servidor local**: la página va embebida (`[native] embed = ["www"]`) y se sirve por
-  `ray://app` con `ui.mount_embed_at("", "www")`; bajo `ray run` se lee del disco. Bajo
-  `ray dev --device` el embebido no está disponible (hallazgo 2) y la página se monta con
-  `ui.mount_dir("", "www")` desde la copia que llega al teléfono.
+  `ray://app` con `ui.mount_embed_at("", "www")`; bajo `ray run` y `ray dev --device` se lee
+  del disco (bajo `--device`, desde 1.27.46; ver hallazgo 2).
 
 ## Uso
 
@@ -114,8 +113,9 @@ Ver también `RAYLANG-FINDINGS.md` y el README de Ray808 (hallazgo 18, el origen
    con el texto de la notificación configurable (`[android] background_audio_title`).
 2. **`std/embed` no ve `[native] embed` bajo `ray dev --device`** (raylang 1.27.25): el
    snapshot trae `ray.toml` y `www/`, pero `ui.mount_embed_at` / `embed.list()` fallan con
-   «no embedded assets configured», y la app moría al arrancar. Sigue igual en 1.27.26. Rodeo en `src/main.ray`:
-   `ui.mount_dir("", "www")`. Detalle en `RAYLANG-FINDINGS.md` (#109).
+   «no embedded assets configured», y la app moría al arrancar. Sigue igual en 1.27.26;
+   **corregido en 1.27.46**, y se quitó el rodeo con `ui.mount_dir`. Detalle en
+   `../findings/` (#109).
 3. **`ray dev --device` guarda el token de emparejamiento en `.ray-dev`**, en la raíz del
    proyecto, sin documentarlo ni ignorarlo: aquí va en `.gitignore`. Ver #111.
 4. **Chasquidos en el iPhone con 1.27.25**, en la shell de desarrollo y en la app normal. Con
