@@ -23,11 +23,14 @@ dev-device: ## Push the program to the phone's development shell on every change
 	ray dev --device
 
 # The audio output is a real-time null sink under test: no sound card, the clock still runs.
+# The native file dialog is headless and always answers with the fixture WAV.
+TEST_ENV := RAY_AUDIO_SINK=null RAY_UI_BACKEND=headless RAY_UI_PICK=tests/fixtures/tiny.wav
+
 test: ## Backend tests (WAV codec, tracks, the player actor, the protocol)
-	RAY_AUDIO_SINK=null ray test
+	$(TEST_ENV) ray test
 
 test-native: ## The same tests as native binaries
-	RAY_AUDIO_SINK=null ray test --native
+	$(TEST_ENV) ray test --native
 
 icon: ## Render assets/icon.png
 	ray run scripts/make-icon.ray

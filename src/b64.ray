@@ -1,0 +1,57 @@
+// A base64 decoder for the WAV the page sends: std/base64 decodes ~15 MB/s and holds ~14× its
+// input (findings #151), which a phone cannot afford for a file of tens of MB. This one reads
+// octets with `b[i]` and flushes its output to `bytes` every 768 KB.
+
+const FLUSH: int = 786432;
+
+fn table() -> [int] {
+    var t: [int] = [];
+    var i = 0;
+    while (i < 256) {
+        t.push(-1);
+        i = i + 1;
+    }
+    let abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".to_bytes();
+    var k = 0;
+    while (k < 64) {
+        t[abc[k]] = k;
+        k = k + 1;
+    }
+    t
+}
+
+/// Decodes standard padded base64 held in `b` from octet `from` to the end.
+pub fn decode(b: bytes, from: int) -> Result<bytes, string> {
+    if ((b.len() - from) % 4 != 0) {
+        return Result.Err("base64: length is not a multiple of 4");
+    }
+    let t = table();
+    var done = bytes_of([]);
+    var out: [int] = [];
+    var i = from;
+    while (i < b.len()) {
+        let last = i + 4 == b.len();
+        let c0 = t[b[i]];
+        let c1 = t[b[i + 1]];
+        let pad2 = last && b[i + 2] == 61;
+        let pad3 = last && b[i + 3] == 61;
+        let c2 = if (pad2) { 0 } else { t[b[i + 2]] };
+        let c3 = if (pad3) { 0 } else { t[b[i + 3]] };
+        if (c0 < 0 || c1 < 0 || c2 < 0 || c3 < 0 || (pad2 && !pad3)) {
+            return Result.Err("base64: invalid character near octet ${i - from}");
+        }
+        out.push(c0 * 4 + c1 / 16);
+        if (!pad2) {
+            out.push(c1 % 16 * 16 + c2 / 4);
+        }
+        if (!pad3) {
+            out.push(c2 % 4 * 64 + c3);
+        }
+        if (out.len() >= FLUSH) {
+            done = done + bytes_of(out);
+            out = [];
+        }
+        i = i + 4;
+    }
+    Result.Ok(done + bytes_of(out))
+}

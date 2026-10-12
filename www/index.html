@@ -29,7 +29,8 @@
   .list small { color: var(--dim); }
   .status { margin-top: 14px; color: var(--dim); font-size: 14px; white-space: pre-line; min-height: 3.6em; }
   .status b { color: var(--fg); }
-  label.load { display: block; margin-top: 14px; padding: 14px; text-align: center; border: 1px dashed #3a4450; border-radius: 12px; color: var(--dim); }
+  .load { display: block; width: 100%; margin-top: 14px; padding: 14px; text-align: center; border: 1px dashed #3a4450; border-radius: 12px; color: var(--dim); background: none; font: inherit; }
+  .load[hidden] { display: none; }
   label.load input { display: none; }
 </style>
 </head>
@@ -48,7 +49,10 @@
   <div class="vol">🔈<input id="vol" type="range" min="0" max="100" value="80">🔊</div>
 </div>
 <div class="list" id="list"></div>
-<label class="load">Load a 16-bit WAV<input id="file" type="file" accept=".wav,audio/wav,audio/x-wav"></label>
+<!-- The program opens the native dialog and reads the file itself; the input is the fallback
+     for a shell without one (there the whole file crosses the bridge as base64). -->
+<button class="load" id="pick">Load a 16-bit WAV</button>
+<label class="load" id="fallback" hidden>Load a 16-bit WAV<input id="file" type="file" accept=".wav,audio/wav,audio/x-wav"></label>
 <div class="status" id="status"></div>
 <script>
 (function () {
@@ -62,11 +66,16 @@
   }
 
   async function call(op, args) {
+    return request(Object.assign({ op }, args || {}));
+  }
+
+  // `body` is an object (sent as JSON) or, for a loaded file, the plain string `add:…`.
+  async function request(body) {
     if (!window.ray || !window.ray.request) {
       $('status').textContent = 'no bridge: open this page inside the RayPlay app';
       return null;
     }
-    const r = await window.ray.request(Object.assign({ op }, args || {}));
+    const r = await window.ray.request(body);
     const reply = typeof r === 'string' ? JSON.parse(r) : r;
     if (!reply.ok) { $('status').textContent = 'error: ' + reply.error; return null; }
     state = reply;
@@ -118,6 +127,22 @@
     const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
     call('seek', { ms: Math.round(frac * t.duration_ms) });
   };
+  function useFileInput() { $('pick').hidden = true; $('fallback').hidden = false; }
+  if (localStorage.getItem('rayplay.noDialog')) useFileInput();
+  $('pick').onclick = async () => {
+    $('status').textContent = 'choose a WAV…';
+    const r = await window.ray.request({ op: 'pick' });
+    const reply = typeof r === 'string' ? JSON.parse(r) : r;
+    if (reply.ok) { state = reply; render(); return; }
+    // No native dialog in this shell (iOS): from now on the page's own input loads the file.
+    if (reply.error.startsWith('dialog: ')) {
+      useFileInput();
+      localStorage.setItem('rayplay.noDialog', '1');
+      $('status').textContent = 'no native file dialog here: tap again to choose the WAV';
+      return;
+    }
+    $('status').textContent = 'error: ' + reply.error;
+  };
   $('file').onchange = async (e) => {
     const f = e.target.files && e.target.files[0];
     if (!f) return;
@@ -125,7 +150,8 @@
     const buf = new Uint8Array(await f.arrayBuffer());
     let bin = '';
     for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-    await call('add', { name: f.name.replace(/\.wav$/i, ''), data: btoa(bin) });
+    // A plain string, not JSON: parsing a long JSON string costs the program ~55× its size.
+    await request('add:' + f.name.replace(/\.wav$/i, '').replace(/\n/g, ' ') + '\n' + btoa(bin));
     e.target.value = '';
   };
 
