@@ -2,18 +2,25 @@
 // 4 to 32 bits per sample and the four channel assignments. The result is 16-bit PCM for the
 // player: deeper samples are truncated to 16 bits, shallower ones scaled up, and of a stream
 // with more than two channels only the first two (front left and right) are kept.
+//
+// It decodes a frame at a time (`next`), so a track plays while it is decoded, and `seek`
+// finds the frame holding any sample by bisecting the file on the sample numbers that frame
+// headers carry: no index, nothing to scan when a file is loaded.
 
 import bits;
-import wav;
 
 struct Info {
     rate: int,
     channels: int,
     depth: int,
+    /// The block size of a fixed-blocksize stream (frame number × it = first sample).
+    max_block: int,
+    /// Samples per channel; 0 when the encoder did not know.
+    total: int,
 }
 
 fn info_none() -> Info {
-    Info { rate: 0, channels: 0, depth: 0 }
+    Info { rate: 0, channels: 0, depth: 0, max_block: 0, total: 0 }
 }
 
 /// Block sizes by the 4-bit code of the frame header (0 = reserved, 6/7 = read after it).
@@ -88,11 +95,21 @@ fn read_metadata(b: bytes, from: int) -> Result<(Info, int), string> {
         let kind = b[at] & 127;
         let size = (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3];
         if (kind == 0 && size >= 18) {
-            let r = bits.over_range(b, at + 4 + 10, at + 4 + size);
+            let r = bits.over_range(b, at + 4, at + 4 + size);
+            bits.skip(r, 16);
+            let max_block = bits.get(r, 16);
+            bits.skip(r, 48);
             let rate = bits.get(r, 20);
             let channels = bits.get(r, 3) + 1;
             let depth = bits.get(r, 5) + 1;
-            info = Info { rate: rate, channels: channels, depth: depth };
+            let total = bits.get_long(r, 36);
+            info = Info {
+                rate: rate,
+                channels: channels,
+                depth: depth,
+                max_block: max_block,
+                total: total
+            };
         }
         at = at + 4 + size;
     }
@@ -230,20 +247,26 @@ fn lpc_predict(s: [int], coefs: [int], shift: int) -> unit {
     }
 }
 
-/// Where the next frame starts at or after `at`: a sync code whose header CRC checks out.
-fn find_sync(b: bytes, at: int) -> int {
-    var i = at;
-    while (i + 1 < b.len()) {
-        if (b[i] == 255 && (b[i + 1] & 254) == 248) {
-            return i;
-        }
-        i = i + 1;
-    }
-    b.len()
+/// A frame header that checked out.
+struct Head {
+    at: int,
+    /// The first sample of the frame (per channel, from the start of the stream).
+    first: int,
+    block: int,
+    depth: int,
+    assignment: int,
+    /// The bit where the first subframe starts.
+    body: int,
 }
 
-/// Decodes the frame at `at` into `sink`; returns where the next one starts.
-fn frame(b: bytes, at: int, info: Info, sink: wav.Sink) -> Result<int, string> {
+/// Parses the frame header at `at`: sync code, no reserved values, the stream's own rate and
+/// channel count, well-formed frame number and a good CRC-8 (which, with the rest, tells a
+/// header from the same bits inside audio data).
+fn header(b: bytes, at: int, info: Info) -> Result<Head, string> {
+    if (at + 6 > b.len() || b[at] != 255 || (b[at + 1] & 254) != 248) {
+        return Result.Err("FLAC: no frame header");
+    }
+    let variable = (b[at + 1] & 1) == 1;
     let r = bits.over_range(b, at, b.len());
     bits.skip(r, 16);
     let size_code = bits.get(r, 4);
@@ -252,17 +275,24 @@ fn frame(b: bytes, at: int, info: Info, sink: wav.Sink) -> Result<int, string> {
     let depth = sample_depth(bits.get(r, 3), info.depth);
     bits.skip(r, 1);
     // The frame or sample number, UTF-8 style: the leading ones say how many octets follow.
-    let first = bits.get(r, 8);
+    let lead = bits.get(r, 8);
     var extra = 0;
     var mask = 128;
-    while ((first & mask) != 0 && mask > 1) {
+    while ((lead & mask) != 0 && mask > 1) {
         extra = extra + 1;
         mask = mask >> 1;
     }
     if (extra == 1 || extra > 7) {
         return Result.Err("FLAC: bad frame number");
     }
-    bits.skip(r, if (extra == 0) { 0 } else { 8 * (extra - 1) });
+    var number = lead & (mask - 1);
+    for _ in 1..extra {
+        let more = bits.get(r, 8);
+        if ((more & 192) != 128) {
+            return Result.Err("FLAC: bad frame number");
+        }
+        number = (number << 6) | (more & 63);
+    }
     var block = block_size(size_code);
     if (size_code == 6) {
         block = bits.get(r, 8) + 1;
@@ -282,6 +312,46 @@ fn frame(b: bytes, at: int, info: Info, sink: wav.Sink) -> Result<int, string> {
     if (block == 0 || depth == 0 || rate_code == 15 || assignment > 10) {
         return Result.Err("FLAC: reserved value in the frame header");
     }
+    let channels = if (assignment <= 7) { assignment + 1 } else { 2 };
+    let rate = sample_rate(rate_code, info.rate);
+    if (channels != info.channels || (rate_code < 12 && rate != info.rate)) {
+        return Result.Err("FLAC: frame header of another stream");
+    }
+    let first = if (variable) { number } else { number * info.max_block };
+    Result.Ok(
+        Head {
+            at: at,
+            first: first,
+            block: block,
+            depth: depth,
+            assignment: assignment,
+            body: r.pos
+        }
+    )
+}
+
+/// The first good frame header at or after `at`, before `limit`.
+fn header_after(b: bytes, at: int, limit: int, info: Info) -> Option<Head> {
+    let stop = if (limit < b.len()) { limit } else { b.len() };
+    var i = at;
+    while (i + 1 < stop) {
+        if (b[i] == 255 && (b[i + 1] & 254) == 248) {
+            if let Result.Ok(h) = header(b, i, info) {
+                return Option.Some(h);
+            }
+        }
+        i = i + 1;
+    }
+    Option.None
+}
+
+/// Decodes the frame `h` heads, appending its samples to `out`; returns where the next one starts.
+fn frame(b: bytes, h: Head, info: Info, out: [int]) -> Result<int, string> {
+    let r = bits.over_range(b, 0, b.len());
+    r.pos = h.body;
+    let block = h.block;
+    let depth = h.depth;
+    let assignment = h.assignment;
     let channels = if (assignment <= 7) { assignment + 1 } else { 2 };
     var chans: [[int]] = [];
     for c in 0..channels {
@@ -317,48 +387,140 @@ fn frame(b: bytes, at: int, info: Info, sink: wav.Sink) -> Result<int, string> {
     let c = if (keep == 2 && channels > 1) { chans[1] } else { chans[0] };
     for i in 0..block {
         if (depth >= 16) {
-            wav.put(sink, a[i] >> (depth - 16));
+            out.push(a[i] >> (depth - 16));
             if (keep == 2) {
-                wav.put(sink, c[i] >> (depth - 16));
+                out.push(c[i] >> (depth - 16));
             }
         } else {
-            wav.put(sink, a[i] << (16 - depth));
+            out.push(a[i] << (16 - depth));
             if (keep == 2) {
-                wav.put(sink, c[i] << (16 - depth));
+                out.push(c[i] << (16 - depth));
             }
         }
     }
     Result.Ok(bits.octet_pos(r))
 }
 
-/// Decodes a whole FLAC file whose `fLaC` marker is at octet `from`. A damaged frame is
-/// skipped (decoding resumes at the next sync code); a file with no good frame is an error.
-pub fn decode(b: bytes, from: int) -> Result<wav.Pcm, string> {
+/// A FLAC file being played.
+pub struct Stream {
+    b: bytes,
+    info: Info,
+    /// Where the first frame starts.
+    start: int,
+    /// Where the next frame to decode starts.
+    at: int,
+    rate: int,
+    /// The channels it is decoded to (1 or 2).
+    channels: int,
+    /// Frames (samples per channel) in the file.
+    total: int,
+}
+
+/// Opens the FLAC file whose `fLaC` marker is at octet `from`: reads its metadata and finds
+/// the first frame. Nothing is decoded yet.
+pub fn open(b: bytes, from: int) -> Result<Stream, string> {
     let (info, start) = read_metadata(b, from)?;
     if (info.channels < 1 || info.rate < 1) {
         return Result.Err("FLAC: bad STREAMINFO");
     }
-    let sink = wav.sink();
-    var at = find_sync(b, start);
-    var frames = 0;
-    var last_error = "";
-    while (at < b.len()) {
-        match (frame(b, at, info, sink)) {
-            Result.Ok(next) => {
-                frames = frames + 1;
-                at = next;
+    let first = match (header_after(b, start, b.len(), info)) {
+        Option.Some(h) => h.at,
+        Option.None => return Result.Err("FLAC without audio frames"),
+    };
+    let total = if (info.total > 0) { info.total } else { count_from_tail(b, first, info) };
+    Result.Ok(
+        Stream {
+            b: b,
+            info: info,
+            start: first,
+            at: first,
+            rate: info.rate,
+            channels: if (info.channels > 2) { 2 } else { info.channels },
+            total: total
+        }
+    )
+}
+
+/// The length of a stream whose STREAMINFO does not say it: where the last frame ends.
+fn count_from_tail(b: bytes, first: int, info: Info) -> int {
+    let window = b.len() - 1048576;
+    var at = if (window > first) { window } else { first };
+    var total = 0;
+    var more = true;
+    while (more) {
+        match (header_after(b, at, b.len(), info)) {
+            Option.Some(h) => {
+                total = h.first + h.block;
+                at = h.at + 1;
             },
-            Result.Err(e) => {
-                last_error = e;
-                at = find_sync(b, at + 1);
+            Option.None => {
+                more = false;
             },
         }
     }
-    if (frames == 0) {
-        return Result.Err(
-            if (last_error == "") { "FLAC without audio frames" } else { last_error }
-        );
+    total
+}
+
+/// Decodes the next frame, appending its samples to `out`; returns the frame its first
+/// sample is, or None at the end of the file. A damaged frame is skipped (decoding resumes at
+/// the next good header).
+pub fn next(s: Stream, out: [int]) -> Option<int> {
+    while (s.at < s.b.len()) {
+        match (header_after(s.b, s.at, s.b.len(), s.info)) {
+            Option.Some(h) => {
+                match (frame(s.b, h, s.info, out)) {
+                    Result.Ok(after) => {
+                        s.at = after;
+                        return Option.Some(h.first);
+                    },
+                    Result.Err(_) => {
+                        s.at = h.at + 1;
+                    },
+                }
+            },
+            Option.None => {
+                s.at = s.b.len();
+            },
+        }
     }
-    let channels = if (info.channels > 2) { 2 } else { info.channels };
-    Result.Ok(wav.Pcm { rate: info.rate, channels: channels, data: wav.finish(sink) })
+    Option.None
+}
+
+/// Makes `next` continue from the frame that holds sample `pos`: bisects the file on the
+/// headers' sample numbers down to 64 KB, then walks the headers in that stretch.
+pub fn seek(s: Stream, pos: int) -> unit {
+    var lo = s.start;
+    var hi = s.b.len();
+    while (hi - lo > 65536) {
+        let mid = lo + (hi - lo) / 2;
+        match (header_after(s.b, mid, hi, s.info)) {
+            Option.Some(h) => {
+                if (h.first <= pos) {
+                    lo = h.at;
+                } else {
+                    hi = mid;
+                }
+            },
+            Option.None => {
+                hi = mid;
+            },
+        }
+    }
+    var best = lo;
+    var more = true;
+    while (more) {
+        match (header_after(s.b, best + 1, s.b.len(), s.info)) {
+            Option.Some(h) => {
+                if (h.first <= pos) {
+                    best = h.at;
+                } else {
+                    more = false;
+                }
+            },
+            Option.None => {
+                more = false;
+            },
+        }
+    }
+    s.at = best;
 }

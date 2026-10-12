@@ -4,11 +4,14 @@
 // structure and names where it helps to compare, flat arrays with offsets where C has pointers.
 // Layers I and II and free-format streams are refused. The Xing/Info frame is skipped and, when
 // it carries LAME's encoder delay and padding, they are trimmed (gapless, like ffmpeg).
+//
+// `open` only walks the frame headers (a few thousand hops for a song) to index where each
+// frame starts; `next` decodes one frame at a time while the track plays, and `seek` restarts
+// a few frames before the one asked for, so the bit reservoir and the overlap are warm.
 
 import std/math;
 import bits;
 import mp3_tables;
-import wav;
 
 /// The tables, built once per file (a `const` array would be rebuilt on every access, findings
 /// #157).
@@ -1232,8 +1235,27 @@ fn synth_granule(d: Dec, nch: int) -> unit {
 
 // ---- frames ----
 
-/// Decodes the Layer III frame at `at` (`size` bytes) into `sink`.
-fn frame(d: Dec, b: bytes, at: int, size: int, sink: wav.Sink) -> Result<unit, string> {
+/// Forgets everything carried from frame to frame (before decoding from somewhere else).
+fn reset(d: Dec) -> unit {
+    d.reserv = bytes_of([]);
+    // Bounds hoisted: `for i in 0..xs.len()` while writing `xs[i]` panics in native code
+    // (findings #156).
+    let overlap = d.overlap;
+    let n_overlap = overlap.len();
+    for i in 0..n_overlap {
+        overlap[i] = 0.0;
+    }
+    let qmf = d.qmf;
+    let n_qmf = qmf.len();
+    for i in 0..n_qmf {
+        qmf[i] = 0.0;
+    }
+}
+
+/// Decodes the Layer III frame at `at` (`size` bytes), appending its samples to `out`. A
+/// frame whose main data starts in frames not seen (after a seek, or a damaged one) adds
+/// nothing.
+fn frame(d: Dec, b: bytes, at: int, size: int, out: [int]) -> Result<unit, string> {
     let h = hdr_at(b, at);
     let nch = channels_of(h);
     let r = bits.over_range(b, at + 4, at + size);
@@ -1259,7 +1281,7 @@ fn frame(d: Dec, b: bytes, at: int, size: int, sink: wav.Sink) -> Result<unit, s
             synth_granule(d, nch);
             let pcm = d.pcm;
             for i in 0..576 * nch {
-                wav.put(sink, pcm[i]);
+                out.push(pcm[i]);
             }
         }
     }
@@ -1309,20 +1331,40 @@ fn info_frame(b: bytes, at: int, size: int) -> Option<(int, int)> {
     Option.Some((delay, padding))
 }
 
-/// Decodes a whole MP3 file whose first frame (or junk before it) starts at octet `from`.
-/// The first frame is taken only when the header after it belongs to the same stream, which
-/// keeps tags and junk from being read as audio; after that, a header like the previous one
-/// is enough (the last frame may be followed by an ID3v1 tag).
-pub fn decode(b: bytes, from: int) -> Result<wav.Pcm, string> {
-    let d = decoder();
-    let sink = wav.sink();
+/// An MP3 file being played.
+pub struct Stream {
+    b: bytes,
+    d: Dec,
+    /// Where each audio frame starts, and its size.
+    offsets: [int],
+    sizes: [int],
+    /// Samples per channel in a frame (1152, or 576 for MPEG-2 and 2.5).
+    per_frame: int,
+    /// The encoder delay to drop from the start.
+    trim_start: int,
+    /// The index of the next frame to decode.
+    next: int,
+    rate: int,
+    channels: int,
+    /// Frames (samples per channel) once delay and padding are trimmed.
+    total: int,
+}
+
+/// Opens the MP3 whose first frame (or junk before it) starts at octet `from`, indexing its
+/// frames. The first frame is taken only when the header after it belongs to the same
+/// stream, which keeps tags and junk from being read as audio; after that, a header like the
+/// previous one is enough (the last frame may be followed by an ID3v1 tag). Frames of another
+/// rate or channel count are left out.
+pub fn open(b: bytes, from: int) -> Result<Stream, string> {
+    var offsets: [int] = [];
+    var sizes: [int] = [];
     var at = from;
     var rate = 0;
     var channels = 0;
-    var frames = 0;
+    var per_frame = 0;
+    var seen = 0;
     var trim_start = 0;
     var trim_end = 0;
-    var last_error = "";
     var locked = -1;
     while (at + 4 <= b.len()) {
         if (!valid_at(b, at)) {
@@ -1343,13 +1385,13 @@ pub fn decode(b: bytes, from: int) -> Result<wav.Pcm, string> {
         if (layer_of(h) != 3) {
             return Result.Err("MPEG layer ${to_string(layer_of(h))} is not supported (only MP3)");
         }
-        if (frames == 0) {
+        if (seen == 0) {
             if let Option.Some(gap) = info_frame(b, at, size) {
                 if (gap.0 > 0 || gap.1 > 0) {
                     trim_start = gap.0 + 529;
                     trim_end = if (gap.1 > 529) { gap.1 - 529 } else { 0 };
                 }
-                frames = 1;
+                seen = 1;
                 at = next;
                 continue;
             }
@@ -1357,32 +1399,74 @@ pub fn decode(b: bytes, from: int) -> Result<wav.Pcm, string> {
         if (rate == 0) {
             rate = sample_rate(h);
             channels = channels_of(h);
+            per_frame = frame_samples(h);
         }
         if (sample_rate(h) == rate && channels_of(h) == channels) {
-            match (frame(d, b, at, size, sink)) {
-                Result.Ok(_) => { },
-                Result.Err(e) => {
-                    last_error = e;
-                    d.reserv = bytes_of([]);
-                },
-            }
+            offsets.push(at);
+            sizes.push(size);
         }
-        frames = frames + 1;
+        seen = seen + 1;
         locked = at;
         at = next;
     }
-    let data = wav.finish(sink);
-    if (rate == 0 || data.len() == 0) {
-        return Result.Err(if (last_error == "") { "no MP3 audio found" } else { last_error });
+    if (offsets.len() == 0) {
+        return Result.Err("no MP3 audio found");
     }
-    let block = 2 * channels;
-    let cut_start = if (trim_start * block < data.len()) { trim_start * block } else { 0 };
-    let cut_end = if (cut_start + trim_end * block < data.len()) { trim_end * block } else { 0 };
+    let raw = offsets.len() * per_frame;
+    // Trimming more than there is would leave nothing: then the file is played untrimmed.
+    let trimmed = trim_start + trim_end < raw;
     Result.Ok(
-        wav.Pcm {
+        Stream {
+            b: b,
+            d: decoder(),
+            offsets: offsets,
+            sizes: sizes,
+            per_frame: per_frame,
+            trim_start: if (trimmed) { trim_start } else { 0 },
+            next: 0,
             rate: rate,
             channels: channels,
-            data: data.sub_bytes(cut_start, data.len() - cut_end)
+            total: if (trimmed) { raw - trim_start - trim_end } else { raw }
         }
     )
+}
+
+/// Decodes the next frame, appending its samples to `out`; returns the frame its first
+/// sample is (negative within the encoder delay), or None at the end. A frame that cannot be
+/// decoded adds silence, so the timeline stays put.
+pub fn next(s: Stream, out: [int]) -> Option<int> {
+    if (s.next >= s.offsets.len()) {
+        return Option.None;
+    }
+    let k = s.next;
+    let before = out.len();
+    match (frame(s.d, s.b, s.offsets[k], s.sizes[k], out)) {
+        Result.Ok(_) => { },
+        Result.Err(_) => {
+            s.d.reserv = bytes_of([]);
+        },
+    }
+    let want = before + s.per_frame * s.channels;
+    while (out.len() < want) {
+        out.push(0);
+    }
+    s.next = k + 1;
+    Option.Some(k * s.per_frame - s.trim_start)
+}
+
+/// Makes `next` continue from the frame that holds sample `pos`, after decoding (and
+/// dropping) up to 8 frames before it: the bit reservoir reaches back at most 511 octets.
+pub fn seek(s: Stream, pos: int) -> unit {
+    var k = (pos + s.trim_start) / s.per_frame;
+    if (k >= s.offsets.len()) {
+        k = s.offsets.len();
+    }
+    let from = if (k > 8) { k - 8 } else { 0 };
+    reset(s.d);
+    var scratch: [int] = [];
+    for j in from..k {
+        let _ok = frame(s.d, s.b, s.offsets[j], s.sizes[j], scratch);
+        scratch = [];
+    }
+    s.next = k;
 }

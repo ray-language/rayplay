@@ -11,9 +11,14 @@ con `std/audio`, y la página es solo la interfaz.
 - Tres pistas **procedurales** (un estudio pentatónico, un dron, un pulso de bajo), calculadas
   trozo a trozo: la app no lleva archivos de audio y ninguna pista ocupa memoria entera.
 - **Cargar una canción en MP3, FLAC o WAV** y añadirla a la lista (diálogo nativo en el
-  escritorio, selector del webview en el móvil). El programa la decodifica a PCM de 16 bits con
-  decodificadores escritos en **raylang puro** (`src/mp3.ray`, `src/flac.ray`, `src/wav.ray`) y
-  la reproduce a su frecuencia y canales. El formato se reconoce por el contenido, no por el nombre.
+  escritorio, selector del webview en el móvil). Los decodificadores están escritos en **raylang
+  puro** (`src/mp3.ray`, `src/flac.ray`, `src/wav.ray`) y la reproduce a su frecuencia y canales.
+  El formato se reconoce por el contenido, no por el nombre.
+- **MP3 y FLAC se decodifican mientras suenan** (`codec.Stream`): al cargar solo se leen las
+  cabeceras, así que la canción empieza al momento y ocupa lo que pesa el archivo. El seek salta
+  a cualquier punto: en FLAC, bisecando el archivo por los números de muestra de las cabeceras de
+  frame; en MP3, con un índice de frames y decodificando antes los 8 frames previos (reservorio de
+  bits). Tras un salto, las muestras son idénticas a decodificar desde el principio.
 - Play/pausa, stop, anterior/siguiente (con vuelta), **seek** tocando la barra, volumen, y al
   acabar una pista sigue con la siguiente. Un cambio de volumen se aplica como una rampa a lo
   largo del siguiente trozo de 50 ms (`synth.chunk_ramp`), no como un escalón que suena a clic.
@@ -35,7 +40,9 @@ con `std/audio`, y la página es solo la interfaz.
 │  player.ray   ACTOR: una fibra con el dispositivo (std/audio) y la  │
 │               lista; comandos por canal; 50 ms por chunk            │
 │  synth.ray    las pistas: procedurales o archivo cargado → s16le    │
-│  codec.ray    reconoce el formato (salta ID3v2) y lo decodifica     │
+│  codec.ray    reconoce el formato (salta ID3v2); Stream decodifica  │
+│               MP3/FLAC por frames mientras suena y sirve cualquier  │
+│               ventana (seek)                                        │
 │  mp3.ray      MPEG-1/2/2.5 Layer III (port de minimp3)              │
 │  flac.ray     FLAC nativo, 4–32 bits, cualquier tamaño de bloque    │
 │  wav.ray      PCM de 16 bits (Pcm, Sink) y RIFF/WAVE (16 y 24 bits) │
@@ -60,7 +67,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 31 tests: MP3, FLAC, WAV, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
+make test            # 35 tests: MP3, FLAC, WAV, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -94,8 +101,8 @@ el emulador Android.
 
 | Qué | Verificado |
 |---|---|
-| Backend | `make test`: 31 tests, VM y nativo (`make test-native`) |
-| Decodificadores | FLAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono, nivel 12, el codificador de Apple). MP3 idéntico a minimp3 compilado en C salvo ±1 en el 0,1 % de las muestras (floats de 64 frente a 32 bits): CBR, VBR, mono, joint y simple stereo, MPEG-2 22 kHz, MPEG-2.5 8 kHz, con ID3v2/ID3v1 y el recorte gapless de LAME. Una pista de 5 min en nativo (Mac): FLAC 1,1 s, MP3 1,6 s |
+| Backend | `make test`: 35 tests, VM y nativo (`make test-native`) |
+| Decodificadores | FLAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono, nivel 12, el codificador de Apple). MP3 idéntico a minimp3 compilado en C salvo ±1 en el 0,1 % de las muestras (floats de 64 frente a 32 bits): CBR, VBR, mono, joint y simple stereo, MPEG-2 22 kHz, MPEG-2.5 8 kHz, con ID3v2/ID3v1 y el recorte gapless de LAME. Una pista de 5 min en nativo (Mac), entera en streaming: FLAC 1,2 s y 68 MB de pico (el archivo pesa 30), MP3 1,2 s y 16 MB (antes, decodificándola entera al cargar: 287 y 256 MB). Abrir y servir el primer trozo, ~1 ms. Tras 40 saltos aleatorios por archivo, las muestras coinciden exactamente con la decodificación completa |
 | Programa completo | `ray run` headless: monta `www/` y abre `ray://app/index.html` |
 | iOS | simulador iPhone 16 Pro (`ray bundle --ios --ios-target sim`, shell 1.27.19 con sesión `playback` y `UIBackgroundModes = audio`): arranca, la página llega por `ray://app`, el puente responde y el display muestra el `lifecycle` del shell; `audio.open` abre el dispositivo dentro del shell (comprobado con una mini app) |
 | Android | emulador arm64 (`ray bundle --android`, shell 1.27.19 con *foreground service* `mediaPlayback`): Play por `adb`, Home durante 10 s, vuelta: la posición pasó de 0:05 a 0:17 y el display dice «played in the background: 0:09». **El audio sigue en segundo plano** |
@@ -106,12 +113,13 @@ el emulador Android.
 
 - MP3 (Layer III; ni Layer I/II ni *free format*), FLAC nativo (no Ogg FLAC) y WAV PCM de 16 o
   24 bits. Ni OGG/Vorbis ni AAC/M4A: la stdlib no trae decodificadores y estos no están escritos.
-  Todo se decodifica entero al cargar (unos 10 MB de PCM por minuto en estéreo a 44,1 kHz), en el
-  hilo que atiende a la página. Lo que pase de 16 bits se trunca (sin dither); de un FLAC de más
+  Lo que pase de 16 bits se trunca (sin dither); de un FLAC de más
   de dos canales se quedan los dos primeros. El reproductor no remuestrea: abre el dispositivo a
   la frecuencia de la pista.
-- En la shell de desarrollo (VM), decodificar es lento: un MP3 de 6 s tarda 1,8 s en el Mac, así
-  que una canción entera tarda minutos. Para probar con música de verdad, la app nativa.
+- En la shell de desarrollo (VM), decodificar va justo: en el Mac, 5 s de audio en 1,4–1,6 s
+  (MP3) y 0,6 s (FLAC), unas 3,5× el tiempo real; un seek, 30–80 ms. En un teléfono puede no dar
+  abasto; para probar con música de verdad, la app nativa.
+- Un WAV no se decodifica: se guarda como PCM tal cual (un WAV de 24 bits, ya reducido a 16).
 - Cargar un archivo: en el escritorio, el programa abre el diálogo nativo y lo lee del disco.
   En iOS/Android no hay diálogo (`ui.pick_file_with` devuelve «file dialogs are not available on
   mobile (v1)», #152), así que la página usa su `<input type=file>` y el archivo cruza el puente

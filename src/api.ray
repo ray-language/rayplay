@@ -8,7 +8,8 @@
 //   stop · next · prev
 //   seek {ms} · volume {value}
 //   pick                       → the native file dialog; the chosen file (WAV, FLAC or MP3) is
-//                                read from disk, decoded and appended to the playlist
+//                                read from disk and appended to the playlist (FLAC and MP3
+//                                are decoded as they play)
 //                                (cancelling changes nothing)
 //   "add:<name>\n<base64>"     → a WAV, FLAC or MP3 from the page's file input, appended to the
 //                                playlist; for a shell without a native dialog (iOS). A plain
@@ -91,15 +92,15 @@ fn pick(cmds: Channel<player.Cmd>) -> Result<bool, string> {
     let chosen = ui.pick_file_with(o).map_err(fn(e: string) -> string { "dialog: " + e })?;
     match (chosen) {
         Option.Some(path) => {
-            let pcm = codec.decode(fs.read_file_bytes(path)?)?;
-            send(cmds, player.Cmd.Add(synth.loaded(track_name(path), pcm)));
+            let src = codec.open(fs.read_file_bytes(path)?)?;
+            send(cmds, player.Cmd.Add(synth.of_source(track_name(path), src)));
             Result.Ok(true)
         },
         Option.None => Result.Ok(false),
     }
 }
 
-/// `add:<name>\n<base64>`: decodes the file and appends it to the playlist.
+/// `add:<name>\n<base64>`: opens the file and appends it to the playlist.
 fn add(cmds: Channel<player.Cmd>, body: string) -> Result<unit, string> {
     // As octets: `b[i]` and `sub_bytes` are O(1), unlike indexing the string by character.
     let b = body.to_bytes();
@@ -108,8 +109,8 @@ fn add(cmds: Channel<player.Cmd>, body: string) -> Result<unit, string> {
         Option.None => return Result.Err("add: missing the file after the name"),
     };
     let name = from_utf8(b.sub_bytes(4, cut))?;
-    let pcm = codec.decode(b64.decode(b, cut + 1)?)?;
-    Result.Ok(send(cmds, player.Cmd.Add(synth.loaded(name, pcm))))
+    let src = codec.open(b64.decode(b, cut + 1)?)?;
+    Result.Ok(send(cmds, player.Cmd.Add(synth.of_source(name, src))))
 }
 
 fn dispatch(cmds: Channel<player.Cmd>, body: string) -> Result<string, string> {

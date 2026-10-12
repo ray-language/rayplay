@@ -104,3 +104,60 @@ fn id3v2_tags_are_skipped() {
     assert_eq(codec.skip_id3(bytes_of(head) + "fLaC".to_bytes()), 139);
     assert_eq(codec.skip_id3("fLaC".to_bytes()), 0);
 }
+
+fn stream(name: string) -> codec.Stream {
+    match (codec.open(fixture(name)).unwrap()) {
+        codec.Source.Stream(s) => s,
+        codec.Source.Pcm(_) => panic("${name} opened as PCM"),
+    }
+}
+
+/// The samples of `s` from frame `from` on, as `read` serves them after `codec.decode`'s.
+fn reads_like_the_whole_decode(name: string, starts: [int]) {
+    let whole = codec.decode(fixture(name)).unwrap();
+    let s = stream(name);
+    let ch = s.channels;
+    for from in starts {
+        // A seek (backwards too), then a second read that goes on from it.
+        let got = codec.read(s, from, 700) + codec.read(s, from + 700, 700);
+        for i in 0..got.len() {
+            let at = from * ch + i;
+            var want = 0;
+            if (2 * at + 1 < whole.data.len()) {
+                want = whole.data[2 * at] + whole.data[2 * at + 1] * 256;
+                if (want >= 32768) {
+                    want = want - 65536;
+                }
+            }
+            assert_eq(got[i], want);
+        }
+    }
+}
+
+@test
+fn flac_and_mp3_open_as_streams_of_the_right_length() {
+    let f = stream("tiny.flac");
+    assert_eq(f.total, 13230);
+    assert_eq(f.rate, 44100);
+    let m = stream("tiny.mp3");
+    assert_eq(m.total, 13230);
+    // A WAV needs no decoding: it stays PCM.
+    match (codec.open(fixture("tiny.wav")).unwrap()) {
+        codec.Source.Pcm(p) => assert_eq(wav.frames(p), 2),
+        codec.Source.Stream(_) => panic("a WAV opened as a stream"),
+    }
+}
+
+@test
+fn a_flac_read_after_any_seek_is_exact() {
+    reads_like_the_whole_decode("tiny.flac", [9000, 0, 4095, 4096, 12900, 2000]);
+    reads_like_the_whole_decode("tiny24.flac", [6000, 100, 13000]);
+}
+
+@test
+fn an_mp3_read_after_any_seek_matches_decoding_from_the_start() {
+    // The seek decodes the frames before the target first, so even the bit reservoir and the
+    // overlap match a decode from the start.
+    reads_like_the_whole_decode("tiny.mp3", [9000, 0, 1152, 5000, 12900]);
+    reads_like_the_whole_decode("tiny22.mp3", [4000, 0, 7000]);
+}
