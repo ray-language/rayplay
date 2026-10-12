@@ -1,0 +1,179 @@
+// Turns an audio file into 16-bit PCM for the player, whatever its format: WAV, FLAC or MP3,
+// recognized by their content (not the file name). An ID3v2 tag in front is skipped.
+//
+// A WAV is PCM already and is kept as it is. FLAC and MP3 are kept compressed and decoded
+// while they play: a `Stream` holds the file, its decoder and the few thousand samples
+// decoded ahead, and `read` serves any window of the track, seeking when it is not the next
+// one. So a song starts at once and costs its file size, not ten times it.
+
+import flac;
+import mp3;
+import wav;
+
+/// The extensions the file dialogs and the page offer.
+pub fn extensions() -> [string] {
+    ["wav", "flac", "mp3"]
+}
+
+fn starts(b: bytes, at: int, tag: string) -> bool {
+    let t = tag.to_bytes();
+    at + t.len() <= b.len() && b.sub_bytes(at, at + t.len()) == t
+}
+
+/// Where the audio starts once a leading ID3v2 tag (or several) is skipped.
+pub fn skip_id3(b: bytes) -> int {
+    var at = 0;
+    while (starts(b, at, "ID3") && at + 10 <= b.len()) {
+        // Syncsafe size: 4 × 7 bits, not counting the 10-byte header (nor the footer).
+        let size = (b[at + 6] << 21) | (b[at + 7] << 14) | (b[at + 8] << 7) | b[at + 9];
+        let footer = if ((b[at + 5] & 16) != 0) { 10 } else { 0 };
+        at = at + 10 + size + footer;
+    }
+    if (at > b.len()) { b.len() } else { at }
+}
+
+enum Decoder {
+    Flac(flac.Stream),
+    Mp3(mp3.Stream),
+}
+
+/// A compressed file being played.
+pub struct Stream {
+    dec: Decoder,
+    rate: int,
+    channels: int,
+    /// Frames (samples per channel) in the track.
+    total: int,
+    /// Decoded samples (interleaved, signed 16-bit) and the frame the first one is.
+    buf: [int],
+    buf_from: int,
+}
+
+/// What a loaded file becomes.
+pub enum Source {
+    Pcm(wav.Pcm),
+    Stream(Stream),
+}
+
+fn stream_of(dec: Decoder, rate: int, channels: int, total: int) -> Source {
+    Source.Stream(
+        Stream { dec: dec, rate: rate, channels: channels, total: total, buf: [], buf_from: 0 }
+    )
+}
+
+/// Recognizes `b` as WAV, FLAC or MP3 and gets it ready to play.
+pub fn open(b: bytes) -> Result<Source, string> {
+    if (starts(b, 0, "RIFF")) {
+        return Result.Ok(Source.Pcm(wav.parse(b)?));
+    }
+    let at = skip_id3(b);
+    if (starts(b, at, "fLaC")) {
+        let f = flac.open(b, at)?;
+        return Result.Ok(stream_of(Decoder.Flac(f), f.rate, f.channels, f.total));
+    }
+    let looks_mp3 = at + 1 < b.len() && b[at] == 255 && (b[at + 1] & 0xE0) == 0xE0;
+    // Some MP3s carry junk before the first frame: the indexer looks for one anyway.
+    match (mp3.open(b, at)) {
+        Result.Ok(m) => Result.Ok(stream_of(Decoder.Mp3(m), m.rate, m.channels, m.total)),
+        Result.Err(e) => Result.Err(if (looks_mp3) { e } else { "not a WAV, FLAC or MP3 file" }),
+    }
+}
+
+/// Decodes the next block into `out`; its first frame, or None at the end.
+fn decode_next(s: Stream, out: [int]) -> Option<int> {
+    match (s.dec) {
+        Decoder.Flac(f) => flac.next(f, out),
+        Decoder.Mp3(m) => mp3.next(m, out),
+    }
+}
+
+fn seek(s: Stream, pos: int) -> unit {
+    match (s.dec) {
+        Decoder.Flac(f) => flac.seek(f, pos),
+        Decoder.Mp3(m) => mp3.seek(m, pos),
+    }
+    s.buf = [];
+    s.buf_from = pos;
+}
+
+/// `frames` frames of the track from frame `from`, as interleaved signed 16-bit samples;
+/// silence past the end. Reading on from where the last read ended only decodes what is new;
+/// anything else (a seek, a restart) repositions the decoder first.
+pub fn read(s: Stream, from: int, frames: int) -> [int] {
+    let ch = s.channels;
+    var buf_end = s.buf_from + s.buf.len() / ch;
+    // Behind the buffer, or more than half a second past it: reposition instead of decoding on.
+    if (from < s.buf_from || from > buf_end + s.rate / 2) {
+        seek(s, from);
+    }
+    // Drop what is behind `from`, so the buffer holds little more than a block.
+    if (from > s.buf_from && s.buf.len() > 0) {
+        let old = s.buf;
+        let skip = (from - s.buf_from) * ch;
+        var kept: [int] = [];
+        let n = old.len();
+        var i = skip;
+        while (i < n) {
+            kept.push(old[i]);
+            i = i + 1;
+        }
+        s.buf = kept;
+        s.buf_from = if (skip < n) { from } else { s.buf_from + n / ch };
+    }
+    buf_end = s.buf_from + s.buf.len() / ch;
+    let want = if (from + frames < s.total) { from + frames } else { s.total };
+    var more = true;
+    while (buf_end < want && more) {
+        var block: [int] = [];
+        match (decode_next(s, block)) {
+            Option.Some(first) => {
+                if (first != buf_end || s.buf.len() == 0) {
+                    // Not where the buffer ends (the first block after a seek starts at or
+                    // before the frame asked for): start the buffer over at it.
+                    s.buf = block;
+                    s.buf_from = first;
+                } else {
+                    let buf = s.buf;
+                    for v in block {
+                        buf.push(v);
+                    }
+                }
+                buf_end = s.buf_from + s.buf.len() / ch;
+            },
+            Option.None => {
+                more = false;
+            },
+        }
+    }
+    let buf = s.buf;
+    let base = s.buf_from;
+    var out: [int] = [];
+    for i in 0..frames {
+        let f = from + i;
+        let inside = f < s.total && f >= base && f < buf_end;
+        for c in 0..ch {
+            out.push(if (inside) { buf[(f - base) * ch + c] } else { 0 });
+        }
+    }
+    out
+}
+
+/// Decodes `b` whole, as WAV, FLAC or MP3 (tests and tools; the player streams).
+pub fn decode(b: bytes) -> Result<wav.Pcm, string> {
+    match (open(b)?) {
+        Source.Pcm(p) => Result.Ok(p),
+        Source.Stream(s) => {
+            let sink = wav.sink();
+            let step = s.rate;
+            var at = 0;
+            while (at < s.total) {
+                let n = if (at + step < s.total) { step } else { s.total - at };
+                for v in read(s, at, n) {
+                    wav.put(sink, v);
+                }
+                at = at + n;
+            }
+            Result.Ok(wav.Pcm { rate: s.rate, channels: s.channels, data: wav.finish(sink) })
+        },
+    }
+}

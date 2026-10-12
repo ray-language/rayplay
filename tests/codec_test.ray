@@ -1,0 +1,163 @@
+import std/fs;
+import codec;
+import wav;
+
+fn fixture(name: string) -> bytes {
+    fs.read_file_bytes("tests/fixtures/" + name).unwrap()
+}
+
+/// The largest difference between two s16le buffers of the same length, or -1 if the lengths
+/// differ.
+fn max_diff(a: bytes, b: bytes) -> int {
+    if (a.len() != b.len()) {
+        return -1;
+    }
+    var worst = 0;
+    var i = 0;
+    let n = a.len();
+    while (i < n) {
+        var x = a[i] + a[i + 1] * 256;
+        var y = b[i] + b[i + 1] * 256;
+        if (x >= 32768) {
+            x = x - 65536;
+        }
+        if (y >= 32768) {
+            y = y - 65536;
+        }
+        let d = if (x > y) { x - y } else { y - x };
+        if (d > worst) {
+            worst = d;
+        }
+        i = i + 2;
+    }
+    worst
+}
+
+// The references (*.raw) are ffmpeg's output for the same files: FLAC is lossless, so it must
+// match exactly; MP3 decoders differ in the last bit or two of rounding.
+
+@test
+fn a_16_bit_stereo_flac_decodes_exactly() {
+    let p = codec.decode(fixture("tiny.flac")).unwrap();
+    assert_eq(p.rate, 44100);
+    assert_eq(p.channels, 2);
+    assert_eq(max_diff(p.data, fixture("tiny.flac.raw")), 0);
+}
+
+@test
+fn a_24_bit_mono_flac_decodes_exactly_to_16_bits() {
+    let p = codec.decode(fixture("tiny24.flac")).unwrap();
+    assert_eq(p.channels, 1);
+    assert_eq(max_diff(p.data, fixture("tiny24.flac.raw")), 0);
+}
+
+@test
+fn an_mp3_with_id3_tags_decodes_gapless() {
+    // ID3v2 in front, a LAME Info frame (encoder delay and padding are trimmed), ID3v1 behind.
+    let p = codec.decode(fixture("tiny.mp3")).unwrap();
+    assert_eq(p.rate, 44100);
+    assert_eq(p.channels, 2);
+    let d = max_diff(p.data, fixture("tiny.mp3.raw"));
+    assert(d >= 0 && d <= 2);
+}
+
+@test
+fn an_mpeg2_mono_mp3_decodes() {
+    let p = codec.decode(fixture("tiny22.mp3")).unwrap();
+    assert_eq(p.rate, 22050);
+    assert_eq(p.channels, 1);
+    let d = max_diff(p.data, fixture("tiny22.mp3.raw"));
+    assert(d >= 0 && d <= 2);
+}
+
+@test
+fn a_wav_still_goes_through_the_wav_reader() {
+    let p = codec.decode(fixture("tiny.wav")).unwrap();
+    assert_eq(wav.frames(p), 2);
+}
+
+@test
+fn damaged_and_unknown_files_are_refused() {
+    assert(codec.decode(bytes_of([1, 2, 3])).is_err());
+    assert(codec.decode("hello, world".to_bytes()).is_err());
+    // A FLAC marker with nothing behind it.
+    assert(codec.decode("fLaC".to_bytes()).is_err());
+    // The first 300 octets of a FLAC: STREAMINFO is there, the frames are cut short.
+    assert(codec.decode(fixture("tiny.flac").sub_bytes(0, 300)).is_err());
+}
+
+@test
+fn a_truncated_mp3_keeps_the_frames_it_has() {
+    let whole = fixture("tiny.mp3");
+    let p = codec.decode(whole.sub_bytes(0, whole.len() / 2)).unwrap();
+    assert(wav.frames(p) > 0);
+    assert(wav.frames(p) < 13230);
+}
+
+@test
+fn id3v2_tags_are_skipped() {
+    // "ID3", version, flags, syncsafe size 0x0101 = 129, then the audio.
+    var head: [int] = [73, 68, 51, 3, 0, 0, 0, 0, 1, 1];
+    for _ in 0..129 {
+        head.push(0);
+    }
+    assert_eq(codec.skip_id3(bytes_of(head) + "fLaC".to_bytes()), 139);
+    assert_eq(codec.skip_id3("fLaC".to_bytes()), 0);
+}
+
+fn stream(name: string) -> codec.Stream {
+    match (codec.open(fixture(name)).unwrap()) {
+        codec.Source.Stream(s) => s,
+        codec.Source.Pcm(_) => panic("${name} opened as PCM"),
+    }
+}
+
+/// The samples of `s` from frame `from` on, as `read` serves them after `codec.decode`'s.
+fn reads_like_the_whole_decode(name: string, starts: [int]) {
+    let whole = codec.decode(fixture(name)).unwrap();
+    let s = stream(name);
+    let ch = s.channels;
+    for from in starts {
+        // A seek (backwards too), then a second read that goes on from it.
+        let got = codec.read(s, from, 700) + codec.read(s, from + 700, 700);
+        for i in 0..got.len() {
+            let at = from * ch + i;
+            var want = 0;
+            if (2 * at + 1 < whole.data.len()) {
+                want = whole.data[2 * at] + whole.data[2 * at + 1] * 256;
+                if (want >= 32768) {
+                    want = want - 65536;
+                }
+            }
+            assert_eq(got[i], want);
+        }
+    }
+}
+
+@test
+fn flac_and_mp3_open_as_streams_of_the_right_length() {
+    let f = stream("tiny.flac");
+    assert_eq(f.total, 13230);
+    assert_eq(f.rate, 44100);
+    let m = stream("tiny.mp3");
+    assert_eq(m.total, 13230);
+    // A WAV needs no decoding: it stays PCM.
+    match (codec.open(fixture("tiny.wav")).unwrap()) {
+        codec.Source.Pcm(p) => assert_eq(wav.frames(p), 2),
+        codec.Source.Stream(_) => panic("a WAV opened as a stream"),
+    }
+}
+
+@test
+fn a_flac_read_after_any_seek_is_exact() {
+    reads_like_the_whole_decode("tiny.flac", [9000, 0, 4095, 4096, 12900, 2000]);
+    reads_like_the_whole_decode("tiny24.flac", [6000, 100, 13000]);
+}
+
+@test
+fn an_mp3_read_after_any_seek_matches_decoding_from_the_start() {
+    // The seek decodes the frames before the target first, so even the bit reservoir and the
+    // overlap match a decode from the start.
+    reads_like_the_whole_decode("tiny.mp3", [9000, 0, 1152, 5000, 12900]);
+    reads_like_the_whole_decode("tiny22.mp3", [4000, 0, 7000]);
+}

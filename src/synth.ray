@@ -1,9 +1,11 @@
 // The tracks. Three are procedural — a few minutes of sound computed chunk by chunk, so the
-// app ships no audio files and no track ever sits whole in memory — and any 16/24-bit WAV the
-// user loads becomes a fourth kind. `chunk` renders any window of a track as s16le at the
-// track's rate, which is all the player needs.
+// app ships no audio files and no track ever sits whole in memory — and a song the user
+// loads is either PCM (a WAV) or a compressed file decoded as it plays (FLAC, MP3).
+// `chunk` renders any window of a track as s16le at the track's rate, which is all the
+// player needs.
 
 import std/math;
+import codec;
 import wav;
 
 pub enum Kind {
@@ -11,6 +13,7 @@ pub enum Kind {
     Drone,
     Pulse,
     Loaded(wav.Pcm),
+    Streamed(codec.Stream),
 }
 
 pub struct Track {
@@ -42,7 +45,7 @@ pub fn builtin() -> [Track] {
     ]
 }
 
-/// A track from a WAV file the user loaded.
+/// A track from PCM (a WAV the user loaded).
 pub fn loaded(name: string, p: wav.Pcm) -> Track {
     Track {
         name: name,
@@ -53,10 +56,25 @@ pub fn loaded(name: string, p: wav.Pcm) -> Track {
     }
 }
 
+/// A track from a file the user loaded, as `codec.open` left it.
+pub fn of_source(name: string, src: codec.Source) -> Track {
+    match (src) {
+        codec.Source.Pcm(p) => loaded(name, p),
+        codec.Source.Stream(s) => Track {
+            name: name,
+            kind: Kind.Streamed(s),
+            rate: s.rate,
+            channels: s.channels,
+            duration_ms: s.total * 1000 / s.rate
+        },
+    }
+}
+
 /// Frames in the track: exact for a loaded file, from the duration for a procedural one.
 pub fn total_frames(t: Track) -> int {
     match (t.kind) {
         Kind.Loaded(p) => wav.frames(p),
+        Kind.Streamed(s) => s.total,
         _ => t.duration_ms * t.rate / 1000,
     }
 }
@@ -152,6 +170,19 @@ pub fn chunk_ramp(t: Track, from: int, frames: int, volume_from: int, volume: in
                         }
                         sample = clamp16(((v as float) / 32768.0) * gain);
                     }
+                    out.push(sample % 256);
+                    out.push(sample / 256);
+                }
+            }
+        },
+        Kind.Streamed(st) => {
+            let samples = codec.read(st, from, frames);
+            let ch = t.channels;
+            for i in 0..frames {
+                let gain = gain_from + step * ((i + 1) as float);
+                for c in 0..ch {
+                    let v = samples[i * ch + c];
+                    let sample = clamp16(((v as float) / 32768.0) * gain);
                     out.push(sample % 256);
                     out.push(sample / 256);
                 }

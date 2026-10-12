@@ -1,0 +1,98 @@
+// A big-endian bit reader over `bytes`, shared by the FLAC and MP3 decoders. Bits are read most
+// significant first; reading past the end yields zeros (each decoder checks `over` where a short
+// read matters), so the hot paths need no bounds checks of their own.
+
+pub struct Bits {
+    b: bytes,
+    /// Next bit to read, counted from the start of `b`.
+    pos: int,
+    /// One past the last readable bit.
+    end: int,
+}
+
+/// A reader over octets `from..to` of `b`.
+pub fn over_range(b: bytes, from: int, to: int) -> Bits {
+    let stop = if (to < b.len()) { to } else { b.len() };
+    Bits { b: b, pos: from * 8, end: stop * 8 }
+}
+
+fn octet(r: Bits, i: int) -> int {
+    if (i * 8 < r.end) { r.b[i] } else { 0 }
+}
+
+/// The next `n` bits (0..=24) without consuming them.
+pub fn peek(r: Bits, n: int) -> int {
+    if (n == 0) {
+        return 0;
+    }
+    let i = r.pos >> 3;
+    let hi = (octet(r, i) << 8) | octet(r, i + 1);
+    let lo = (octet(r, i + 2) << 8) | octet(r, i + 3);
+    let w = (hi << 16) | lo;
+    ((w << (r.pos & 7)) & 0xFFFFFFFF) >> (32 - n)
+}
+
+pub fn skip(r: Bits, n: int) -> unit {
+    r.pos = r.pos + n;
+}
+
+/// The next `n` bits (0..=24) as an unsigned value.
+pub fn get(r: Bits, n: int) -> int {
+    let v = peek(r, n);
+    r.pos = r.pos + n;
+    v
+}
+
+/// The next `n` bits (0..=48) as an unsigned value.
+pub fn get_long(r: Bits, n: int) -> int {
+    if (n <= 24) {
+        return get(r, n);
+    }
+    let hi = get(r, n - 24);
+    (hi << 24) | get(r, 24)
+}
+
+/// The next `n` bits (1..=33) as a two's-complement value.
+pub fn get_signed(r: Bits, n: int) -> int {
+    if (n == 0) {
+        return 0;
+    }
+    let v = get_long(r, n);
+    if ((v >> (n - 1)) == 1) { v - (1 << n) } else { v }
+}
+
+/// Counts zero bits up to the next one bit and consumes both (a unary code).
+pub fn unary(r: Bits) -> int {
+    var n = 0;
+    while (r.pos < r.end) {
+        let w = peek(r, 24);
+        if (w != 0) {
+            var lead = 0;
+            var bit = 1 << 23;
+            while ((w & bit) == 0) {
+                lead = lead + 1;
+                bit = bit >> 1;
+            }
+            r.pos = r.pos + lead + 1;
+            return n + lead;
+        }
+        n = n + 24;
+        r.pos = r.pos + 24;
+    }
+    n
+}
+
+/// Skips to the next octet boundary.
+pub fn align(r: Bits) -> unit {
+    r.pos = (r.pos + 7) / 8 * 8;
+}
+
+/// The octet the reader is at (after `align`, the next whole one).
+pub fn octet_pos(r: Bits) -> int {
+    r.pos >> 3
+}
+
+/// True once a read has gone past the end.
+pub fn over(r: Bits) -> bool {
+    r.pos > r.end
+}

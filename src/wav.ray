@@ -1,5 +1,5 @@
-// RIFF/WAVE reader and writer for 16-bit PCM: the one format the player plays. 24-bit files are
-// read too and reduced to 16 bits on load.
+// 16-bit PCM, the one format the player plays (`Pcm`, and the `Sink` the decoders write it to),
+// and a RIFF/WAVE reader and writer for it. 24-bit WAVs are read too and reduced to 16 bits.
 // Everything is little-endian; `b[i]` is the octet at `i`.
 
 /// Interleaved s16le samples with their format.
@@ -15,6 +15,35 @@ pub fn frames(p: Pcm) -> int {
 
 pub fn duration_ms(p: Pcm) -> int {
     if (p.rate == 0) { 0 } else { frames(p) * 1000 / p.rate }
+}
+
+/// Collects s16le samples for a decoder: they go through `[int]` and are flushed to `bytes`
+/// every 768 KB, so a long track costs little more than its own size.
+pub struct Sink {
+    done: bytes,
+    octets: [int],
+}
+
+pub fn sink() -> Sink {
+    Sink { done: bytes_of([]), octets: [] }
+}
+
+/// Appends one sample, clamped to 16 bits.
+pub fn put(s: Sink, v: int) -> unit {
+    let c = if (v > 32767) { 32767 } else if (v < -32768) { -32768 } else { v };
+    let u = if (c < 0) { c + 65536 } else { c };
+    s.octets.push(u & 255);
+    s.octets.push(u >> 8);
+    if (s.octets.len() >= 786432) {
+        s.done = s.done + bytes_of(s.octets);
+        s.octets = [];
+    }
+}
+
+pub fn finish(s: Sink) -> bytes {
+    s.done = s.done + bytes_of(s.octets);
+    s.octets = [];
+    s.done
 }
 
 fn read_u16(b: bytes, at: int) -> int {

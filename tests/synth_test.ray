@@ -1,3 +1,5 @@
+import std/fs;
+import codec;
 import synth;
 import wav;
 
@@ -68,4 +70,21 @@ fn a_volume_ramp_ends_at_the_new_volume() {
     assert_eq(left(ramp, 2204), left(target, 2204));
     let start = synth.chunk(t, 0, 2205, 20);
     assert(left(ramp, 1100) != left(start, 1100));
+}
+
+@test
+fn a_loaded_flac_is_a_streamed_track() {
+    let b = fs.read_file_bytes("tests/fixtures/tiny.flac").unwrap();
+    let t = synth.of_source("t", codec.open(b).unwrap());
+    assert_eq(synth.total_frames(t), 13230);
+    assert_eq(t.duration_ms, 300);
+    // At full volume it plays the decoded samples unchanged.
+    let whole = codec.decode(b).unwrap();
+    assert(synth.chunk(t, 2000, 441, 100) == whole.data.sub_bytes(2000 * 4, 2441 * 4));
+    // Past the end, silence.
+    let tail = synth.chunk(t, 13200, 100, 100);
+    assert_eq(tail.len(), 400);
+    for i in 120..400 {
+        assert_eq(tail[i], 0);
+    }
 }
