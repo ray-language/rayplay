@@ -1,15 +1,24 @@
 // The page ↔ program protocol over `window.ray.request({op, …})`: every request is answered
-// with the player's snapshot as JSON (`ok: true`) or `{ok: false, error}`.
+// with the player's snapshot as JSON (`ok: true`) or `{ok: false, error}`. A loaded file is
+// the exception: it comes as a plain string, not JSON (see `add` below).
 //
 //   state                      → the snapshot
 //   play {index}               → start that track from the beginning
 //   toggle                     → play / pause / resume the current track
 //   stop · next · prev
 //   seek {ms} · volume {value}
-//   add {name, data}           → a 16-bit WAV (base64) appended to the playlist
+//   pick                       → the native file dialog; the chosen 16/24-bit WAV is read from
+//                                disk and appended to the playlist (cancelling changes nothing)
+//   "add:<name>\n<base64>"     → a 16/24-bit WAV from the page's file input, appended to the
+//                                playlist; for a shell without a native dialog (iOS). A plain
+//                                string because `json.parse` costs ~55× a long string
+//                                (findings #150): a 56 MB WAV inside JSON blows the phone's
+//                                memory limit; decoded with `b64`, not std/base64 (#151).
 
-import std/base64;
+import std/fs;
 import std/json;
+import std/ui;
+import b64;
 import player;
 import synth;
 import wav;
@@ -58,7 +67,50 @@ fn str_field(req: json.Json, key: string) -> Result<string, string> {
     }
 }
 
+/// The track name of a file: its base name without the `.wav` extension.
+pub fn track_name(path: string) -> string {
+    let parts = path.replace("\\", "/").split("/");
+    let base = parts[parts.len() - 1];
+    if (base.to_lower().ends_with(".wav")) { base.substring(0, base.len() - 4) } else { base }
+}
+
+/// Lets the user choose a WAV with the native dialog and reads it straight from disk, so the
+/// file never crosses the page bridge (a large one there costs far more than its size).
+/// `Ok(false)` if the user cancelled.
+fn pick(cmds: Channel<player.Cmd>) -> Result<bool, string> {
+    var o = ui.file_options();
+    o.title = "Load a WAV (16 or 24-bit)";
+    o.filters = [ui.filter("WAV audio", ["wav"])];
+    // A dialog failure is told apart so the page can fall back to its own file input.
+    let chosen = ui.pick_file_with(o).map_err(fn(e: string) -> string { "dialog: " + e })?;
+    match (chosen) {
+        Option.Some(path) => {
+            let pcm = wav.parse(fs.read_file_bytes(path)?)?;
+            send(cmds, player.Cmd.Add(synth.loaded(track_name(path), pcm)));
+            Result.Ok(true)
+        },
+        Option.None => Result.Ok(false),
+    }
+}
+
+/// `add:<name>\n<base64>`: decodes the file and appends it to the playlist.
+fn add(cmds: Channel<player.Cmd>, body: string) -> Result<unit, string> {
+    // As octets: `b[i]` and `sub_bytes` are O(1), unlike indexing the string by character.
+    let b = body.to_bytes();
+    let cut = match (b.index_of(bytes_of([10]))) {
+        Option.Some(i) => i,
+        Option.None => return Result.Err("add: missing the file after the name"),
+    };
+    let name = from_utf8(b.sub_bytes(4, cut))?;
+    let pcm = wav.parse(b64.decode(b, cut + 1)?)?;
+    Result.Ok(send(cmds, player.Cmd.Add(synth.loaded(name, pcm))))
+}
+
 fn dispatch(cmds: Channel<player.Cmd>, body: string) -> Result<string, string> {
+    if (body.starts_with("add:")) {
+        add(cmds, body)?;
+        return Result.Ok(snapshot_json(player.query(cmds)));
+    }
     let req = json.parse(body)?;
     let op = str_field(req, "op")?;
     match (op) {
@@ -70,11 +122,8 @@ fn dispatch(cmds: Channel<player.Cmd>, body: string) -> Result<string, string> {
         "prev" => send(cmds, player.Cmd.Prev),
         "seek" => send(cmds, player.Cmd.Seek(int_field(req, "ms")?)),
         "volume" => send(cmds, player.Cmd.Volume(int_field(req, "value")?)),
-        "add" => {
-            let name = str_field(req, "name")?;
-            let data = base64.base64_decode(str_field(req, "data")?)?;
-            let pcm = wav.parse(data)?;
-            send(cmds, player.Cmd.Add(synth.loaded(name, pcm)));
+        "pick" => {
+            pick(cmds)?;
         },
         _ => return Result.Err("unknown op: ${op}"),
     }
@@ -85,6 +134,9 @@ fn dispatch(cmds: Channel<player.Cmd>, body: string) -> Result<string, string> {
 pub fn handle(cmds: Channel<player.Cmd>, body: string) -> string {
     match (dispatch(cmds, body)) {
         Result.Ok(reply) => reply,
-        Result.Err(e) => fail(e),
+        Result.Err(e) => {
+            eprint("rayplay: request failed: " + e);
+            fail(e)
+        },
     }
 }

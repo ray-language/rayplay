@@ -19,6 +19,49 @@ fn a_wav_round_trips_through_encode_and_parse() {
     assert_eq(back.data[7], 128);
 }
 
+fn le(v: int, n: int) -> [int] {
+    var xs: [int] = [];
+    var x = v;
+    for _ in 0..n {
+        xs.push(x % 256);
+        x = x / 256;
+    }
+    xs
+}
+
+/// A 24-bit stereo WAV at 48 kHz holding `samples` (raw 3-octet groups).
+fn wav24(samples: [int]) -> bytes {
+    var h: [int] = [82, 73, 70, 70] + le(36 + samples.len(), 4) + [87, 65, 86, 69];
+    h = h + [102, 109, 116, 32] + le(16, 4) + le(1, 2) + le(2, 2);
+    h = h + le(48000, 4) + le(48000 * 6, 4) + le(6, 2) + le(24, 2);
+    h = h + [100, 97, 116, 97] + le(samples.len(), 4);
+    bytes_of(h) + bytes_of(samples)
+}
+
+@test
+fn a_24_bit_wav_is_read_as_16_bit() {
+    // Frames (0x123456, -1) and (max, min); a trailing partial frame is dropped.
+    let p = wav.parse(wav24([0x56, 0x34, 0x12, 255, 255, 255, 255, 255, 127, 0, 0, 128, 9, 9]))
+        .unwrap();
+    assert_eq(p.rate, 48000);
+    assert_eq(p.channels, 2);
+    assert_eq(wav.frames(p), 2);
+    assert_eq(p.data == bytes_of([0x34, 0x12, 255, 255, 255, 127, 0, 128]), true);
+}
+
+@test
+fn a_long_24_bit_wav_crosses_the_flush() {
+    var s: [int] = [];
+    for i in 0..400000 {
+        s.push(0);
+        s.push(i % 256);
+        s.push(i / 256 % 128);
+    }
+    let p = wav.parse(wav24(s)).unwrap();
+    assert_eq(p.data.len(), 800000);
+    assert_eq(p.data[2 * 399999], 399999 % 256);
+}
+
 @test
 fn duration_follows_rate_and_frames() {
     let p = wav.Pcm { rate: 1000, channels: 1, data: bytes_of([0, 0, 0, 0, 0, 0]) };

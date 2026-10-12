@@ -10,8 +10,9 @@ con `std/audio`, y la página es solo la interfaz.
 
 - Tres pistas **procedurales** (un estudio pentatónico, un dron, un pulso de bajo), calculadas
   trozo a trozo: la app no lleva archivos de audio y ninguna pista ocupa memoria entera.
-- **Cargar un WAV de 16 bits** desde la página (selector de archivos del webview) y añadirlo a
-  la lista: el programa lo analiza (`src/wav.ray`) y lo reproduce a su frecuencia y canales.
+- **Cargar un WAV de 16 o 24 bits** y añadirlo a la lista (diálogo nativo en el escritorio,
+  selector del webview en el móvil): el programa lo analiza (`src/wav.ray`), reduce los de 24
+  bits a 16 y lo reproduce a su frecuencia y canales.
 - Play/pausa, stop, anterior/siguiente (con vuelta), **seek** tocando la barra, volumen, y al
   acabar una pista sigue con la siguiente. Un cambio de volumen se aplica como una rampa a lo
   largo del siguiente trozo de 50 ms (`synth.chunk_ramp`), no como un escalón que suena a clic.
@@ -29,11 +30,12 @@ con `std/audio`, y la página es solo la interfaz.
 ┌────────── programa raylang (src/) ───┴─────────────────────────────┐
 │  main.ray     ventana (std/ui), eventos: message, lifecycle, closed │
 │  api.ray      protocolo: state, play, toggle, stop, next, prev,     │
-│               seek, volume, add                                     │
+│               seek, volume, pick, add                               │
 │  player.ray   ACTOR: una fibra con el dispositivo (std/audio) y la  │
 │               lista; comandos por canal; 50 ms por chunk            │
 │  synth.ray    las pistas: procedurales o WAV cargado → s16le        │
-│  wav.ray      lector/escritor RIFF/WAVE PCM 16 bits                 │
+│  wav.ray      lector/escritor RIFF/WAVE PCM (lee 16 y 24 bits)      │
+│  b64.ray      base64 → bytes rápido (std/base64 no aguanta 56 MB)   │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -53,7 +55,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 15 tests: WAV, pistas, el actor (con RAY_AUDIO_SINK=null), protocolo
+make test            # 21 tests: WAV, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -87,7 +89,7 @@ el emulador Android.
 
 | Qué | Verificado |
 |---|---|
-| Backend | `make test`: 15 tests, VM y nativo (`make test-native`) |
+| Backend | `make test`: 21 tests, VM y nativo (`make test-native`) |
 | Programa completo | `ray run` headless: monta `www/` y abre `ray://app/index.html` |
 | iOS | simulador iPhone 16 Pro (`ray bundle --ios --ios-target sim`, shell 1.27.19 con sesión `playback` y `UIBackgroundModes = audio`): arranca, la página llega por `ray://app`, el puente responde y el display muestra el `lifecycle` del shell; `audio.open` abre el dispositivo dentro del shell (comprobado con una mini app) |
 | Android | emulador arm64 (`ray bundle --android`, shell 1.27.19 con *foreground service* `mediaPlayback`): Play por `adb`, Home durante 10 s, vuelta: la posición pasó de 0:05 a 0:17 y el display dice «played in the background: 0:09». **El audio sigue en segundo plano** |
@@ -96,15 +98,20 @@ el emulador Android.
 
 ## Limitaciones
 
-- Solo WAV PCM de 16 bits, mono o estéreo, 8–192 kHz: no hay decodificador de MP3/OGG en la
-  stdlib, y el reproductor no remuestrea (abre el dispositivo a la frecuencia de la pista).
-- El WAV cargado viaja entero por el puente en base64 y se copia al actor: vale para archivos
-  de unos MB, no para discos enteros.
+- Solo WAV PCM de 16 o 24 bits, mono o estéreo, 8–192 kHz: no hay decodificador de MP3/OGG en la
+  stdlib, y el reproductor no remuestrea (abre el dispositivo a la frecuencia de la pista). Los de
+  24 bits se truncan a 16 al cargarlos (sin dither).
+- Cargar un WAV: en el escritorio, el programa abre el diálogo nativo y lee el archivo del disco.
+  En iOS/Android no hay diálogo (`ui.pick_file_with` devuelve «file dialogs are not available on
+  mobile (v1)», #152), así que la página usa su `<input type=file>` y el archivo cruza el puente
+  entero en base64. Va como string plano y no como JSON, porque `json.parse` gasta ~55× un string
+  largo (#150), y se decodifica con `src/b64.ray` en vez de `std/base64` (#151). Un WAV de 56 MB
+  ocupa unos 410 MB y tarda 0,6 s en nativo; en la shell de desarrollo (VM) no cabe.
 - Sin cola persistente: la lista vuelve a las tres pistas al relanzar.
 
 ## Hallazgos de dogfood
 
-Ver también `RAYLANG-FINDINGS.md` y el README de Ray808 (hallazgo 18, el origen de esta app).
+Ver también `../findings/` (los números son los de allí) y el README de Ray808 (hallazgo 18, el origen de esta app).
 
 1. **Android pide el permiso de notificaciones nada más arrancar** (raylang 1.27.19,
    `[android] background_audio`): el shell lo solicita en `onCreate` para el *foreground
@@ -120,4 +127,12 @@ Ver también `RAYLANG-FINDINGS.md` y el README de Ray808 (hallazgo 18, el origen
    proyecto, sin documentarlo ni ignorarlo: aquí va en `.gitignore`. Ver #111.
 4. **Chasquidos en el iPhone con 1.27.25**, en la shell de desarrollo y en la app normal. Con
    1.27.19 sonaba limpio y en el Mac no se reproduce: es del backend de audio de iOS. Corregido
-   en 1.27.26; falta comprobarlo en el iPhone. Ver #112.
+   en 1.27.26; **comprobado en el iPhone con 1.27.46** (limpio, también en segundo plano). Ver #112.
+5. **Cargar un WAV de 56 MB cerraba la app en el iPhone** (1.27.46): iOS la mataba por memoria
+   (~2 GB, `per-process-limit`). El archivo iba en base64 dentro del JSON de `window.ray.request`,
+   y `json.parse` gasta ~55× un string largo: 6,3 GB en el Mac. Ver #150. Ahora va como string
+   plano.
+6. **`base64.base64_decode` es lento y caro**: ~15 MB/s y ~14× la entrada en nativo. Un
+   decodificador en raylang sobre `bytes` (`src/b64.ray`) es ~17× más rápido. Ver #151.
+7. **No hay diálogos de archivo en móvil** y la doc no lo dice: `ui.pick_file_with` devuelve
+   «file dialogs are not available on mobile (v1)». Ver #152.
