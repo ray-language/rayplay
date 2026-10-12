@@ -1,0 +1,47 @@
+// Turns an audio file into 16-bit PCM for the player, whatever its format: WAV, FLAC or MP3,
+// recognized by their content (not the file name). An ID3v2 tag in front is skipped.
+
+import flac;
+import mp3;
+import wav;
+
+/// The extensions the file dialogs and the page offer.
+pub fn extensions() -> [string] {
+    ["wav", "flac", "mp3"]
+}
+
+fn starts(b: bytes, at: int, tag: string) -> bool {
+    let t = tag.to_bytes();
+    at + t.len() <= b.len() && b.sub_bytes(at, at + t.len()) == t
+}
+
+/// Where the audio starts once a leading ID3v2 tag (or several) is skipped.
+pub fn skip_id3(b: bytes) -> int {
+    var at = 0;
+    while (starts(b, at, "ID3") && at + 10 <= b.len()) {
+        // Syncsafe size: 4 × 7 bits, not counting the 10-byte header (nor the footer).
+        let size = (b[at + 6] << 21) | (b[at + 7] << 14) | (b[at + 8] << 7) | b[at + 9];
+        let footer = if ((b[at + 5] & 16) != 0) { 10 } else { 0 };
+        at = at + 10 + size + footer;
+    }
+    if (at > b.len()) { b.len() } else { at }
+}
+
+/// Decodes `b` as WAV, FLAC or MP3.
+pub fn decode(b: bytes) -> Result<wav.Pcm, string> {
+    if (starts(b, 0, "RIFF")) {
+        return wav.parse(b);
+    }
+    let at = skip_id3(b);
+    if (starts(b, at, "fLaC")) {
+        return flac.decode(b, at);
+    }
+    if (at + 1 < b.len() && b[at] == 255 && (b[at + 1] & 0xE0) == 0xE0) {
+        return mp3.decode(b, at);
+    }
+    // Some MP3s carry junk before the first frame: let the decoder look for one.
+    match (mp3.decode(b, at)) {
+        Result.Ok(p) => Result.Ok(p),
+        Result.Err(_) => Result.Err("not a WAV, FLAC or MP3 file"),
+    }
+}

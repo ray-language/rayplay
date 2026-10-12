@@ -51,8 +51,8 @@
 <div class="list" id="list"></div>
 <!-- The program opens the native dialog and reads the file itself; the input is the fallback
      for a shell without one (there the whole file crosses the bridge as base64). -->
-<button class="load" id="pick">Load a WAV (16 or 24-bit)</button>
-<label class="load" id="fallback" hidden>Load a WAV (16 or 24-bit)<input id="file" type="file" accept=".wav,audio/wav,audio/x-wav"></label>
+<button class="load" id="pick">Load a song (MP3, FLAC or WAV)</button>
+<label class="load" id="fallback" hidden>Load a song (MP3, FLAC or WAV)<input id="file" type="file" accept=".mp3,.flac,.wav,audio/mpeg,audio/flac,audio/wav,audio/x-wav"></label>
 <div class="status" id="status"></div>
 <script>
 (function () {
@@ -130,7 +130,7 @@
   function useFileInput() { $('pick').hidden = true; $('fallback').hidden = false; }
   if (localStorage.getItem('rayplay.noDialog')) useFileInput();
   $('pick').onclick = async () => {
-    $('status').textContent = 'choose a WAV…';
+    $('status').textContent = 'choose a song…';
     const r = await window.ray.request({ op: 'pick' });
     const reply = typeof r === 'string' ? JSON.parse(r) : r;
     if (reply.ok) { state = reply; render(); return; }
@@ -138,7 +138,7 @@
     if (reply.error.startsWith('dialog: ')) {
       useFileInput();
       localStorage.setItem('rayplay.noDialog', '1');
-      $('status').textContent = 'no native file dialog here: tap again to choose the WAV';
+      $('status').textContent = 'no native file dialog here: tap again to choose the song';
       return;
     }
     $('status').textContent = 'error: ' + reply.error;
@@ -151,7 +151,7 @@
     let bin = '';
     for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
     // A plain string, not JSON: parsing a long JSON string costs the program ~55× its size.
-    await request('add:' + f.name.replace(/\.wav$/i, '').replace(/\n/g, ' ') + '\n' + btoa(bin));
+    await request('add:' + f.name.replace(/\.(wav|flac|mp3)$/i, '').replace(/\n/g, ' ') + '\n' + btoa(bin));
     e.target.value = '';
   };
 

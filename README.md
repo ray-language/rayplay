@@ -10,9 +10,10 @@ con `std/audio`, y la página es solo la interfaz.
 
 - Tres pistas **procedurales** (un estudio pentatónico, un dron, un pulso de bajo), calculadas
   trozo a trozo: la app no lleva archivos de audio y ninguna pista ocupa memoria entera.
-- **Cargar un WAV de 16 o 24 bits** y añadirlo a la lista (diálogo nativo en el escritorio,
-  selector del webview en el móvil): el programa lo analiza (`src/wav.ray`), reduce los de 24
-  bits a 16 y lo reproduce a su frecuencia y canales.
+- **Cargar una canción en MP3, FLAC o WAV** y añadirla a la lista (diálogo nativo en el
+  escritorio, selector del webview en el móvil). El programa la decodifica a PCM de 16 bits con
+  decodificadores escritos en **raylang puro** (`src/mp3.ray`, `src/flac.ray`, `src/wav.ray`) y
+  la reproduce a su frecuencia y canales. El formato se reconoce por el contenido, no por el nombre.
 - Play/pausa, stop, anterior/siguiente (con vuelta), **seek** tocando la barra, volumen, y al
   acabar una pista sigue con la siguiente. Un cambio de volumen se aplica como una rampa a lo
   largo del siguiente trozo de 50 ms (`synth.chunk_ramp`), no como un escalón que suena a clic.
@@ -33,9 +34,13 @@ con `std/audio`, y la página es solo la interfaz.
 │               seek, volume, pick, add                               │
 │  player.ray   ACTOR: una fibra con el dispositivo (std/audio) y la  │
 │               lista; comandos por canal; 50 ms por chunk            │
-│  synth.ray    las pistas: procedurales o WAV cargado → s16le        │
-│  wav.ray      lector/escritor RIFF/WAVE PCM (lee 16 y 24 bits)      │
-│  b64.ray      base64 → bytes rápido (std/base64 no aguanta 56 MB)   │
+│  synth.ray    las pistas: procedurales o archivo cargado → s16le    │
+│  codec.ray    reconoce el formato (salta ID3v2) y lo decodifica     │
+│  mp3.ray      MPEG-1/2/2.5 Layer III (port de minimp3)              │
+│  flac.ray     FLAC nativo, 4–32 bits, cualquier tamaño de bloque    │
+│  wav.ray      PCM de 16 bits (Pcm, Sink) y RIFF/WAVE (16 y 24 bits) │
+│  bits.ray     lector de bits big-endian sobre bytes                 │
+│  b64.ray      base64 → bytes rápido (std/base64 no aguantaba 56 MB) │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,7 +60,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 21 tests: WAV, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
+make test            # 31 tests: MP3, FLAC, WAV, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -89,7 +94,8 @@ el emulador Android.
 
 | Qué | Verificado |
 |---|---|
-| Backend | `make test`: 21 tests, VM y nativo (`make test-native`) |
+| Backend | `make test`: 31 tests, VM y nativo (`make test-native`) |
+| Decodificadores | FLAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono, nivel 12, el codificador de Apple). MP3 idéntico a minimp3 compilado en C salvo ±1 en el 0,1 % de las muestras (floats de 64 frente a 32 bits): CBR, VBR, mono, joint y simple stereo, MPEG-2 22 kHz, MPEG-2.5 8 kHz, con ID3v2/ID3v1 y el recorte gapless de LAME. Una pista de 5 min en nativo (Mac): FLAC 1,1 s, MP3 1,6 s |
 | Programa completo | `ray run` headless: monta `www/` y abre `ray://app/index.html` |
 | iOS | simulador iPhone 16 Pro (`ray bundle --ios --ios-target sim`, shell 1.27.19 con sesión `playback` y `UIBackgroundModes = audio`): arranca, la página llega por `ray://app`, el puente responde y el display muestra el `lifecycle` del shell; `audio.open` abre el dispositivo dentro del shell (comprobado con una mini app) |
 | Android | emulador arm64 (`ray bundle --android`, shell 1.27.19 con *foreground service* `mediaPlayback`): Play por `adb`, Home durante 10 s, vuelta: la posición pasó de 0:05 a 0:17 y el display dice «played in the background: 0:09». **El audio sigue en segundo plano** |
@@ -98,10 +104,15 @@ el emulador Android.
 
 ## Limitaciones
 
-- Solo WAV PCM de 16 o 24 bits, mono o estéreo, 8–192 kHz: no hay decodificador de MP3/OGG en la
-  stdlib, y el reproductor no remuestrea (abre el dispositivo a la frecuencia de la pista). Los de
-  24 bits se truncan a 16 al cargarlos (sin dither).
-- Cargar un WAV: en el escritorio, el programa abre el diálogo nativo y lee el archivo del disco.
+- MP3 (Layer III; ni Layer I/II ni *free format*), FLAC nativo (no Ogg FLAC) y WAV PCM de 16 o
+  24 bits. Ni OGG/Vorbis ni AAC/M4A: la stdlib no trae decodificadores y estos no están escritos.
+  Todo se decodifica entero al cargar (unos 10 MB de PCM por minuto en estéreo a 44,1 kHz), en el
+  hilo que atiende a la página. Lo que pase de 16 bits se trunca (sin dither); de un FLAC de más
+  de dos canales se quedan los dos primeros. El reproductor no remuestrea: abre el dispositivo a
+  la frecuencia de la pista.
+- En la shell de desarrollo (VM), decodificar es lento: un MP3 de 6 s tarda 1,8 s en el Mac, así
+  que una canción entera tarda minutos. Para probar con música de verdad, la app nativa.
+- Cargar un archivo: en el escritorio, el programa abre el diálogo nativo y lo lee del disco.
   En iOS/Android no hay diálogo (`ui.pick_file_with` devuelve «file dialogs are not available on
   mobile (v1)», #152), así que la página usa su `<input type=file>` y el archivo cruza el puente
   entero en base64. Va como string plano y no como JSON, porque `json.parse` gasta ~55× un string
@@ -135,4 +146,13 @@ Ver también `../findings/` (los números son los de allí) y el README de Ray80
 6. **`base64.base64_decode` es lento y caro**: ~15 MB/s y ~14× la entrada en nativo. Un
    decodificador en raylang sobre `bytes` (`src/b64.ray`) es ~17× más rápido. Ver #151.
 7. **No hay diálogos de archivo en móvil** y la doc no lo dice: `ui.pick_file_with` devuelve
-   «file dialogs are not available on mobile (v1)». Ver #152.
+   «file dialogs are not available on mobile (v1)». Ver #152. Con 1.27.47, #150, #151 y #152
+   están corregidos.
+8. **En nativo, `for i in 0..xs.len()` con `xs[i] = …` en el cuerpo revienta** con «RefCell
+   already borrowed»; en la VM funciona. El decodificador FLAC pasaba los tests en la VM y moría
+   en el binario. Rodeo: sacar `xs.len()` a una variable. Ver #156.
+9. **Indexar un `const` array lo reconstruye en cada acceso**: con las tablas de Huffman del MP3
+   (2164 entradas), unas 400× más lento que una copia local. Por eso `src/mp3_tables.ray` son
+   funciones que se llaman una vez por archivo. Ver #157.
+10. **No está documentado cómo escribir el valor `unit`**: `Result.Ok(())` es un error de sintaxis;
+    funciona `Result.Ok({ })`. Ver #158.

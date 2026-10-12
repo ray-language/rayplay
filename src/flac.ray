@@ -1,0 +1,364 @@
+// A FLAC decoder (https://xiph.org/flac/format.html): native FLAC streams with any block size,
+// 4 to 32 bits per sample and the four channel assignments. The result is 16-bit PCM for the
+// player: deeper samples are truncated to 16 bits, shallower ones scaled up, and of a stream
+// with more than two channels only the first two (front left and right) are kept.
+
+import bits;
+import wav;
+
+struct Info {
+    rate: int,
+    channels: int,
+    depth: int,
+}
+
+fn info_none() -> Info {
+    Info { rate: 0, channels: 0, depth: 0 }
+}
+
+/// Block sizes by the 4-bit code of the frame header (0 = reserved, 6/7 = read after it).
+fn block_size(code: int) -> int {
+    if (code == 1) {
+        192
+    } else if (code >= 2 && code <= 5) {
+        576 << (code - 2)
+    } else if (code >= 8) {
+        256 << (code - 8)
+    } else {
+        0
+    }
+}
+
+fn sample_depth(code: int, stream: int) -> int {
+    match (code) {
+        0 => stream,
+        1 => 8,
+        2 => 12,
+        4 => 16,
+        5 => 20,
+        6 => 24,
+        7 => 32,
+        _ => 0,
+    }
+}
+
+fn sample_rate(code: int, stream: int) -> int {
+    match (code) {
+        0 => stream,
+        1 => 88200,
+        2 => 176400,
+        3 => 192000,
+        4 => 8000,
+        5 => 16000,
+        6 => 22050,
+        7 => 24000,
+        8 => 32000,
+        9 => 44100,
+        10 => 48000,
+        11 => 96000,
+        _ => 0,
+    }
+}
+
+/// CRC-8 (polynomial 0x07) of octets `from..to`: guards the frame header against false syncs.
+fn crc8(b: bytes, from: int, to: int) -> int {
+    var crc = 0;
+    for i in from..to {
+        crc = crc ^ b[i];
+        for _ in 0..8 {
+            crc = if ((crc & 128) != 0) { ((crc << 1) ^ 7) & 255 } else { (crc << 1) & 255 };
+        }
+    }
+    crc
+}
+
+/// Reads STREAMINFO from the metadata blocks after `fLaC`; returns it and where the frames start.
+fn read_metadata(b: bytes, from: int) -> Result<(Info, int), string> {
+    if (b.len() < from + 8 || from_utf8(b.sub_bytes(from, from + 4)).unwrap_or("") != "fLaC") {
+        return Result.Err("not a FLAC file");
+    }
+    var at = from + 4;
+    var info = info_none();
+    var last = false;
+    while (!last) {
+        if (at + 4 > b.len()) {
+            return Result.Err("FLAC: truncated metadata");
+        }
+        last = (b[at] & 128) != 0;
+        let kind = b[at] & 127;
+        let size = (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3];
+        if (kind == 0 && size >= 18) {
+            let r = bits.over_range(b, at + 4 + 10, at + 4 + size);
+            let rate = bits.get(r, 20);
+            let channels = bits.get(r, 3) + 1;
+            let depth = bits.get(r, 5) + 1;
+            info = Info { rate: rate, channels: channels, depth: depth };
+        }
+        at = at + 4 + size;
+    }
+    if (info.rate == 0) {
+        return Result.Err("FLAC without STREAMINFO");
+    }
+    Result.Ok((info, at))
+}
+
+/// Decodes the residual of a subframe into `out` (which already holds the warm-up samples).
+fn residual(r: bits.Bits, out: [int], block: int, order: int) -> Result<unit, string> {
+    let method = bits.get(r, 2);
+    if (method > 1) {
+        return Result.Err("FLAC: reserved residual coding");
+    }
+    let param_bits = if (method == 0) { 4 } else { 5 };
+    let escape = if (method == 0) { 15 } else { 31 };
+    let parts = 1 << bits.get(r, 4);
+    if (block % parts != 0 || block / parts < order) {
+        return Result.Err("FLAC: bad residual partition");
+    }
+    for p in 0..parts {
+        let n = if (p == 0) { block / parts - order } else { block / parts };
+        let k = bits.get(r, param_bits);
+        if (k == escape) {
+            let raw = bits.get(r, 5);
+            for _ in 0..n {
+                out.push(bits.get_signed(r, raw));
+            }
+        } else {
+            for _ in 0..n {
+                let q = bits.unary(r);
+                let v = (q << k) | bits.get(r, k);
+                out.push((v >> 1) ^ (0 - (v & 1)));
+            }
+        }
+    }
+    if (bits.over(r)) {
+        return Result.Err("FLAC: truncated frame");
+    }
+    Result.Ok({ })
+}
+
+/// One subframe of `block` samples at `depth` bits.
+fn subframe(r: bits.Bits, block: int, depth: int) -> Result<[int], string> {
+    if (bits.get(r, 1) != 0) {
+        return Result.Err("FLAC: bad subframe padding");
+    }
+    let kind = bits.get(r, 6);
+    var wasted = 0;
+    if (bits.get(r, 1) == 1) {
+        wasted = bits.unary(r) + 1;
+    }
+    let d = depth - wasted;
+    var out: [int] = [];
+    if (kind == 0) {
+        let v = bits.get_signed(r, d);
+        for _ in 0..block {
+            out.push(v);
+        }
+    } else if (kind == 1) {
+        for _ in 0..block {
+            out.push(bits.get_signed(r, d));
+        }
+    } else if (kind >= 8 && kind <= 12) {
+        let order = kind - 8;
+        for _ in 0..order {
+            out.push(bits.get_signed(r, d));
+        }
+        residual(r, out, block, order)?;
+        fixed_predict(out, order);
+    } else if (kind >= 32) {
+        let order = kind - 31;
+        for _ in 0..order {
+            out.push(bits.get_signed(r, d));
+        }
+        let precision = bits.get(r, 4) + 1;
+        if (precision == 16) {
+            return Result.Err("FLAC: bad LPC precision");
+        }
+        let shift = bits.get_signed(r, 5);
+        if (shift < 0) {
+            return Result.Err("FLAC: negative LPC shift");
+        }
+        var coefs: [int] = [];
+        for _ in 0..order {
+            coefs.push(bits.get_signed(r, precision));
+        }
+        residual(r, out, block, order)?;
+        lpc_predict(out, coefs, shift);
+    } else {
+        return Result.Err("FLAC: reserved subframe type ${to_string(kind)}");
+    }
+    if (wasted > 0) {
+        for i in 0..block {
+            out[i] = out[i] << wasted;
+        }
+    }
+    Result.Ok(out)
+}
+
+/// Turns residuals into samples with the fixed polynomial predictor of `order` (0..4).
+fn fixed_predict(s: [int], order: int) -> unit {
+    let n = s.len();
+    if (order == 1) {
+        for i in 1..n {
+            s[i] = s[i] + s[i - 1];
+        }
+    } else if (order == 2) {
+        for i in 2..n {
+            s[i] = s[i] + 2 * s[i - 1] - s[i - 2];
+        }
+    } else if (order == 3) {
+        for i in 3..n {
+            s[i] = s[i] + 3 * s[i - 1] - 3 * s[i - 2] + s[i - 3];
+        }
+    } else if (order == 4) {
+        for i in 4..n {
+            s[i] = s[i] + 4 * s[i - 1] - 6 * s[i - 2] + 4 * s[i - 3] - s[i - 4];
+        }
+    }
+}
+
+fn lpc_predict(s: [int], coefs: [int], shift: int) -> unit {
+    let order = coefs.len();
+    // Bound hoisted: `for i in a..s.len()` while writing `s[i]` panics in native code
+    // ("RefCell already borrowed", findings #156).
+    let n = s.len();
+    for i in order..n {
+        var sum = 0;
+        for j in 0..order {
+            sum = sum + coefs[j] * s[i - 1 - j];
+        }
+        s[i] = s[i] + (sum >> shift);
+    }
+}
+
+/// Where the next frame starts at or after `at`: a sync code whose header CRC checks out.
+fn find_sync(b: bytes, at: int) -> int {
+    var i = at;
+    while (i + 1 < b.len()) {
+        if (b[i] == 255 && (b[i + 1] & 254) == 248) {
+            return i;
+        }
+        i = i + 1;
+    }
+    b.len()
+}
+
+/// Decodes the frame at `at` into `sink`; returns where the next one starts.
+fn frame(b: bytes, at: int, info: Info, sink: wav.Sink) -> Result<int, string> {
+    let r = bits.over_range(b, at, b.len());
+    bits.skip(r, 16);
+    let size_code = bits.get(r, 4);
+    let rate_code = bits.get(r, 4);
+    let assignment = bits.get(r, 4);
+    let depth = sample_depth(bits.get(r, 3), info.depth);
+    bits.skip(r, 1);
+    // The frame or sample number, UTF-8 style: the leading ones say how many octets follow.
+    let first = bits.get(r, 8);
+    var extra = 0;
+    var mask = 128;
+    while ((first & mask) != 0 && mask > 1) {
+        extra = extra + 1;
+        mask = mask >> 1;
+    }
+    if (extra == 1 || extra > 7) {
+        return Result.Err("FLAC: bad frame number");
+    }
+    bits.skip(r, if (extra == 0) { 0 } else { 8 * (extra - 1) });
+    var block = block_size(size_code);
+    if (size_code == 6) {
+        block = bits.get(r, 8) + 1;
+    } else if (size_code == 7) {
+        block = bits.get(r, 16) + 1;
+    }
+    if (rate_code == 12) {
+        bits.skip(r, 8);
+    } else if (rate_code == 13 || rate_code == 14) {
+        bits.skip(r, 16);
+    }
+    let head_end = bits.octet_pos(r);
+    if (head_end >= b.len() || crc8(b, at, head_end) != b[head_end]) {
+        return Result.Err("FLAC: bad frame header");
+    }
+    bits.skip(r, 8);
+    if (block == 0 || depth == 0 || rate_code == 15 || assignment > 10) {
+        return Result.Err("FLAC: reserved value in the frame header");
+    }
+    let channels = if (assignment <= 7) { assignment + 1 } else { 2 };
+    var chans: [[int]] = [];
+    for c in 0..channels {
+        // The side channel of a stereo decorrelation carries one more bit.
+        let side = (assignment == 8 && c == 1)
+            || (assignment == 9 && c == 0)
+            || (assignment == 10 && c == 1);
+        chans.push(subframe(r, block, if (side) { depth + 1 } else { depth })?);
+    }
+    bits.align(r);
+    bits.skip(r, 16);
+    let left = chans[0];
+    if (assignment == 8) {
+        let side = chans[1];
+        for i in 0..block {
+            side[i] = left[i] - side[i];
+        }
+    } else if (assignment == 9) {
+        let right = chans[1];
+        for i in 0..block {
+            left[i] = left[i] + right[i];
+        }
+    } else if (assignment == 10) {
+        let side = chans[1];
+        for i in 0..block {
+            let mid = (left[i] << 1) | (side[i] & 1);
+            left[i] = (mid + side[i]) >> 1;
+            side[i] = (mid - side[i]) >> 1;
+        }
+    }
+    let keep = if (info.channels > 2) { 2 } else { info.channels };
+    let a = chans[0];
+    let c = if (keep == 2 && channels > 1) { chans[1] } else { chans[0] };
+    for i in 0..block {
+        if (depth >= 16) {
+            wav.put(sink, a[i] >> (depth - 16));
+            if (keep == 2) {
+                wav.put(sink, c[i] >> (depth - 16));
+            }
+        } else {
+            wav.put(sink, a[i] << (16 - depth));
+            if (keep == 2) {
+                wav.put(sink, c[i] << (16 - depth));
+            }
+        }
+    }
+    Result.Ok(bits.octet_pos(r))
+}
+
+/// Decodes a whole FLAC file whose `fLaC` marker is at octet `from`. A damaged frame is
+/// skipped (decoding resumes at the next sync code); a file with no good frame is an error.
+pub fn decode(b: bytes, from: int) -> Result<wav.Pcm, string> {
+    let (info, start) = read_metadata(b, from)?;
+    if (info.channels < 1 || info.rate < 1) {
+        return Result.Err("FLAC: bad STREAMINFO");
+    }
+    let sink = wav.sink();
+    var at = find_sync(b, start);
+    var frames = 0;
+    var last_error = "";
+    while (at < b.len()) {
+        match (frame(b, at, info, sink)) {
+            Result.Ok(next) => {
+                frames = frames + 1;
+                at = next;
+            },
+            Result.Err(e) => {
+                last_error = e;
+                at = find_sync(b, at + 1);
+            },
+        }
+    }
+    if (frames == 0) {
+        return Result.Err(
+            if (last_error == "") { "FLAC without audio frames" } else { last_error }
+        );
+    }
+    let channels = if (info.channels > 2) { 2 } else { info.channels };
+    Result.Ok(wav.Pcm { rate: info.rate, channels: channels, data: wav.finish(sink) })
+}

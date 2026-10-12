@@ -1,5 +1,5 @@
 // The tracks. Three are procedural — a few minutes of sound computed chunk by chunk, so the
-// app ships no audio files and no track ever sits whole in memory — and any 16/24-bit WAV the
+// app ships no audio files and no track ever sits whole in memory — and any song the
 // user loads becomes a fourth kind. `chunk` renders any window of a track as s16le at the
 // track's rate, which is all the player needs.
 
@@ -42,7 +42,7 @@ pub fn builtin() -> [Track] {
     ]
 }
 
-/// A track from a WAV file the user loaded.
+/// A track from a file the user loaded (decoded to PCM by `codec`).
 pub fn loaded(name: string, p: wav.Pcm) -> Track {
     Track {
         name: name,

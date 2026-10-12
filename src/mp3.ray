@@ -1,0 +1,1388 @@
+// An MP3 decoder: MPEG-1, MPEG-2 and MPEG-2.5 Layer III, with the bit reservoir, mid/side and
+// intensity stereo, short and mixed blocks. A port of minimp3's Layer III path
+// (https://github.com/lieff/minimp3, CC0 / public domain) to raylang, in 64-bit floats: same
+// structure and names where it helps to compare, flat arrays with offsets where C has pointers.
+// Layers I and II and free-format streams are refused. The Xing/Info frame is skipped and, when
+// it carries LAME's encoder delay and padding, they are trimmed (gapless, like ffmpeg).
+
+import std/math;
+import bits;
+import mp3_tables;
+import wav;
+
+/// The tables, built once per file (a `const` array would be rebuilt on every access, findings
+/// #157).
+struct Tables {
+    huffman: [int],
+    huffman_index: [int],
+    linbits: [int],
+    count1_a: [int],
+    count1_b: [int],
+    scf_long: [int],
+    scf_short: [int],
+    scf_mixed: [int],
+    partitions: [int],
+    pow43: [float],
+    window: [float],
+    /// 2^(-i/4) for i in 0..1024 (minimp3's L3_ldexp_q2).
+    pow2q: [float],
+}
+
+/// Header octets 1..3 (octet 0 is the 0xFF of the sync word).
+struct Hdr {
+    b1: int,
+    b2: int,
+    b3: int,
+}
+
+/// Side information of one granule of one channel (minimp3's L3_gr_info_t).
+struct Gr {
+    sfb: [int],
+    part_23_length: int,
+    big_values: int,
+    scalefac_compress: int,
+    global_gain: int,
+    block_type: int,
+    mixed_block_flag: int,
+    n_long_sfb: int,
+    n_short_sfb: int,
+    table_select: [int],
+    region_count: [int],
+    subblock_gain: [int],
+    preflag: int,
+    scalefac_scale: int,
+    count1_table: int,
+    scfsi: int,
+}
+
+/// Decoder state that lives across frames, plus the scratch buffers of one frame.
+struct Dec {
+    t: Tables,
+    reserv: bytes,
+    overlap: [float],
+    qmf: [float],
+    grbuf: [float],
+    scf: [float],
+    syn: [float],
+    ist_pos: [int],
+    iscf: [int],
+    pcm: [int],
+    t32: [float],
+    co: [float],
+    si: [float],
+    tmp: [float],
+    c3: [float],
+    s3: [float],
+}
+
+fn floats(n: int) -> [float] {
+    var xs: [float] = [];
+    for _ in 0..n {
+        xs.push(0.0);
+    }
+    xs
+}
+
+fn ints(n: int) -> [int] {
+    var xs: [int] = [];
+    for _ in 0..n {
+        xs.push(0);
+    }
+    xs
+}
+
+fn tables() -> Tables {
+    var pow2q: [float] = [];
+    for i in 0..1024 {
+        pow2q.push(math.pow(2.0, 0.0 - (i as float) / 4.0));
+    }
+    Tables {
+        huffman: mp3_tables.huffman(),
+        huffman_index: mp3_tables.huffman_index(),
+        linbits: mp3_tables.linbits(),
+        count1_a: mp3_tables.count1_a(),
+        count1_b: mp3_tables.count1_b(),
+        scf_long: mp3_tables.scf_long(),
+        scf_short: mp3_tables.scf_short(),
+        scf_mixed: mp3_tables.scf_mixed(),
+        partitions: mp3_tables.scf_partitions(),
+        pow43: mp3_tables.pow43(),
+        window: mp3_tables.synth_window(),
+        pow2q: pow2q
+    }
+}
+
+fn decoder() -> Dec {
+    Dec {
+        t: tables(),
+        reserv: bytes_of([]),
+        overlap: floats(2 * 9 * 32),
+        qmf: floats(15 * 64),
+        grbuf: floats(2 * 576),
+        scf: floats(40),
+        syn: floats(33 * 64),
+        ist_pos: ints(2 * 39),
+        iscf: ints(42),
+        pcm: ints(2 * 576),
+        t32: floats(32),
+        co: floats(9),
+        si: floats(9),
+        tmp: floats(18),
+        c3: floats(3),
+        s3: floats(3)
+    }
+}
+
+// ---- the frame header ----
+
+fn hdr_at(b: bytes, at: int) -> Hdr {
+    Hdr { b1: b[at + 1], b2: b[at + 2], b3: b[at + 3] }
+}
+
+fn is_mono(h: Hdr) -> bool {
+    (h.b3 & 0xC0) == 0xC0
+}
+
+fn is_ms_stereo(h: Hdr) -> bool {
+    (h.b3 & 0xE0) == 0x60
+}
+
+fn test_mpeg1(h: Hdr) -> bool {
+    (h.b1 & 8) != 0
+}
+
+fn test_i_stereo(h: Hdr) -> bool {
+    (h.b3 & 0x10) != 0
+}
+
+fn test_ms_stereo(h: Hdr) -> bool {
+    (h.b3 & 0x20) != 0
+}
+
+fn my_sample_rate(h: Hdr) -> int {
+    ((h.b2 >> 2) & 3) + (((h.b1 >> 3) & 1) + ((h.b1 >> 4) & 1)) * 3
+}
+
+fn channels_of(h: Hdr) -> int {
+    if (is_mono(h)) { 1 } else { 2 }
+}
+
+/// A plausible header of any layer at `at` (minimp3's hdr_valid).
+fn valid_at(b: bytes, at: int) -> bool {
+    if (at + 4 > b.len() || b[at] != 255) {
+        return false;
+    }
+    let b1 = b[at + 1];
+    let b2 = b[at + 2];
+    ((b1 & 0xF0) == 0xF0 || (b1 & 0xFE) == 0xE2)
+        && ((b1 >> 1) & 3) != 0
+        && (b2 >> 4) != 15
+        && ((b2 >> 2) & 3) != 3
+}
+
+/// Same stream parameters as the header at `a` (minimp3's hdr_compare).
+fn same_stream(b: bytes, a: int, other: int) -> bool {
+    valid_at(b, other)
+        && ((b[a + 1] ^ b[other + 1]) & 0xFE) == 0
+        && ((b[a + 2] ^ b[other + 2]) & 0x0C) == 0
+        && ((b[a + 2] & 0xF0) == 0) == ((b[other + 2] & 0xF0) == 0)
+}
+
+fn layer_of(h: Hdr) -> int {
+    4 - ((h.b1 >> 1) & 3)
+}
+
+fn sample_rate(h: Hdr) -> int {
+    let base = match ((h.b2 >> 2) & 3) {
+        0 => 44100,
+        1 => 48000,
+        _ => 32000,
+    };
+    let mpeg2 = if (test_mpeg1(h)) { 0 } else { 1 };
+    let mpeg25 = if ((h.b1 & 0x10) != 0) { 0 } else { 1 };
+    base >> mpeg2 >> mpeg25
+}
+
+/// Layer III bitrates in kbps by index: MPEG-1, then MPEG-2/2.5.
+fn bitrate_kbps(h: Hdr) -> int {
+    let i = h.b2 >> 4;
+    let mpeg1 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+    let mpeg2 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    if (i > 14) {
+        0
+    } else if (test_mpeg1(h)) {
+        mpeg1[i]
+    } else {
+        mpeg2[i]
+    }
+}
+
+fn frame_samples(h: Hdr) -> int {
+    if ((h.b1 & 14) == 2) { 576 } else { 1152 }
+}
+
+/// Bytes of the Layer III frame, padding included; 0 for free format.
+fn frame_bytes(h: Hdr) -> int {
+    let n = frame_samples(h) * bitrate_kbps(h) * 125 / sample_rate(h);
+    let padding = if ((h.b2 & 2) != 0) { 1 } else { 0 };
+    if (n == 0) { 0 } else { n + padding }
+}
+
+fn side_info_bytes(h: Hdr) -> int {
+    if (test_mpeg1(h)) {
+        if (is_mono(h)) { 17 } else { 32 }
+    } else {
+        if (is_mono(h)) { 9 } else { 17 }
+    }
+}
+
+// ---- side information ----
+
+fn ldexp_q2(t: Tables, y: float, e: int) -> float {
+    if (e < 1024) {
+        y * t.pow2q[e]
+    } else {
+        y * math.pow(2.0, 0.0 - (e as float) / 4.0)
+    }
+}
+
+fn read_side_info(r: bits.Bits, h: Hdr, t: Tables) -> Result<(int, [Gr]), string> {
+    let sr = my_sample_rate(h);
+    let sr_idx = if (sr != 0) { sr - 1 } else { 0 };
+    let mono = is_mono(h);
+    let mpeg1 = test_mpeg1(h);
+    var gr_count = if (mono) { 1 } else { 2 };
+    var scfsi = 0;
+    var main_data_begin = 0;
+    if (mpeg1) {
+        gr_count = gr_count * 2;
+        main_data_begin = bits.get(r, 9);
+        scfsi = bits.get(r, 7 + gr_count);
+    } else {
+        main_data_begin = bits.get(r, 8 + gr_count) >> gr_count;
+    }
+    var grs: [Gr] = [];
+    var part_23_sum = 0;
+    for _ in 0..gr_count {
+        if (mono) {
+            scfsi = scfsi << 4;
+        }
+        let part_23_length = bits.get(r, 12);
+        part_23_sum = part_23_sum + part_23_length;
+        let big_values = bits.get(r, 9);
+        if (big_values > 288) {
+            return Result.Err("MP3: bad big_values");
+        }
+        let global_gain = bits.get(r, 8);
+        let scalefac_compress = bits.get(r, if (mpeg1) { 4 } else { 9 });
+        var sfb = t.scf_long.slice(sr_idx * 23, sr_idx * 23 + 23);
+        var n_long_sfb = 22;
+        var n_short_sfb = 0;
+        var block_type = 0;
+        var mixed = 0;
+        var tables_bits = 0;
+        var region_count = [0, 0, 0];
+        var subblock_gain = [0, 0, 0];
+        if (bits.get(r, 1) == 1) {
+            block_type = bits.get(r, 2);
+            if (block_type == 0) {
+                return Result.Err("MP3: bad block type");
+            }
+            mixed = bits.get(r, 1);
+            region_count[0] = 7;
+            region_count[1] = 255;
+            if (block_type == 2) {
+                scfsi = scfsi & 0x0F0F;
+                if (mixed == 0) {
+                    region_count[0] = 8;
+                    sfb = t.scf_short.slice(sr_idx * 40, sr_idx * 40 + 40);
+                    n_long_sfb = 0;
+                    n_short_sfb = 39;
+                } else {
+                    sfb = t.scf_mixed.slice(sr_idx * 40, sr_idx * 40 + 40);
+                    n_long_sfb = if (mpeg1) { 8 } else { 6 };
+                    n_short_sfb = 30;
+                }
+            }
+            tables_bits = bits.get(r, 10) << 5;
+            subblock_gain[0] = bits.get(r, 3);
+            subblock_gain[1] = bits.get(r, 3);
+            subblock_gain[2] = bits.get(r, 3);
+        } else {
+            tables_bits = bits.get(r, 15);
+            region_count[0] = bits.get(r, 4);
+            region_count[1] = bits.get(r, 3);
+            region_count[2] = 255;
+        }
+        let preflag = if (mpeg1) {
+            bits.get(r, 1)
+        } else if (scalefac_compress >= 500) {
+            1
+        } else {
+            0
+        };
+        let scalefac_scale = bits.get(r, 1);
+        let count1_table = bits.get(r, 1);
+        grs.push(
+            Gr {
+                sfb: sfb,
+                part_23_length: part_23_length,
+                big_values: big_values,
+                scalefac_compress: scalefac_compress,
+                global_gain: global_gain,
+                block_type: block_type,
+                mixed_block_flag: mixed,
+                n_long_sfb: n_long_sfb,
+                n_short_sfb: n_short_sfb,
+                table_select: [tables_bits >> 10, (tables_bits >> 5) & 31, tables_bits & 31],
+                region_count: region_count,
+                subblock_gain: subblock_gain,
+                preflag: preflag,
+                scalefac_scale: scalefac_scale,
+                count1_table: count1_table,
+                scfsi: (scfsi >> 12) & 15
+            }
+        );
+        scfsi = scfsi << 4;
+    }
+    if (part_23_sum + r.pos > r.end + main_data_begin * 8) {
+        return Result.Err("MP3: granules longer than the frame");
+    }
+    Result.Ok((main_data_begin, grs))
+}
+
+// ---- scale factors ----
+
+fn read_scalefactors(
+    d: Dec,
+    ist_off: int,
+    scf_size: [int],
+    part: [int],
+    part_off: int,
+    r: bits.Bits,
+    scfsi_in: int
+) -> unit {
+    var scfsi = scfsi_in;
+    var at = 0;
+    var i = 0;
+    while (i < 4 && part[part_off + i] != 0) {
+        let cnt = part[part_off + i];
+        if ((scfsi & 8) != 0) {
+            for k in 0..cnt {
+                d.iscf[at + k] = d.ist_pos[ist_off + at + k];
+            }
+        } else {
+            let nbits = scf_size[i];
+            if (nbits == 0) {
+                for k in 0..cnt {
+                    d.iscf[at + k] = 0;
+                    d.ist_pos[ist_off + at + k] = 0;
+                }
+            } else {
+                let max_scf = if (scfsi < 0) { (1 << nbits) - 1 } else { -1 };
+                for k in 0..cnt {
+                    let s = bits.get(r, nbits);
+                    d.ist_pos[ist_off + at + k] = if (s == max_scf) { 255 } else { s };
+                    d.iscf[at + k] = s;
+                }
+            }
+        }
+        at = at + cnt;
+        i = i + 1;
+        scfsi = scfsi * 2;
+    }
+    d.iscf[at] = 0;
+    d.iscf[at + 1] = 0;
+    d.iscf[at + 2] = 0;
+}
+
+fn decode_scalefactors(d: Dec, h: Hdr, ist_off: int, r: bits.Bits, gr: Gr, ch: int) -> unit {
+    let t = d.t;
+    // Partition rows: 0 long blocks, 1 mixed, 2 short.
+    let row = if (gr.n_short_sfb == 0) { 0 } else if (gr.n_long_sfb != 0) { 1 } else { 2 };
+    var part_off = row * 28;
+    var scf_size = [0, 0, 0, 0];
+    let scf_shift = gr.scalefac_scale + 1;
+    var scfsi = gr.scfsi;
+    if (test_mpeg1(h)) {
+        let decode = [0, 1, 2, 3, 12, 5, 6, 7, 9, 10, 11, 13, 14, 15, 18, 19];
+        let p = decode[gr.scalefac_compress];
+        scf_size[0] = p >> 2;
+        scf_size[1] = p >> 2;
+        scf_size[2] = p & 3;
+        scf_size[3] = p & 3;
+    } else {
+        let modulo = [5, 5, 4, 4, 5, 5, 4, 1, 4, 3, 1, 1, 5, 6, 6, 1, 4, 4, 4, 1, 4, 3, 1, 1];
+        let ist = if (test_i_stereo(h) && ch != 0) { 1 } else { 0 };
+        var sfc = gr.scalefac_compress >> ist;
+        var k = ist * 3 * 4;
+        while (sfc >= 0) {
+            var modprod = 1;
+            var i = 3;
+            while (i >= 0) {
+                scf_size[i] = sfc / modprod % modulo[k + i];
+                modprod = modprod * modulo[k + i];
+                i = i - 1;
+            }
+            sfc = sfc - modprod;
+            k = k + 4;
+        }
+        part_off = part_off + k;
+        scfsi = -16;
+    }
+    read_scalefactors(d, ist_off, scf_size, t.partitions, part_off, r, scfsi);
+    if (gr.n_short_sfb != 0) {
+        let sh = 3 - scf_shift;
+        var i = gr.n_long_sfb;
+        while (i < gr.n_long_sfb + gr.n_short_sfb) {
+            for w in 0..3 {
+                d.iscf[i + w] = d.iscf[i + w] + (gr.subblock_gain[w] << sh);
+            }
+            i = i + 3;
+        }
+    } else if (gr.preflag != 0) {
+        let preamp = [1, 1, 1, 1, 2, 2, 3, 3, 3, 2];
+        for i in 0..10 {
+            d.iscf[11 + i] = d.iscf[11 + i] + preamp[i];
+        }
+    }
+    let ms_gain = if (is_ms_stereo(h)) { 2 } else { 0 };
+    let gain_exp = gr.global_gain - 4 - 210 - ms_gain;
+    let gain = ldexp_q2(t, 2048.0, 44 - gain_exp);
+    let n = gr.n_long_sfb + gr.n_short_sfb;
+    for i in 0..n {
+        d.scf[i] = ldexp_q2(t, gain, d.iscf[i] << scf_shift);
+    }
+}
+
+// ---- Huffman decoding and requantization ----
+
+fn pow43(t: Tables, x: int) -> float {
+    if (x < 129) { t.pow43[16 + x] } else { math.pow(x as float, 4.0 / 3.0) }
+}
+
+fn huffman(d: Dec, dst_off: int, r: bits.Bits, gr: Gr, limit: int) -> unit {
+    let t = d.t;
+    let tabs = t.huffman;
+    let g = d.grbuf;
+    let sfb = gr.sfb;
+    var one = 0.0;
+    var ireg = 0;
+    var big = gr.big_values;
+    var si = 0;
+    var fi = 0;
+    var di = dst_off;
+    while (big > 0) {
+        let tab_num = gr.table_select[ireg];
+        var sfb_cnt = gr.region_count[ireg];
+        ireg = ireg + 1;
+        let cb = t.huffman_index[tab_num];
+        let lin = t.linbits[tab_num];
+        var more = true;
+        while (more) {
+            let np = sfb[si] / 2;
+            si = si + 1;
+            let pairs = if (big < np) { big } else { np };
+            one = d.scf[fi];
+            fi = fi + 1;
+            for _ in 0..pairs {
+                var w = 5;
+                var leaf = tabs[cb + bits.peek(r, w)];
+                while (leaf < 0) {
+                    bits.skip(r, w);
+                    w = leaf & 7;
+                    leaf = tabs[cb + bits.peek(r, w) - (leaf >> 3)];
+                }
+                bits.skip(r, leaf >> 8);
+                for _ in 0..2 {
+                    var lsb = leaf & 15;
+                    if (lin > 0 && lsb == 15) {
+                        lsb = lsb + bits.get(r, lin);
+                        let v = one * pow43(t, lsb);
+                        g[di] = if (bits.get(r, 1) == 1) { 0.0 - v } else { v };
+                    } else if (lsb != 0) {
+                        let v = t.pow43[16 + lsb] * one;
+                        g[di] = if (bits.get(r, 1) == 1) { 0.0 - v } else { v };
+                    } else {
+                        g[di] = 0.0;
+                    }
+                    di = di + 1;
+                    leaf = leaf >> 4;
+                }
+            }
+            big = big - np;
+            sfb_cnt = sfb_cnt - 1;
+            more = big > 0 && sfb_cnt >= 0;
+        }
+    }
+    let cb1 = if (gr.count1_table != 0) { t.count1_b } else { t.count1_a };
+    var np = 1 - big;
+    while (true) {
+        var leaf = cb1[bits.peek(r, 4)];
+        if ((leaf & 8) == 0) {
+            let n = leaf & 3;
+            leaf = cb1[(leaf >> 3) + (bits.peek(r, 4 + n) & ((1 << n) - 1))];
+        }
+        bits.skip(r, leaf & 7);
+        if (r.pos > limit) {
+            break;
+        }
+        np = np - 1;
+        if (np == 0) {
+            np = sfb[si] / 2;
+            si = si + 1;
+            if (np == 0) {
+                break;
+            }
+            one = d.scf[fi];
+            fi = fi + 1;
+        }
+        if ((leaf & 128) != 0) {
+            g[di] = if (bits.get(r, 1) == 1) { 0.0 - one } else { one };
+        }
+        if ((leaf & 64) != 0) {
+            g[di + 1] = if (bits.get(r, 1) == 1) { 0.0 - one } else { one };
+        }
+        np = np - 1;
+        if (np == 0) {
+            np = sfb[si] / 2;
+            si = si + 1;
+            if (np == 0) {
+                break;
+            }
+            one = d.scf[fi];
+            fi = fi + 1;
+        }
+        if ((leaf & 32) != 0) {
+            g[di + 2] = if (bits.get(r, 1) == 1) { 0.0 - one } else { one };
+        }
+        if ((leaf & 16) != 0) {
+            g[di + 3] = if (bits.get(r, 1) == 1) { 0.0 - one } else { one };
+        }
+        di = di + 4;
+    }
+    r.pos = limit;
+}
+
+// ---- stereo ----
+
+fn midside(g: [float], off: int, n: int) -> unit {
+    for i in off..off + n {
+        let a = g[i];
+        let b = g[i + 576];
+        g[i] = a + b;
+        g[i + 576] = a - b;
+    }
+}
+
+fn intensity_band(g: [float], off: int, n: int, kl: float, kr: float) -> unit {
+    for i in off..off + n {
+        g[i + 576] = g[i] * kr;
+        g[i] = g[i] * kl;
+    }
+}
+
+fn stereo_top_band(g: [float], sfb: [int], nbands: int, max_band: [int]) -> unit {
+    max_band[0] = -1;
+    max_band[1] = -1;
+    max_band[2] = -1;
+    var off = 576;
+    for i in 0..nbands {
+        var k = 0;
+        while (k < sfb[i]) {
+            if (g[off + k] != 0.0 || g[off + k + 1] != 0.0) {
+                max_band[i % 3] = i;
+                break;
+            }
+            k = k + 2;
+        }
+        off = off + sfb[i];
+    }
+}
+
+fn stereo_process(
+    d: Dec,
+    ist_off: int,
+    sfb: [int],
+    h: Hdr,
+    max_band: [int],
+    mpeg2_sh: int
+) -> unit {
+    let pan = [
+        0.0,
+        1.0,
+        0.21132487,
+        0.78867513,
+        0.3660254,
+        0.6339746,
+        0.5,
+        0.5,
+        0.6339746,
+        0.3660254,
+        0.78867513,
+        0.21132487,
+        1.0,
+        0.0
+    ];
+    let mpeg1 = test_mpeg1(h);
+    let max_pos = if (mpeg1) { 7 } else { 64 };
+    let g = d.grbuf;
+    var off = 0;
+    var i = 0;
+    while (sfb[i] != 0) {
+        let ipos = d.ist_pos[ist_off + i];
+        if (i > max_band[i % 3] && ipos < max_pos) {
+            let s = if (test_ms_stereo(h)) { 1.41421356 } else { 1.0 };
+            var kl = 1.0;
+            var kr = 1.0;
+            if (mpeg1) {
+                kl = pan[2 * ipos];
+                kr = pan[2 * ipos + 1];
+            } else {
+                kr = ldexp_q2(d.t, 1.0, ((ipos + 1) >> 1) << mpeg2_sh);
+                if ((ipos & 1) != 0) {
+                    kl = kr;
+                    kr = 1.0;
+                }
+            }
+            intensity_band(g, off, sfb[i], kl * s, kr * s);
+        } else if (test_ms_stereo(h)) {
+            midside(g, off, sfb[i]);
+        }
+        off = off + sfb[i];
+        i = i + 1;
+    }
+}
+
+fn intensity_stereo(d: Dec, ist_off: int, gr0: Gr, gr1: Gr, h: Hdr) -> unit {
+    var max_band = [0, 0, 0];
+    let n_sfb = gr0.n_long_sfb + gr0.n_short_sfb;
+    let max_blocks = if (gr0.n_short_sfb != 0) { 3 } else { 1 };
+    stereo_top_band(d.grbuf, gr0.sfb, n_sfb, max_band);
+    if (gr0.n_long_sfb != 0) {
+        var m = max_band[0];
+        if (max_band[1] > m) {
+            m = max_band[1];
+        }
+        if (max_band[2] > m) {
+            m = max_band[2];
+        }
+        max_band[0] = m;
+        max_band[1] = m;
+        max_band[2] = m;
+    }
+    for i in 0..max_blocks {
+        let default_pos = if (test_mpeg1(h)) { 3 } else { 0 };
+        let itop = n_sfb - max_blocks + i;
+        let prev = itop - max_blocks;
+        d.ist_pos[ist_off + itop] = if (max_band[i] >= prev) {
+            default_pos
+        } else {
+            d.ist_pos[ist_off + prev]
+        };
+    }
+    stereo_process(d, ist_off, gr0.sfb, h, max_band, gr1.scalefac_compress & 1);
+}
+
+// ---- reordering, antialiasing and the IMDCT ----
+
+fn reorder(d: Dec, off: int, sfb: [int], from: int) -> unit {
+    let g = d.grbuf;
+    let tmp = d.syn;
+    var src = off;
+    var dst = 0;
+    var j = from;
+    while (sfb[j] != 0) {
+        let len = sfb[j];
+        for i in 0..len {
+            tmp[dst] = g[src + i];
+            tmp[dst + 1] = g[src + len + i];
+            tmp[dst + 2] = g[src + 2 * len + i];
+            dst = dst + 3;
+        }
+        src = src + 3 * len;
+        j = j + 3;
+    }
+    for i in 0..dst {
+        g[off + i] = tmp[i];
+    }
+}
+
+fn antialias(g: [float], off: int, nbands: int) -> unit {
+    let aa0 = [
+        0.85749293,
+        0.881742,
+        0.94962865,
+        0.98331459,
+        0.99551782,
+        0.99916056,
+        0.9998992,
+        0.99999316
+    ];
+    let aa1 = [
+        0.51449576,
+        0.47173197,
+        0.31337745,
+        0.1819132,
+        0.09457419,
+        0.04096558,
+        0.01419856,
+        0.00369997
+    ];
+    var base = off;
+    for _ in 0..nbands {
+        for i in 0..8 {
+            let u = g[base + 18 + i];
+            let dn = g[base + 17 - i];
+            g[base + 18 + i] = u * aa0[i] - dn * aa1[i];
+            g[base + 17 - i] = u * aa1[i] + dn * aa0[i];
+        }
+        base = base + 18;
+    }
+}
+
+fn dct3_9(y: [float]) -> unit {
+    var s0 = y[0];
+    var s2 = y[2];
+    var s4 = y[4];
+    var s6 = y[6];
+    var s8 = y[8];
+    var t0 = s0 + s6 * 0.5;
+    s0 = s0 - s6;
+    var t4 = (s4 + s2) * 0.93969262;
+    var t2 = (s8 + s2) * 0.76604444;
+    s6 = (s4 - s8) * 0.17364818;
+    s4 = s4 + s8 - s2;
+    s2 = s0 - s4 * 0.5;
+    y[4] = s4 + s0;
+    s8 = t0 - t2 + s6;
+    s0 = t0 - t4 + t2;
+    s4 = t0 + t4 - s6;
+    var s1 = y[1];
+    var s3 = y[3];
+    var s5 = y[5];
+    var s7 = y[7];
+    s3 = s3 * 0.8660254;
+    t0 = (s5 + s1) * 0.98480775;
+    t4 = (s5 - s7) * 0.34202014;
+    t2 = (s1 + s7) * 0.64278761;
+    s1 = (s1 - s5 - s7) * 0.8660254;
+    s5 = t0 - s3 - t2;
+    s7 = t4 - s3 - t0;
+    s3 = t4 + s3 - t2;
+    y[0] = s4 - s7;
+    y[1] = s2 + s1;
+    y[2] = s0 - s3;
+    y[3] = s8 + s5;
+    y[5] = s8 - s5;
+    y[6] = s0 + s3;
+    y[7] = s2 - s1;
+    y[8] = s4 + s7;
+}
+
+fn imdct36(d: Dec, goff: int, ooff: int, window: [float], nbands: int) -> unit {
+    let twid9 = [
+        0.73727734,
+        0.79335334,
+        0.84339145,
+        0.88701083,
+        0.92387953,
+        0.95371695,
+        0.97629601,
+        0.99144486,
+        0.99904822,
+        0.67559021,
+        0.60876143,
+        0.53729961,
+        0.46174861,
+        0.38268343,
+        0.3007058,
+        0.21643961,
+        0.13052619,
+        0.04361938
+    ];
+    let g = d.grbuf;
+    let ov = d.overlap;
+    let co = d.co;
+    let si = d.si;
+    var gb = goff;
+    var ob = ooff;
+    for _ in 0..nbands {
+        co[0] = 0.0 - g[gb];
+        si[0] = g[gb + 17];
+        for i in 0..4 {
+            si[8 - 2 * i] = g[gb + 4 * i + 1] - g[gb + 4 * i + 2];
+            co[1 + 2 * i] = g[gb + 4 * i + 1] + g[gb + 4 * i + 2];
+            si[7 - 2 * i] = g[gb + 4 * i + 4] - g[gb + 4 * i + 3];
+            co[2 + 2 * i] = 0.0 - (g[gb + 4 * i + 3] + g[gb + 4 * i + 4]);
+        }
+        dct3_9(co);
+        dct3_9(si);
+        si[1] = 0.0 - si[1];
+        si[3] = 0.0 - si[3];
+        si[5] = 0.0 - si[5];
+        si[7] = 0.0 - si[7];
+        for i in 0..9 {
+            let ovl = ov[ob + i];
+            let sum = co[i] * twid9[9 + i] + si[i] * twid9[i];
+            ov[ob + i] = co[i] * twid9[i] - si[i] * twid9[9 + i];
+            g[gb + i] = ovl * window[i] - sum * window[9 + i];
+            g[gb + 17 - i] = ovl * window[9 + i] + sum * window[i];
+        }
+        gb = gb + 18;
+        ob = ob + 9;
+    }
+}
+
+fn idct3(x0: float, x1: float, x2: float, dst: [float]) -> unit {
+    let m1 = x1 * 0.8660254;
+    let a1 = x0 - x2 * 0.5;
+    dst[1] = x0 + x2;
+    dst[0] = a1 + m1;
+    dst[2] = a1 - m1;
+}
+
+fn imdct12(d: Dec, x: [float], xo: int, dst: [float], doff: int, ov: [float], oo: int) -> unit {
+    let tw = [0.79335334, 0.92387953, 0.99144486, 0.60876143, 0.38268343, 0.13052619];
+    let co = d.c3;
+    let si = d.s3;
+    idct3(0.0 - x[xo], x[xo + 6] + x[xo + 3], x[xo + 12] + x[xo + 9], co);
+    idct3(x[xo + 15], x[xo + 12] - x[xo + 9], x[xo + 6] - x[xo + 3], si);
+    si[1] = 0.0 - si[1];
+    for i in 0..3 {
+        let ovl = ov[oo + i];
+        let sum = co[i] * tw[3 + i] + si[i] * tw[i];
+        ov[oo + i] = co[i] * tw[i] - si[i] * tw[3 + i];
+        dst[doff + i] = ovl * tw[2 - i] - sum * tw[5 - i];
+        dst[doff + 5 - i] = ovl * tw[5 - i] + sum * tw[2 - i];
+    }
+}
+
+fn imdct_short(d: Dec, goff: int, ooff: int, nbands: int) -> unit {
+    let g = d.grbuf;
+    let ov = d.overlap;
+    let tmp = d.tmp;
+    var gb = goff;
+    var ob = ooff;
+    for _ in 0..nbands {
+        for i in 0..18 {
+            tmp[i] = g[gb + i];
+        }
+        for i in 0..6 {
+            g[gb + i] = ov[ob + i];
+        }
+        imdct12(d, tmp, 0, g, gb + 6, ov, ob + 6);
+        imdct12(d, tmp, 1, g, gb + 12, ov, ob + 6);
+        imdct12(d, tmp, 2, ov, ob, ov, ob + 6);
+        gb = gb + 18;
+        ob = ob + 9;
+    }
+}
+
+fn change_sign(g: [float], off: int) -> unit {
+    var base = off + 18;
+    for _ in 0..16 {
+        var i = 1;
+        while (i < 18) {
+            g[base + i] = 0.0 - g[base + i];
+            i = i + 2;
+        }
+        base = base + 36;
+    }
+}
+
+fn imdct_gr(d: Dec, goff: int, ooff: int, block_type: int, n_long_bands: int) -> unit {
+    let normal = [
+        0.99904822,
+        0.99144486,
+        0.97629601,
+        0.95371695,
+        0.92387953,
+        0.88701083,
+        0.84339145,
+        0.79335334,
+        0.73727734,
+        0.04361938,
+        0.13052619,
+        0.21643961,
+        0.3007058,
+        0.38268343,
+        0.46174861,
+        0.53729961,
+        0.60876143,
+        0.67559021
+    ];
+    let stop = [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        0.99144486,
+        0.92387953,
+        0.79335334,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.13052619,
+        0.38268343,
+        0.60876143
+    ];
+    var gb = goff;
+    var ob = ooff;
+    if (n_long_bands > 0) {
+        imdct36(d, gb, ob, normal, n_long_bands);
+        gb = gb + 18 * n_long_bands;
+        ob = ob + 9 * n_long_bands;
+    }
+    if (block_type == 2) {
+        imdct_short(d, gb, ob, 32 - n_long_bands);
+    } else {
+        imdct36(d, gb, ob, if (block_type == 3) { stop } else { normal }, 32 - n_long_bands);
+    }
+}
+
+fn l3_decode(d: Dec, h: Hdr, r: bits.Bits, grs: [Gr], base: int, nch: int) -> unit {
+    for ch in 0..nch {
+        let gr = grs[base + ch];
+        let limit = r.pos + gr.part_23_length;
+        decode_scalefactors(d, h, ch * 39, r, gr, ch);
+        huffman(d, ch * 576, r, gr, limit);
+    }
+    if (test_i_stereo(h)) {
+        intensity_stereo(d, 39, grs[base], grs[base + 1], h);
+    } else if (is_ms_stereo(h)) {
+        midside(d.grbuf, 0, 576);
+    }
+    for ch in 0..nch {
+        let gr = grs[base + ch];
+        var aa_bands = 31;
+        // Mixed blocks start with 2 long bands; minimp3 doubles that at MPEG-2.5's 8 kHz.
+        let long_bands = if (gr.mixed_block_flag != 0) { 2 } else { 0 };
+        let n_long_bands = if (my_sample_rate(h) == 2) { long_bands * 2 } else { long_bands };
+        if (gr.n_short_sfb != 0) {
+            aa_bands = n_long_bands - 1;
+            reorder(d, ch * 576 + n_long_bands * 18, gr.sfb, gr.n_long_sfb);
+        }
+        antialias(d.grbuf, ch * 576, aa_bands);
+        imdct_gr(d, ch * 576, ch * 288, gr.block_type, n_long_bands);
+        change_sign(d.grbuf, ch * 576);
+    }
+}
+
+// ---- the polyphase synthesis ----
+
+fn dct_ii(d: Dec, off: int, n: int) -> unit {
+    let sec = [
+        10.19000816,
+        0.50060302,
+        0.50241929,
+        3.40760851,
+        0.50547093,
+        0.52249861,
+        2.05778098,
+        0.51544732,
+        0.56694406,
+        1.4841646,
+        0.53104258,
+        0.6468218,
+        1.16943991,
+        0.55310392,
+        0.7881546,
+        0.97256821,
+        0.58293498,
+        1.06067765,
+        0.83934963,
+        0.62250412,
+        1.72244716,
+        0.74453628,
+        0.67480832,
+        5.10114861
+    ];
+    let g = d.grbuf;
+    let t = d.t32;
+    for k in 0..n {
+        let y = off + k;
+        for i in 0..8 {
+            let x0 = g[y + i * 18];
+            let x1 = g[y + (15 - i) * 18];
+            let x2 = g[y + (16 + i) * 18];
+            let x3 = g[y + (31 - i) * 18];
+            let t0 = x0 + x3;
+            let t1 = x1 + x2;
+            let t2 = (x1 - x2) * sec[3 * i];
+            let t3 = (x0 - x3) * sec[3 * i + 1];
+            t[i] = t0 + t1;
+            t[8 + i] = (t0 - t1) * sec[3 * i + 2];
+            t[16 + i] = t3 + t2;
+            t[24 + i] = (t3 - t2) * sec[3 * i + 2];
+        }
+        for i in 0..4 {
+            let x = 8 * i;
+            var x0 = t[x];
+            var x1 = t[x + 1];
+            var x2 = t[x + 2];
+            var x3 = t[x + 3];
+            var x4 = t[x + 4];
+            var x5 = t[x + 5];
+            var x6 = t[x + 6];
+            var x7 = t[x + 7];
+            var xt = x0 - x7;
+            x0 = x0 + x7;
+            x7 = x1 - x6;
+            x1 = x1 + x6;
+            x6 = x2 - x5;
+            x2 = x2 + x5;
+            x5 = x3 - x4;
+            x3 = x3 + x4;
+            x4 = x0 - x3;
+            x0 = x0 + x3;
+            x3 = x1 - x2;
+            x1 = x1 + x2;
+            t[x] = x0 + x1;
+            t[x + 4] = (x0 - x1) * 0.70710677;
+            x5 = x5 + x6;
+            x6 = (x6 + x7) * 0.70710677;
+            x7 = x7 + xt;
+            x3 = (x3 + x4) * 0.70710677;
+            x5 = x5 - x7 * 0.198912367;
+            x7 = x7 + x5 * 0.382683432;
+            x5 = x5 - x7 * 0.198912367;
+            x0 = xt - x6;
+            xt = xt + x6;
+            t[x + 1] = (xt + x7) * 0.50979561;
+            t[x + 2] = (x4 + x3) * 0.54119611;
+            t[x + 3] = (x0 - x5) * 0.60134488;
+            t[x + 5] = (x0 + x5) * 0.89997619;
+            t[x + 6] = (x4 - x3) * 1.30656302;
+            t[x + 7] = (xt - x7) * 2.56291556;
+        }
+        var yy = y;
+        for i in 0..7 {
+            g[yy] = t[i];
+            g[yy + 18] = t[16 + i] + t[24 + i] + t[24 + i + 1];
+            g[yy + 36] = t[8 + i] + t[8 + i + 1];
+            g[yy + 54] = t[16 + i + 1] + t[24 + i] + t[24 + i + 1];
+            yy = yy + 72;
+        }
+        g[yy] = t[7];
+        g[yy + 18] = t[23] + t[31];
+        g[yy + 36] = t[15];
+        g[yy + 54] = t[31];
+    }
+}
+
+/// A synthesized sample to 16 bits, rounded as minimp3 does (away from zero, clamped).
+fn scale_pcm(sample: float) -> int {
+    if (sample >= 32766.5) {
+        return 32767;
+    }
+    if (sample <= -32767.5) {
+        return -32768;
+    }
+    let s = (sample + 0.5) as int;
+    if (s < 0) { s - 1 } else { s }
+}
+
+fn synth_pair(pcm: [int], p: int, nch: int, z: [float], zo: int) -> unit {
+    var a = (z[zo + 14 * 64] - z[zo]) * 29.0;
+    a = a + (z[zo + 64] + z[zo + 13 * 64]) * 213.0;
+    a = a + (z[zo + 12 * 64] - z[zo + 2 * 64]) * 459.0;
+    a = a + (z[zo + 3 * 64] + z[zo + 11 * 64]) * 2037.0;
+    a = a + (z[zo + 10 * 64] - z[zo + 4 * 64]) * 5153.0;
+    a = a + (z[zo + 5 * 64] + z[zo + 9 * 64]) * 6574.0;
+    a = a + (z[zo + 8 * 64] - z[zo + 6 * 64]) * 37489.0;
+    a = a + z[zo + 7 * 64] * 75038.0;
+    pcm[p] = scale_pcm(a);
+    let z2 = zo + 2;
+    var b = z[z2 + 14 * 64] * 104.0;
+    b = b + z[z2 + 12 * 64] * 1567.0;
+    b = b + z[z2 + 10 * 64] * 9727.0;
+    b = b + z[z2 + 8 * 64] * 64019.0;
+    b = b + z[z2 + 6 * 64] * -9975.0;
+    b = b + z[z2 + 4 * 64] * -45.0;
+    b = b + z[z2 + 2 * 64] * 146.0;
+    b = b + z[z2] * -5.0;
+    pcm[p + 16 * nch] = scale_pcm(b);
+}
+
+fn synth(d: Dec, xl: int, dstl: int, nch: int, loff: int) -> unit {
+    let g = d.grbuf;
+    let lins = d.syn;
+    let pcm = d.pcm;
+    let win = d.t.window;
+    let xr = xl + 576 * (nch - 1);
+    let dstr = dstl + (nch - 1);
+    let zlin = loff + 15 * 64;
+    lins[zlin + 60] = g[xl + 288];
+    lins[zlin + 61] = g[xr + 288];
+    lins[zlin + 62] = g[xl];
+    lins[zlin + 63] = g[xr];
+    lins[zlin + 124] = g[xl + 1 + 288];
+    lins[zlin + 125] = g[xr + 1 + 288];
+    lins[zlin + 126] = g[xl + 1];
+    lins[zlin + 127] = g[xr + 1];
+    synth_pair(pcm, dstr, nch, lins, loff + 60 + 1);
+    synth_pair(pcm, dstr + 32 * nch, nch, lins, loff + 60 + 64 + 1);
+    synth_pair(pcm, dstl, nch, lins, loff + 60);
+    synth_pair(pcm, dstl + 32 * nch, nch, lins, loff + 60 + 64);
+    var wi = 0;
+    var a0 = 0.0;
+    var a1 = 0.0;
+    var a2 = 0.0;
+    var a3 = 0.0;
+    var b0 = 0.0;
+    var b1 = 0.0;
+    var b2 = 0.0;
+    var b3 = 0.0;
+    var i = 14;
+    while (i >= 0) {
+        lins[zlin + 4 * i] = g[xl + 18 * (31 - i)];
+        lins[zlin + 4 * i + 1] = g[xr + 18 * (31 - i)];
+        lins[zlin + 4 * i + 2] = g[xl + 1 + 18 * (31 - i)];
+        lins[zlin + 4 * i + 3] = g[xr + 1 + 18 * (31 - i)];
+        lins[zlin + 4 * (i + 16)] = g[xl + 1 + 18 * (1 + i)];
+        lins[zlin + 4 * (i + 16) + 1] = g[xr + 1 + 18 * (1 + i)];
+        lins[zlin + 4 * (i - 16) + 2] = g[xl + 18 * (1 + i)];
+        lins[zlin + 4 * (i - 16) + 3] = g[xr + 18 * (1 + i)];
+        // minimp3's S0(0) S2(1) S1(2) S2(3) S1(4) S2(5) S1(6) S2(7).
+        for k in 0..8 {
+            let w0 = win[wi];
+            let w1 = win[wi + 1];
+            wi = wi + 2;
+            let vz = zlin + 4 * i - k * 64;
+            let vy = zlin + 4 * i - (15 - k) * 64;
+            let z0 = lins[vz];
+            let z1 = lins[vz + 1];
+            let z2 = lins[vz + 2];
+            let z3 = lins[vz + 3];
+            let y0 = lins[vy];
+            let y1 = lins[vy + 1];
+            let y2 = lins[vy + 2];
+            let y3 = lins[vy + 3];
+            if (k == 0) {
+                b0 = z0 * w1 + y0 * w0;
+                b1 = z1 * w1 + y1 * w0;
+                b2 = z2 * w1 + y2 * w0;
+                b3 = z3 * w1 + y3 * w0;
+                a0 = z0 * w0 - y0 * w1;
+                a1 = z1 * w0 - y1 * w1;
+                a2 = z2 * w0 - y2 * w1;
+                a3 = z3 * w0 - y3 * w1;
+            } else {
+                b0 = b0 + z0 * w1 + y0 * w0;
+                b1 = b1 + z1 * w1 + y1 * w0;
+                b2 = b2 + z2 * w1 + y2 * w0;
+                b3 = b3 + z3 * w1 + y3 * w0;
+                if ((k & 1) == 1) {
+                    a0 = a0 + y0 * w1 - z0 * w0;
+                    a1 = a1 + y1 * w1 - z1 * w0;
+                    a2 = a2 + y2 * w1 - z2 * w0;
+                    a3 = a3 + y3 * w1 - z3 * w0;
+                } else {
+                    a0 = a0 + z0 * w0 - y0 * w1;
+                    a1 = a1 + z1 * w0 - y1 * w1;
+                    a2 = a2 + z2 * w0 - y2 * w1;
+                    a3 = a3 + z3 * w0 - y3 * w1;
+                }
+            }
+        }
+        pcm[dstr + (15 - i) * nch] = scale_pcm(a1);
+        pcm[dstr + (17 + i) * nch] = scale_pcm(b1);
+        pcm[dstl + (15 - i) * nch] = scale_pcm(a0);
+        pcm[dstl + (17 + i) * nch] = scale_pcm(b0);
+        pcm[dstr + (47 - i) * nch] = scale_pcm(a3);
+        pcm[dstr + (49 + i) * nch] = scale_pcm(b3);
+        pcm[dstl + (47 - i) * nch] = scale_pcm(a2);
+        pcm[dstl + (49 + i) * nch] = scale_pcm(b2);
+        i = i - 1;
+    }
+}
+
+fn synth_granule(d: Dec, nch: int) -> unit {
+    for ch in 0..nch {
+        dct_ii(d, 576 * ch, 18);
+    }
+    let lins = d.syn;
+    let qmf = d.qmf;
+    for i in 0..960 {
+        lins[i] = qmf[i];
+    }
+    var i = 0;
+    while (i < 18) {
+        synth(d, i, 32 * nch * i, nch, i * 64);
+        i = i + 2;
+    }
+    if (nch == 1) {
+        var k = 0;
+        while (k < 960) {
+            qmf[k] = lins[18 * 64 + k];
+            k = k + 2;
+        }
+    } else {
+        for k in 0..960 {
+            qmf[k] = lins[18 * 64 + k];
+        }
+    }
+}
+
+// ---- frames ----
+
+/// Decodes the Layer III frame at `at` (`size` bytes) into `sink`.
+fn frame(d: Dec, b: bytes, at: int, size: int, sink: wav.Sink) -> Result<unit, string> {
+    let h = hdr_at(b, at);
+    let nch = channels_of(h);
+    let r = bits.over_range(b, at + 4, at + size);
+    if ((h.b1 & 1) == 0) {
+        bits.skip(r, 16);
+    }
+    let (main_data_begin, grs) = read_side_info(r, h, d.t)?;
+    // The granules may start in earlier frames: the reservoir keeps their tail.
+    let have = if (d.reserv.len() < main_data_begin) { d.reserv.len() } else { main_data_begin };
+    let main = d.reserv.sub_bytes(
+        d.reserv.len() - have,
+        d.reserv.len()
+    ) + b.sub_bytes(bits.octet_pos(r), at + size);
+    let m = bits.over_range(main, 0, main.len());
+    if (d.reserv.len() >= main_data_begin) {
+        let granules = if (test_mpeg1(h)) { 2 } else { 1 };
+        let g = d.grbuf;
+        for igr in 0..granules {
+            for i in 0..1152 {
+                g[i] = 0.0;
+            }
+            l3_decode(d, h, m, grs, igr * nch, nch);
+            synth_granule(d, nch);
+            let pcm = d.pcm;
+            for i in 0..576 * nch {
+                wav.put(sink, pcm[i]);
+            }
+        }
+    }
+    var keep_from = (m.pos + 7) / 8;
+    if (keep_from > main.len()) {
+        keep_from = main.len();
+    }
+    if (main.len() - keep_from > 511) {
+        keep_from = main.len() - 511;
+    }
+    d.reserv = main.sub_bytes(keep_from, main.len());
+    Result.Ok({ })
+}
+
+/// LAME's encoder delay and padding from a Xing/Info frame at `at`, or None if the frame is
+/// not one. `Some((0, 0))` = an Info frame without a LAME tag.
+fn info_frame(b: bytes, at: int, size: int) -> Option<(int, int)> {
+    let h = hdr_at(b, at);
+    let crc = if ((h.b1 & 1) == 0) { 2 } else { 0 };
+    let tag = at + 4 + crc + side_info_bytes(h);
+    if (tag + 8 > at + size) {
+        return Option.None;
+    }
+    let id = from_utf8(b.sub_bytes(tag, tag + 4)).unwrap_or("");
+    if (id != "Xing" && id != "Info") {
+        return Option.None;
+    }
+    let flags = b[tag + 7];
+    var lame = tag + 8;
+    if ((flags & 1) != 0) {
+        lame = lame + 4;
+    }
+    if ((flags & 2) != 0) {
+        lame = lame + 4;
+    }
+    if ((flags & 4) != 0) {
+        lame = lame + 100;
+    }
+    if ((flags & 8) != 0) {
+        lame = lame + 4;
+    }
+    if (lame + 24 > at + size) {
+        return Option.Some((0, 0));
+    }
+    let delay = (b[lame + 21] << 4) | (b[lame + 22] >> 4);
+    let padding = ((b[lame + 22] & 15) << 8) | b[lame + 23];
+    Option.Some((delay, padding))
+}
+
+/// Decodes a whole MP3 file whose first frame (or junk before it) starts at octet `from`.
+/// The first frame is taken only when the header after it belongs to the same stream, which
+/// keeps tags and junk from being read as audio; after that, a header like the previous one
+/// is enough (the last frame may be followed by an ID3v1 tag).
+pub fn decode(b: bytes, from: int) -> Result<wav.Pcm, string> {
+    let d = decoder();
+    let sink = wav.sink();
+    var at = from;
+    var rate = 0;
+    var channels = 0;
+    var frames = 0;
+    var trim_start = 0;
+    var trim_end = 0;
+    var last_error = "";
+    var locked = -1;
+    while (at + 4 <= b.len()) {
+        if (!valid_at(b, at)) {
+            at = at + 1;
+            continue;
+        }
+        let h = hdr_at(b, at);
+        let size = frame_bytes(h);
+        let next = at + size;
+        let follows = next + 4 > b.len()
+            || same_stream(b, at, next)
+            || (locked >= 0 && same_stream(b, locked, at));
+        let fits = size > 4 && next <= b.len() && follows;
+        if (!fits) {
+            at = at + 1;
+            continue;
+        }
+        if (layer_of(h) != 3) {
+            return Result.Err("MPEG layer ${to_string(layer_of(h))} is not supported (only MP3)");
+        }
+        if (frames == 0) {
+            if let Option.Some(gap) = info_frame(b, at, size) {
+                if (gap.0 > 0 || gap.1 > 0) {
+                    trim_start = gap.0 + 529;
+                    trim_end = if (gap.1 > 529) { gap.1 - 529 } else { 0 };
+                }
+                frames = 1;
+                at = next;
+                continue;
+            }
+        }
+        if (rate == 0) {
+            rate = sample_rate(h);
+            channels = channels_of(h);
+        }
+        if (sample_rate(h) == rate && channels_of(h) == channels) {
+            match (frame(d, b, at, size, sink)) {
+                Result.Ok(_) => { },
+                Result.Err(e) => {
+                    last_error = e;
+                    d.reserv = bytes_of([]);
+                },
+            }
+        }
+        frames = frames + 1;
+        locked = at;
+        at = next;
+    }
+    let data = wav.finish(sink);
+    if (rate == 0 || data.len() == 0) {
+        return Result.Err(if (last_error == "") { "no MP3 audio found" } else { last_error });
+    }
+    let block = 2 * channels;
+    let cut_start = if (trim_start * block < data.len()) { trim_start * block } else { 0 };
+    let cut_end = if (cut_start + trim_end * block < data.len()) { trim_end * block } else { 0 };
+    Result.Ok(
+        wav.Pcm {
+            rate: rate,
+            channels: channels,
+            data: data.sub_bytes(cut_start, data.len() - cut_end)
+        }
+    )
+}
