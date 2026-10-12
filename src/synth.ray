@@ -1,5 +1,5 @@
 // The tracks. Three are procedural — a few minutes of sound computed chunk by chunk, so the
-// app ships no audio files and no track ever sits whole in memory — and any 16-bit WAV the
+// app ships no audio files and no track ever sits whole in memory — and any 16/24-bit WAV the
 // user loads becomes a fourth kind. `chunk` renders any window of a track as s16le at the
 // track's rate, which is all the player needs.
 

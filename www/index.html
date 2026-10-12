@@ -51,8 +51,8 @@
 <div class="list" id="list"></div>
 <!-- The program opens the native dialog and reads the file itself; the input is the fallback
      for a shell without one (there the whole file crosses the bridge as base64). -->
-<button class="load" id="pick">Load a 16-bit WAV</button>
-<label class="load" id="fallback" hidden>Load a 16-bit WAV<input id="file" type="file" accept=".wav,audio/wav,audio/x-wav"></label>
+<button class="load" id="pick">Load a WAV (16 or 24-bit)</button>
+<label class="load" id="fallback" hidden>Load a WAV (16 or 24-bit)<input id="file" type="file" accept=".wav,audio/wav,audio/x-wav"></label>
 <div class="status" id="status"></div>
 <script>
 (function () {

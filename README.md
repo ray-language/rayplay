@@ -10,8 +10,9 @@ con `std/audio`, y la página es solo la interfaz.
 
 - Tres pistas **procedurales** (un estudio pentatónico, un dron, un pulso de bajo), calculadas
   trozo a trozo: la app no lleva archivos de audio y ninguna pista ocupa memoria entera.
-- **Cargar un WAV de 16 bits** desde la página (selector de archivos del webview) y añadirlo a
-  la lista: el programa lo analiza (`src/wav.ray`) y lo reproduce a su frecuencia y canales.
+- **Cargar un WAV de 16 o 24 bits** y añadirlo a la lista (diálogo nativo en el escritorio,
+  selector del webview en el móvil): el programa lo analiza (`src/wav.ray`), reduce los de 24
+  bits a 16 y lo reproduce a su frecuencia y canales.
 - Play/pausa, stop, anterior/siguiente (con vuelta), **seek** tocando la barra, volumen, y al
   acabar una pista sigue con la siguiente. Un cambio de volumen se aplica como una rampa a lo
   largo del siguiente trozo de 50 ms (`synth.chunk_ramp`), no como un escalón que suena a clic.
@@ -29,11 +30,12 @@ con `std/audio`, y la página es solo la interfaz.
 ┌────────── programa raylang (src/) ───┴─────────────────────────────┐
 │  main.ray     ventana (std/ui), eventos: message, lifecycle, closed │
 │  api.ray      protocolo: state, play, toggle, stop, next, prev,     │
-│               seek, volume, add                                     │
+│               seek, volume, pick, add                               │
 │  player.ray   ACTOR: una fibra con el dispositivo (std/audio) y la  │
 │               lista; comandos por canal; 50 ms por chunk            │
 │  synth.ray    las pistas: procedurales o WAV cargado → s16le        │
-│  wav.ray      lector/escritor RIFF/WAVE PCM 16 bits                 │
+│  wav.ray      lector/escritor RIFF/WAVE PCM (lee 16 y 24 bits)      │
+│  b64.ray      base64 → bytes rápido (std/base64 no aguanta 56 MB)   │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -96,8 +98,9 @@ el emulador Android.
 
 ## Limitaciones
 
-- Solo WAV PCM de 16 bits, mono o estéreo, 8–192 kHz: no hay decodificador de MP3/OGG en la
-  stdlib, y el reproductor no remuestrea (abre el dispositivo a la frecuencia de la pista).
+- Solo WAV PCM de 16 o 24 bits, mono o estéreo, 8–192 kHz: no hay decodificador de MP3/OGG en la
+  stdlib, y el reproductor no remuestrea (abre el dispositivo a la frecuencia de la pista). Los de
+  24 bits se truncan a 16 al cargarlos (sin dither).
 - Cargar un WAV: en el escritorio, el programa abre el diálogo nativo y lee el archivo del disco.
   En iOS/Android no hay diálogo (`ui.pick_file_with` devuelve «file dialogs are not available on
   mobile (v1)», #152), así que la página usa su `<input type=file>` y el archivo cruza el puente
