@@ -1,0 +1,1718 @@
+// The SILK layer of Opus (RFC 6716, section 4.2): the speech codec for SILK-only frames and the
+// lower band of hybrid frames, at 8, 12 or 16 kHz. A port of libopus' fixed-point decoder
+// (silk/dec_API.c and what it calls), so the output is bit-exact: each 10 or 20 ms frame codes
+// gains, a spectral envelope (NLSFs turned into an LPC filter), pitch lags and long-term
+// prediction filters for voiced speech, and an excitation of pulses; stereo is coded as mid and
+// side. The result is resampled to 48 kHz with SILK's own resampler.
+//
+// Lost frames are not concealed (no PLC or comfort noise): the Opus layer resets on damage.
+
+import rangedec as rd;
+import silk_tables as t;
+
+const MAX_LPC_ORDER: int = 16;
+
+const LTP_ORDER: int = 5;
+
+const MAX_FRAME_LENGTH: int = 320;
+
+const MAX_SUB_FRAME_LENGTH: int = 80;
+
+const TYPE_VOICED: int = 2;
+
+const CODE_INDEPENDENTLY: int = 0;
+
+const CODE_INDEPENDENTLY_NO_LTP_SCALING: int = 1;
+
+const CODE_CONDITIONALLY: int = 2;
+
+const NLSF_QUANT_MAX_AMPLITUDE: int = 4;
+
+const SHELL_CODEC_FRAME_LENGTH: int = 16;
+
+const SILK_MAX_PULSES: int = 16;
+
+const N_LEVELS_QGAIN: int = 64;
+
+const MIN_DELTA_GAIN_QUANT: int = -4;
+
+const MAX_DELTA_GAIN_QUANT: int = 36;
+
+const QUANT_LEVEL_ADJUST_Q10: int = 80;
+
+/// ((2 · 128) / 6 + 16 · 128): the gain offset; and the inverse gain step in Q16.
+const GAIN_OFFSET: int = 2090;
+
+const INV_SCALE_Q16: int = 1907825;
+
+const RAND_MULTIPLIER: int = 196314165;
+
+const RAND_INCREMENT: int = 907633515;
+
+const A_LIMIT: int = 16773022;
+
+const MIN_INV_GAIN_Q30: int = 107374;
+
+const MAX_LPC_STABILIZE_ITERATIONS: int = 16;
+
+const INT32_MAX: int = 2147483647;
+
+const INT32_MIN: int = -2147483648;
+
+const ORDERING16: [int] = [0, 15, 8, 7, 4, 11, 12, 3, 2, 13, 10, 5, 6, 9, 14, 1];
+
+const ORDERING10: [int] = [0, 9, 6, 3, 4, 5, 8, 1, 2, 7];
+
+const FRAC_FIR_12: [int] = [
+    189,
+    -600,
+    617,
+    30567,
+    117,
+    -159,
+    -1070,
+    29704,
+    52,
+    221,
+    -2392,
+    28276,
+    -4,
+    529,
+    -3350,
+    26341,
+    -48,
+    758,
+    -3956,
+    23973,
+    -80,
+    905,
+    -4235,
+    21254,
+    -99,
+    972,
+    -4222,
+    18278,
+    -107,
+    967,
+    -3957,
+    15143,
+    -103,
+    896,
+    -3487,
+    11950,
+    -91,
+    773,
+    -2865,
+    8798,
+    -71,
+    611,
+    -2143,
+    5784,
+    -46,
+    425,
+    -1375,
+    2996
+];
+
+// ---- Fixed-point helpers (libopus' macros, on 64-bit ints)
+
+/// The low 16 bits as a signed value, as a cast to opus_int16.
+fn i16(x: int) -> int {
+    ((x + 32768) & 0xFFFF) - 32768
+}
+
+/// The low 32 bits as a signed value (wrap-around, as in silk_ADD32_ovflw).
+fn i32(x: int) -> int {
+    ((x + 0x80000000) & 0xFFFFFFFF) - 0x80000000
+}
+
+fn smulwb(a: int, b: int) -> int {
+    (a * i16(b)) >> 16
+}
+
+fn smlawb(a: int, b: int, c: int) -> int {
+    a + ((b * i16(c)) >> 16)
+}
+
+fn smulbb(a: int, b: int) -> int {
+    i16(a) * i16(b)
+}
+
+fn smlabb(a: int, b: int, c: int) -> int {
+    a + i16(b) * i16(c)
+}
+
+fn smulww(a: int, b: int) -> int {
+    i32((a * b) >> 16)
+}
+
+fn smlaww(a: int, b: int, c: int) -> int {
+    i32(a + ((b * c) >> 16))
+}
+
+fn smmul(a: int, b: int) -> int {
+    (a * b) >> 32
+}
+
+fn rshift_round(a: int, shift: int) -> int {
+    if (shift == 1) { (a >> 1) + (a & 1) } else { ((a >> (shift - 1)) + 1) >> 1 }
+}
+
+fn sat16(a: int) -> int {
+    if (a > 32767) { 32767 } else if (a < -32768) { -32768 } else { a }
+}
+
+fn limit(a: int, l1: int, l2: int) -> int {
+    if (l1 > l2) {
+        if (a > l1) { l1 } else if (a < l2) { l2 } else { a }
+    } else {
+        if (a > l2) { l2 } else if (a < l1) { l1 } else { a }
+    }
+}
+
+fn imin(a: int, b: int) -> int {
+    if (a < b) { a } else { b }
+}
+
+fn imax(a: int, b: int) -> int {
+    if (a > b) { a } else { b }
+}
+
+fn iabs(a: int) -> int {
+    if (a > 0) { a } else { -a }
+}
+
+fn add_sat32(a: int, b: int) -> int {
+    let s = a + b;
+    if (s > INT32_MAX) { INT32_MAX } else if (s < INT32_MIN) { INT32_MIN } else { s }
+}
+
+fn sub_sat32(a: int, b: int) -> int {
+    let s = a - b;
+    if (s > INT32_MAX) { INT32_MAX } else if (s < INT32_MIN) { INT32_MIN } else { s }
+}
+
+fn lshift_sat32(a: int, shift: int) -> int {
+    i32(limit(a, INT32_MIN >> shift, INT32_MAX >> shift) << shift)
+}
+
+/// Leading zeros of a 32-bit value.
+fn clz32(x0: int) -> int {
+    let x = x0 & 0xFFFFFFFF;
+    if (x == 0) {
+        return 32;
+    }
+    32 - rd.ilog(x)
+}
+
+fn rand(seed: int) -> int {
+    i32(RAND_INCREMENT + seed * RAND_MULTIPLIER)
+}
+
+fn div32_varq(a32: int, b32: int, qres: int) -> int {
+    let a_headrm = clz32(iabs(a32)) - 1;
+    var a32_nrm = i32(a32 << a_headrm);
+    let b_headrm = clz32(iabs(b32)) - 1;
+    let b32_nrm = i32(b32 << b_headrm);
+    let b32_inv = (INT32_MAX >> 2) / (b32_nrm >> 16);
+    var result = smulwb(a32_nrm, b32_inv);
+    a32_nrm = i32(a32_nrm - i32(smmul(b32_nrm, result) << 3));
+    result = smlawb(result, a32_nrm, b32_inv);
+    let lshift = 29 + a_headrm - b_headrm - qres;
+    if (lshift < 0) {
+        return lshift_sat32(result, -lshift);
+    }
+    if (lshift < 32) { result >> lshift } else { 0 }
+}
+
+fn inverse32_varq(b32: int, qres: int) -> int {
+    let b_headrm = clz32(iabs(b32)) - 1;
+    let b32_nrm = i32(b32 << b_headrm);
+    let b32_inv = (INT32_MAX >> 2) / (b32_nrm >> 16);
+    var result = i32(b32_inv << 16);
+    let err_q32 = i32(((1 << 29) - smulwb(b32_nrm, b32_inv)) << 3);
+    result = smlaww(result, err_q32, b32_inv);
+    let lshift = 61 - b_headrm - qres;
+    if (lshift <= 0) {
+        return lshift_sat32(result, -lshift);
+    }
+    if (lshift < 32) { result >> lshift } else { 0 }
+}
+
+fn log2lin(in_log_q7: int) -> int {
+    if (in_log_q7 < 0) {
+        return 0;
+    }
+    if (in_log_q7 >= 3967) {
+        return INT32_MAX;
+    }
+    var out = 1 << (in_log_q7 >> 7);
+    let frac_q7 = in_log_q7 & 0x7F;
+    if (in_log_q7 < 2048) {
+        out = out + ((out * smlawb(frac_q7, smulbb(frac_q7, 128 - frac_q7), -174)) >> 7);
+    } else {
+        out = out + (out >> 7) * smlawb(frac_q7, smulbb(frac_q7, 128 - frac_q7), -174);
+    }
+    out
+}
+
+fn copy_of(a: [int]) -> [int] {
+    var v: [int] = [];
+    for x in a {
+        v.push(x);
+    }
+    v
+}
+
+fn zeros(n: int) -> [int] {
+    var v: [int] = [];
+    for _ in 0..n {
+        v.push(0);
+    }
+    v
+}
+
+// ---- State
+
+/// The tables passed around or picked by rate: a `const` array is copied wherever it is used
+/// as a value, so the decoder copies them once here and passes these.
+struct Tables {
+    cb_lags_stage2: [int],
+    cb_lags_stage2_10_ms: [int],
+    cb_lags_stage3: [int],
+    cb_lags_stage3_10_ms: [int],
+    delta_gain_icdf: [int],
+    gain_icdf: [int],
+    lbrr_flags_2_icdf: [int],
+    lbrr_flags_3_icdf: [int],
+    lsb_icdf: [int],
+    ltpscale_icdf: [int],
+    ltp_gain_icdf_0: [int],
+    ltp_gain_icdf_1: [int],
+    ltp_gain_icdf_2: [int],
+    ltp_per_index_icdf: [int],
+    ltp_vq_0: [int],
+    ltp_vq_1: [int],
+    ltp_vq_2: [int],
+    nlsf_cb1_icdf_nb_mb: [int],
+    nlsf_cb1_icdf_wb: [int],
+    nlsf_cb1_nb_mb_q8: [int],
+    nlsf_cb1_wb_q8: [int],
+    nlsf_cb1_wght_nb_mb_q9: [int],
+    nlsf_cb1_wght_wb_q9: [int],
+    nlsf_cb2_icdf_nb_mb: [int],
+    nlsf_cb2_icdf_wb: [int],
+    nlsf_cb2_select_nb_mb: [int],
+    nlsf_cb2_select_wb: [int],
+    nlsf_delta_min_nb_mb_q15: [int],
+    nlsf_delta_min_wb_q15: [int],
+    nlsf_ext_icdf: [int],
+    nlsf_interpolation_factor_icdf: [int],
+    nlsf_pred_nb_mb_q8: [int],
+    nlsf_pred_wb_q8: [int],
+    pitch_contour_10_ms_icdf: [int],
+    pitch_contour_10_ms_nb_icdf: [int],
+    pitch_contour_icdf: [int],
+    pitch_contour_nb_icdf: [int],
+    pitch_delta_icdf: [int],
+    pitch_lag_icdf: [int],
+    pulses_per_block_icdf: [int],
+    rate_levels_icdf: [int],
+    shell_code_table0: [int],
+    shell_code_table1: [int],
+    shell_code_table2: [int],
+    shell_code_table3: [int],
+    stereo_only_code_mid_icdf: [int],
+    stereo_pred_joint_icdf: [int],
+    type_offset_no_vad_icdf: [int],
+    type_offset_vad_icdf: [int],
+    uniform3_icdf: [int],
+    uniform4_icdf: [int],
+    uniform5_icdf: [int],
+    uniform6_icdf: [int],
+    uniform8_icdf: [int],
+}
+
+fn tables_of() -> Tables {
+    Tables {
+        cb_lags_stage2: t.CB_LAGS_STAGE2,
+        cb_lags_stage2_10_ms: t.CB_LAGS_STAGE2_10_MS,
+        cb_lags_stage3: t.CB_LAGS_STAGE3,
+        cb_lags_stage3_10_ms: t.CB_LAGS_STAGE3_10_MS,
+        delta_gain_icdf: t.DELTA_GAIN_ICDF,
+        gain_icdf: t.GAIN_ICDF,
+        lbrr_flags_2_icdf: t.LBRR_FLAGS_2_ICDF,
+        lbrr_flags_3_icdf: t.LBRR_FLAGS_3_ICDF,
+        lsb_icdf: t.LSB_ICDF,
+        ltpscale_icdf: t.LTPSCALE_ICDF,
+        ltp_gain_icdf_0: t.LTP_GAIN_ICDF_0,
+        ltp_gain_icdf_1: t.LTP_GAIN_ICDF_1,
+        ltp_gain_icdf_2: t.LTP_GAIN_ICDF_2,
+        ltp_per_index_icdf: t.LTP_PER_INDEX_ICDF,
+        ltp_vq_0: t.LTP_VQ_0,
+        ltp_vq_1: t.LTP_VQ_1,
+        ltp_vq_2: t.LTP_VQ_2,
+        nlsf_cb1_icdf_nb_mb: t.NLSF_CB1_ICDF_NB_MB,
+        nlsf_cb1_icdf_wb: t.NLSF_CB1_ICDF_WB,
+        nlsf_cb1_nb_mb_q8: t.NLSF_CB1_NB_MB_Q8,
+        nlsf_cb1_wb_q8: t.NLSF_CB1_WB_Q8,
+        nlsf_cb1_wght_nb_mb_q9: t.NLSF_CB1_WGHT_NB_MB_Q9,
+        nlsf_cb1_wght_wb_q9: t.NLSF_CB1_WGHT_WB_Q9,
+        nlsf_cb2_icdf_nb_mb: t.NLSF_CB2_ICDF_NB_MB,
+        nlsf_cb2_icdf_wb: t.NLSF_CB2_ICDF_WB,
+        nlsf_cb2_select_nb_mb: t.NLSF_CB2_SELECT_NB_MB,
+        nlsf_cb2_select_wb: t.NLSF_CB2_SELECT_WB,
+        nlsf_delta_min_nb_mb_q15: t.NLSF_DELTA_MIN_NB_MB_Q15,
+        nlsf_delta_min_wb_q15: t.NLSF_DELTA_MIN_WB_Q15,
+        nlsf_ext_icdf: t.NLSF_EXT_ICDF,
+        nlsf_interpolation_factor_icdf: t.NLSF_INTERPOLATION_FACTOR_ICDF,
+        nlsf_pred_nb_mb_q8: t.NLSF_PRED_NB_MB_Q8,
+        nlsf_pred_wb_q8: t.NLSF_PRED_WB_Q8,
+        pitch_contour_10_ms_icdf: t.PITCH_CONTOUR_10_MS_ICDF,
+        pitch_contour_10_ms_nb_icdf: t.PITCH_CONTOUR_10_MS_NB_ICDF,
+        pitch_contour_icdf: t.PITCH_CONTOUR_ICDF,
+        pitch_contour_nb_icdf: t.PITCH_CONTOUR_NB_ICDF,
+        pitch_delta_icdf: t.PITCH_DELTA_ICDF,
+        pitch_lag_icdf: t.PITCH_LAG_ICDF,
+        pulses_per_block_icdf: t.PULSES_PER_BLOCK_ICDF,
+        rate_levels_icdf: t.RATE_LEVELS_ICDF,
+        shell_code_table0: t.SHELL_CODE_TABLE0,
+        shell_code_table1: t.SHELL_CODE_TABLE1,
+        shell_code_table2: t.SHELL_CODE_TABLE2,
+        shell_code_table3: t.SHELL_CODE_TABLE3,
+        stereo_only_code_mid_icdf: t.STEREO_ONLY_CODE_MID_ICDF,
+        stereo_pred_joint_icdf: t.STEREO_PRED_JOINT_ICDF,
+        type_offset_no_vad_icdf: t.TYPE_OFFSET_NO_VAD_ICDF,
+        type_offset_vad_icdf: t.TYPE_OFFSET_VAD_ICDF,
+        uniform3_icdf: t.UNIFORM3_ICDF,
+        uniform4_icdf: t.UNIFORM4_ICDF,
+        uniform5_icdf: t.UNIFORM5_ICDF,
+        uniform6_icdf: t.UNIFORM6_ICDF,
+        uniform8_icdf: t.UNIFORM8_ICDF
+    }
+}
+
+/// SILK's resampler from the internal rate to 48 kHz (2× all-pass upsampling, then a FIR
+/// interpolator).
+struct Resampler {
+    siir: [int],
+    sfir: [int],
+    delay_buf: [int],
+    input_delay: int,
+    fs_in_khz: int,
+    fs_out_khz: int,
+    batch_size: int,
+    inv_ratio_q16: int,
+    /// Work buffer: 2 × batch + 8.
+    buf: [int],
+}
+
+fn resampler_of(fs_in: int) -> Resampler {
+    let fs_in_khz = fs_in / 1000;
+    let input_delay = if (fs_in == 8000) { 0 } else if (fs_in == 12000) { 4 } else { 7 };
+    var inv = ((fs_in << 15) / 48000) << 2;
+    while (smulww(inv, 48000) < fs_in << 1) {
+        inv = inv + 1;
+    }
+    Resampler {
+        siir: zeros(6),
+        sfir: zeros(8),
+        delay_buf: zeros(48),
+        input_delay: input_delay,
+        fs_in_khz: fs_in_khz,
+        fs_out_khz: 48,
+        batch_size: fs_in_khz * 10,
+        inv_ratio_q16: inv,
+        buf: zeros(2 * fs_in_khz * 10 + 8)
+    }
+}
+
+/// One channel's decoder (libopus' silk_decoder_state).
+struct Lane {
+    tb: Tables,
+    prev_gain_q16: int,
+    exc_q14: [int],
+    slpc_q14_buf: [int],
+    out_buf: [int],
+    lag_prev: int,
+    last_gain_index: int,
+    fs_khz: int,
+    nb_subfr: int,
+    frame_length: int,
+    subfr_length: int,
+    ltp_mem_length: int,
+    lpc_order: int,
+    prev_nlsf_q15: [int],
+    first_frame_after_reset: bool,
+    n_frames_decoded: int,
+    n_frames_per_packet: int,
+    ec_prev_signal_type: int,
+    ec_prev_lag_index: int,
+    vad_flags: [int],
+    lbrr_flag: int,
+    lbrr_flags: [int],
+    resampler: Resampler,
+    has_resampler: bool,
+    // Quantization indices of the current frame.
+    signal_type: int,
+    quant_offset_type: int,
+    gains_indices: [int],
+    nlsf_indices: [int],
+    nlsf_interp_coef_q2: int,
+    lag_index: int,
+    contour_index: int,
+    per_index: int,
+    ltp_index: [int],
+    ltp_scale_index: int,
+    seed: int,
+}
+
+fn lane(tb: Tables) -> Lane {
+    let c = Lane {
+        tb: tb,
+        prev_gain_q16: 65536,
+        exc_q14: zeros(MAX_FRAME_LENGTH),
+        slpc_q14_buf: zeros(MAX_LPC_ORDER),
+        out_buf: zeros(MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH),
+        lag_prev: 0,
+        last_gain_index: 0,
+        fs_khz: 0,
+        nb_subfr: 0,
+        frame_length: 0,
+        subfr_length: 0,
+        ltp_mem_length: 0,
+        lpc_order: 0,
+        prev_nlsf_q15: zeros(MAX_LPC_ORDER),
+        first_frame_after_reset: true,
+        n_frames_decoded: 0,
+        n_frames_per_packet: 0,
+        ec_prev_signal_type: 0,
+        ec_prev_lag_index: 0,
+        vad_flags: zeros(3),
+        lbrr_flag: 0,
+        lbrr_flags: zeros(3),
+        resampler: resampler_of(16000),
+        has_resampler: false,
+        signal_type: 0,
+        quant_offset_type: 0,
+        gains_indices: zeros(4),
+        nlsf_indices: zeros(MAX_LPC_ORDER + 1),
+        nlsf_interp_coef_q2: 0,
+        lag_index: 0,
+        contour_index: 0,
+        per_index: 0,
+        ltp_index: zeros(4),
+        ltp_scale_index: 0,
+        seed: 0
+    };
+    c
+}
+
+/// The decoder of a stream: two channel decoders (mid and side) and the stereo state.
+pub struct Silk {
+    /// Output channels.
+    channels: int,
+    tb: Tables,
+    ch: [Lane],
+    pred_prev_q13: [int],
+    s_mid: [int],
+    s_side: [int],
+    n_channels_api: int,
+    n_channels_internal: int,
+    prev_decode_only_middle: bool,
+    // Work buffers.
+    tmp: [[int]],
+    resampled: [int],
+    pulses: [int],
+}
+
+/// A decoder for `channels` output channels (1 or 2).
+pub fn new(channels: int) -> Silk {
+    let tb = tables_of();
+    Silk {
+        channels: channels,
+        tb: tb,
+        ch: [lane(tb), lane(tb)],
+        pred_prev_q13: zeros(2),
+        s_mid: zeros(2),
+        s_side: zeros(2),
+        n_channels_api: 0,
+        n_channels_internal: 0,
+        prev_decode_only_middle: false,
+        tmp: [zeros(MAX_FRAME_LENGTH + 2), zeros(MAX_FRAME_LENGTH + 2)],
+        resampled: zeros(960),
+        pulses: zeros(MAX_FRAME_LENGTH + SHELL_CODEC_FRAME_LENGTH)
+    }
+}
+
+/// Back to the state of a new decoder (silk_ResetDecoder; the channel counts are kept).
+pub fn reset(s: Silk) -> unit {
+    s.ch[0] = lane(s.tb);
+    s.ch[1] = lane(s.tb);
+    for i in 0..2 {
+        s.pred_prev_q13[i] = 0;
+        s.s_mid[i] = 0;
+        s.s_side[i] = 0;
+    }
+    s.prev_decode_only_middle = false;
+}
+
+fn set_fs(c: Lane, fs_khz: int) -> unit {
+    c.subfr_length = 5 * fs_khz;
+    let frame_length = c.nb_subfr * c.subfr_length;
+    if (c.fs_khz != fs_khz || !c.has_resampler) {
+        c.resampler = resampler_of(fs_khz * 1000);
+        c.has_resampler = true;
+    }
+    if (c.fs_khz != fs_khz || frame_length != c.frame_length) {
+        if (c.fs_khz != fs_khz) {
+            c.ltp_mem_length = 20 * fs_khz;
+            c.lpc_order = if (fs_khz == 16) { 16 } else { 10 };
+            c.first_frame_after_reset = true;
+            c.lag_prev = 100;
+            c.last_gain_index = 10;
+            for i in 0..c.out_buf.len() {
+                c.out_buf[i] = 0;
+            }
+            for i in 0..MAX_LPC_ORDER {
+                c.slpc_q14_buf[i] = 0;
+            }
+        }
+        c.fs_khz = fs_khz;
+        c.frame_length = frame_length;
+    }
+}
+
+// ---- Side information
+
+fn nlsf_cb1_icdf(c: Lane) -> [int] {
+    if (c.lpc_order == 16) { c.tb.nlsf_cb1_icdf_wb } else { c.tb.nlsf_cb1_icdf_nb_mb }
+}
+
+/// The entropy table indices and predictors of the NLSF residuals for first-stage index `cb1`.
+fn nlsf_unpack(c: Lane, ec_ix: [int], pred_q8: [int], cb1: int) -> unit {
+    let order = c.lpc_order;
+    let sel = if (order == 16) { c.tb.nlsf_cb2_select_wb } else { c.tb.nlsf_cb2_select_nb_mb };
+    let pred = if (order == 16) { c.tb.nlsf_pred_wb_q8 } else { c.tb.nlsf_pred_nb_mb_q8 };
+    var at = cb1 * order / 2;
+    var i = 0;
+    while (i < order) {
+        let entry = sel[at];
+        at = at + 1;
+        ec_ix[i] = ((entry >> 1) & 7) * (2 * NLSF_QUANT_MAX_AMPLITUDE + 1);
+        pred_q8[i] = pred[i + (entry & 1) * (order - 1)];
+        ec_ix[i + 1] = ((entry >> 5) & 7) * (2 * NLSF_QUANT_MAX_AMPLITUDE + 1);
+        pred_q8[i + 1] = pred[i + ((entry >> 4) & 1) * (order - 1) + 1];
+        i = i + 2;
+    }
+}
+
+fn decode_indices(
+    c: Lane,
+    d: rd.Dec,
+    frame_index: int,
+    decode_lbrr: bool,
+    cond_coding: int
+) -> unit {
+    var ix = 0;
+    if (decode_lbrr || c.vad_flags[frame_index] != 0) {
+        ix = rd.icdf(d, c.tb.type_offset_vad_icdf, 8) + 2;
+    } else {
+        ix = rd.icdf(d, c.tb.type_offset_no_vad_icdf, 8);
+    }
+    c.signal_type = ix >> 1;
+    c.quant_offset_type = ix & 1;
+    if (cond_coding == CODE_CONDITIONALLY) {
+        c.gains_indices[0] = rd.icdf(d, c.tb.delta_gain_icdf, 8);
+    } else {
+        c.gains_indices[0] = rd.icdf_at(d, c.tb.gain_icdf, c.signal_type * 8, 8) << 3;
+        c.gains_indices[0] = c.gains_indices[0] + rd.icdf(d, c.tb.uniform8_icdf, 8);
+    }
+    for i in 1..c.nb_subfr {
+        c.gains_indices[i] = rd.icdf(d, c.tb.delta_gain_icdf, 8);
+    }
+    c.nlsf_indices[0] = rd.icdf_at(d, nlsf_cb1_icdf(c), (c.signal_type >> 1) * 32, 8);
+    let ec_ix = zeros(MAX_LPC_ORDER);
+    let pred_q8 = zeros(MAX_LPC_ORDER);
+    nlsf_unpack(c, ec_ix, pred_q8, c.nlsf_indices[0]);
+    let cb2 = if (c.lpc_order == 16) { c.tb.nlsf_cb2_icdf_wb } else { c.tb.nlsf_cb2_icdf_nb_mb };
+    for i in 0..c.lpc_order {
+        var v = rd.icdf_at(d, cb2, ec_ix[i], 8);
+        if (v == 0) {
+            v = v - rd.icdf(d, c.tb.nlsf_ext_icdf, 8);
+        } else if (v == 2 * NLSF_QUANT_MAX_AMPLITUDE) {
+            v = v + rd.icdf(d, c.tb.nlsf_ext_icdf, 8);
+        }
+        c.nlsf_indices[i + 1] = v - NLSF_QUANT_MAX_AMPLITUDE;
+    }
+    if (c.nb_subfr == 4) {
+        c.nlsf_interp_coef_q2 = rd.icdf(d, c.tb.nlsf_interpolation_factor_icdf, 8);
+    } else {
+        c.nlsf_interp_coef_q2 = 4;
+    }
+    if (c.signal_type == TYPE_VOICED) {
+        var absolute = true;
+        if (cond_coding == CODE_CONDITIONALLY && c.ec_prev_signal_type == TYPE_VOICED) {
+            let delta = rd.icdf(d, c.tb.pitch_delta_icdf, 8);
+            if (delta > 0) {
+                c.lag_index = i16(c.ec_prev_lag_index + delta - 9);
+                absolute = false;
+            }
+        }
+        if (absolute) {
+            c.lag_index = rd.icdf(d, c.tb.pitch_lag_icdf, 8) * (c.fs_khz >> 1);
+            let low = if (c.fs_khz == 16) {
+                c.tb.uniform8_icdf
+            } else if (c.fs_khz == 12) {
+                c.tb.uniform6_icdf
+            } else {
+                c.tb.uniform4_icdf
+            };
+            c.lag_index = c.lag_index + rd.icdf(d, low, 8);
+        }
+        c.ec_prev_lag_index = c.lag_index;
+        let contour = if (c.fs_khz == 8) {
+            if (c.nb_subfr == 4) {
+                c.tb.pitch_contour_nb_icdf
+            } else {
+                c.tb.pitch_contour_10_ms_nb_icdf
+            }
+        } else {
+            if (c.nb_subfr == 4) { c.tb.pitch_contour_icdf } else { c.tb.pitch_contour_10_ms_icdf }
+        };
+        c.contour_index = rd.icdf(d, contour, 8);
+        c.per_index = rd.icdf(d, c.tb.ltp_per_index_icdf, 8);
+        let gains = if (c.per_index == 0) {
+            c.tb.ltp_gain_icdf_0
+        } else if (c.per_index == 1) {
+            c.tb.ltp_gain_icdf_1
+        } else {
+            c.tb.ltp_gain_icdf_2
+        };
+        for k in 0..c.nb_subfr {
+            c.ltp_index[k] = rd.icdf(d, gains, 8);
+        }
+        if (cond_coding == CODE_INDEPENDENTLY) {
+            c.ltp_scale_index = rd.icdf(d, c.tb.ltpscale_icdf, 8);
+        } else {
+            c.ltp_scale_index = 0;
+        }
+    }
+    c.ec_prev_signal_type = c.signal_type;
+    c.seed = rd.icdf(d, c.tb.uniform4_icdf, 8);
+}
+
+// ---- Excitation pulses
+
+fn shell_table(tb: Tables, level: int) -> [int] {
+    if (level == 0) {
+        tb.shell_code_table0
+    } else if (level == 1) {
+        tb.shell_code_table1
+    } else if (level == 2) {
+        tb.shell_code_table2
+    } else {
+        tb.shell_code_table3
+    }
+}
+
+/// Splits `p` pulses of a node of `level` into its two children at `out[a]` and `out[b]`.
+fn decode_split(d: rd.Dec, tb: Tables, out: [int], a: int, b: int, p: int, level: int) -> unit {
+    if (p > 0) {
+        out[a] = rd.icdf_at(d, shell_table(tb, level), t.SHELL_CODE_TABLE_OFFSETS[p], 8);
+        out[b] = p - out[a];
+    } else {
+        out[a] = 0;
+        out[b] = 0;
+    }
+}
+
+fn shell_decoder(d: rd.Dec, tb: Tables, pulses: [int], at: int, pulses4: int) -> unit {
+    let p3 = zeros(2);
+    let p2 = zeros(4);
+    let p1 = zeros(8);
+    decode_split(d, tb, p3, 0, 1, pulses4, 3);
+    decode_split(d, tb, p2, 0, 1, p3[0], 2);
+    decode_split(d, tb, p1, 0, 1, p2[0], 1);
+    decode_split(d, tb, pulses, at, at + 1, p1[0], 0);
+    decode_split(d, tb, pulses, at + 2, at + 3, p1[1], 0);
+    decode_split(d, tb, p1, 2, 3, p2[1], 1);
+    decode_split(d, tb, pulses, at + 4, at + 5, p1[2], 0);
+    decode_split(d, tb, pulses, at + 6, at + 7, p1[3], 0);
+    decode_split(d, tb, p2, 2, 3, p3[1], 2);
+    decode_split(d, tb, p1, 4, 5, p2[2], 1);
+    decode_split(d, tb, pulses, at + 8, at + 9, p1[4], 0);
+    decode_split(d, tb, pulses, at + 10, at + 11, p1[5], 0);
+    decode_split(d, tb, p1, 6, 7, p2[3], 1);
+    decode_split(d, tb, pulses, at + 12, at + 13, p1[6], 0);
+    decode_split(d, tb, pulses, at + 14, at + 15, p1[7], 0);
+}
+
+fn decode_pulses(
+    d: rd.Dec,
+    tb: Tables,
+    pulses: [int],
+    signal_type: int,
+    quant_offset_type: int,
+    frame_length: int
+) -> unit {
+    let rate_level = rd.icdf_at(d, tb.rate_levels_icdf, (signal_type >> 1) * 9, 8);
+    var iter = frame_length >> 4;
+    if (iter * SHELL_CODEC_FRAME_LENGTH < frame_length) {
+        iter = iter + 1;
+    }
+    let sum_pulses = zeros(iter);
+    let n_lshifts = zeros(iter);
+    for i in 0..iter {
+        sum_pulses[i] = rd.icdf_at(d, tb.pulses_per_block_icdf, rate_level * 18, 8);
+        while (sum_pulses[i] == SILK_MAX_PULSES + 1) {
+            n_lshifts[i] = n_lshifts[i] + 1;
+            let extra = if (n_lshifts[i] == 10) { 1 } else { 0 };
+            sum_pulses[i] = rd.icdf_at(d, tb.pulses_per_block_icdf, 9 * 18 + extra, 8);
+        }
+    }
+    for i in 0..iter {
+        if (sum_pulses[i] > 0) {
+            shell_decoder(d, tb, pulses, i * SHELL_CODEC_FRAME_LENGTH, sum_pulses[i]);
+        } else {
+            for k in 0..SHELL_CODEC_FRAME_LENGTH {
+                pulses[i * SHELL_CODEC_FRAME_LENGTH + k] = 0;
+            }
+        }
+    }
+    for i in 0..iter {
+        if (n_lshifts[i] > 0) {
+            let nls = n_lshifts[i];
+            let base = i * SHELL_CODEC_FRAME_LENGTH;
+            for k in 0..SHELL_CODEC_FRAME_LENGTH {
+                var abs_q = pulses[base + k];
+                for _ in 0..nls {
+                    abs_q = (abs_q << 1) + rd.icdf(d, tb.lsb_icdf, 8);
+                }
+                pulses[base + k] = abs_q;
+            }
+            sum_pulses[i] = sum_pulses[i] | (nls << 5);
+        }
+    }
+    // Signs.
+    let sign_at = 7 * (quant_offset_type + (signal_type << 1));
+    let icdf = [0, 0];
+    let blocks = (frame_length + SHELL_CODEC_FRAME_LENGTH / 2) >> 4;
+    for i in 0..blocks {
+        let p = sum_pulses[i];
+        if (p > 0) {
+            icdf[0] = t.SIGN_ICDF[sign_at + imin(p & 0x1F, 6)];
+            let base = i * SHELL_CODEC_FRAME_LENGTH;
+            for j in 0..SHELL_CODEC_FRAME_LENGTH {
+                if (pulses[base + j] > 0) {
+                    let bit = rd.icdf(d, icdf, 8);
+                    pulses[base + j] = pulses[base + j] * ((bit << 1) - 1);
+                }
+            }
+        }
+    }
+}
+
+// ---- Parameters
+
+fn gains_dequant(c: Lane, gains_q16: [int], conditional: bool) -> unit {
+    for k in 0..c.nb_subfr {
+        let ind = c.gains_indices[k];
+        if (k == 0 && !conditional) {
+            c.last_gain_index = imax(ind, c.last_gain_index - 16);
+        } else {
+            let ind_tmp = ind + MIN_DELTA_GAIN_QUANT;
+            let threshold = 2 * MAX_DELTA_GAIN_QUANT - N_LEVELS_QGAIN + c.last_gain_index;
+            if (ind_tmp > threshold) {
+                c.last_gain_index = c.last_gain_index + (ind_tmp << 1) - threshold;
+            } else {
+                c.last_gain_index = c.last_gain_index + ind_tmp;
+            }
+        }
+        c.last_gain_index = limit(c.last_gain_index, 0, N_LEVELS_QGAIN - 1);
+        gains_q16[k] = log2lin(imin(smulwb(INV_SCALE_Q16, c.last_gain_index) + GAIN_OFFSET, 3967));
+    }
+}
+
+fn nlsf_stabilize(nlsf: [int], delta_min: [int], l: int) -> unit {
+    var loops = 0;
+    while (loops < 20) {
+        var min_diff = nlsf[0] - delta_min[0];
+        var ii = 0;
+        for i in 1..l {
+            let diff = nlsf[i] - (nlsf[i - 1] + delta_min[i]);
+            if (diff < min_diff) {
+                min_diff = diff;
+                ii = i;
+            }
+        }
+        let diff = 32768 - (nlsf[l - 1] + delta_min[l]);
+        if (diff < min_diff) {
+            min_diff = diff;
+            ii = l;
+        }
+        if (min_diff >= 0) {
+            return;
+        }
+        if (ii == 0) {
+            nlsf[0] = delta_min[0];
+        } else if (ii == l) {
+            nlsf[l - 1] = 32768 - delta_min[l];
+        } else {
+            var min_center = 0;
+            for k in 0..ii {
+                min_center = min_center + delta_min[k];
+            }
+            min_center = min_center + (delta_min[ii] >> 1);
+            var max_center = 32768;
+            var k = l;
+            while (k > ii) {
+                max_center = max_center - delta_min[k];
+                k = k - 1;
+            }
+            max_center = max_center - (delta_min[ii] >> 1);
+            let center = i16(
+                limit(rshift_round(nlsf[ii - 1] + nlsf[ii], 1), min_center, max_center)
+            );
+            nlsf[ii - 1] = i16(center - (delta_min[ii] >> 1));
+            nlsf[ii] = i16(nlsf[ii - 1] + delta_min[ii]);
+        }
+        loops = loops + 1;
+    }
+    // Fall back: sort, then enforce the spacing from both ends.
+    for i in 1..l {
+        let v = nlsf[i];
+        var j = i - 1;
+        while (j >= 0 && v < nlsf[j]) {
+            nlsf[j + 1] = nlsf[j];
+            j = j - 1;
+        }
+        nlsf[j + 1] = v;
+    }
+    nlsf[0] = imax(nlsf[0], delta_min[0]);
+    for i in 1..l {
+        nlsf[i] = imax(nlsf[i], sat16(nlsf[i - 1] + delta_min[i]));
+    }
+    nlsf[l - 1] = imin(nlsf[l - 1], 32768 - delta_min[l]);
+    var i = l - 2;
+    while (i >= 0) {
+        nlsf[i] = imin(nlsf[i], nlsf[i + 1] - delta_min[i + 1]);
+        i = i - 1;
+    }
+}
+
+fn nlsf_decode(c: Lane, nlsf: [int]) -> unit {
+    let order = c.lpc_order;
+    let wb = order == 16;
+    let ec_ix = zeros(MAX_LPC_ORDER);
+    let pred_q8 = zeros(MAX_LPC_ORDER);
+    let cb1 = c.nlsf_indices[0];
+    nlsf_unpack(c, ec_ix, pred_q8, cb1);
+    let step = if (wb) { 9830 } else { 11796 };
+    let res_q10 = zeros(MAX_LPC_ORDER);
+    var out_q10 = 0;
+    var i = order - 1;
+    while (i >= 0) {
+        let pred_q10 = smulbb(out_q10, pred_q8[i]) >> 8;
+        out_q10 = c.nlsf_indices[i + 1] << 10;
+        if (out_q10 > 0) {
+            out_q10 = out_q10 - 102;
+        } else if (out_q10 < 0) {
+            out_q10 = out_q10 + 102;
+        }
+        out_q10 = smlawb(pred_q10, out_q10, step);
+        res_q10[i] = i16(out_q10);
+        i = i - 1;
+    }
+    let cb = if (wb) { c.tb.nlsf_cb1_wb_q8 } else { c.tb.nlsf_cb1_nb_mb_q8 };
+    let w = if (wb) { c.tb.nlsf_cb1_wght_wb_q9 } else { c.tb.nlsf_cb1_wght_nb_mb_q9 };
+    for k in 0..order {
+        let v = ((res_q10[k] << 14) / w[cb1 * order + k]) + (cb[cb1 * order + k] << 7);
+        nlsf[k] = limit(v, 0, 32767);
+    }
+    nlsf_stabilize(
+        nlsf,
+        if (wb) { c.tb.nlsf_delta_min_wb_q15 } else { c.tb.nlsf_delta_min_nb_mb_q15 },
+        order
+    );
+}
+
+fn nlsf2a_find_poly(out: [int], c_lsf: [int], from: int, dd: int) -> unit {
+    out[0] = 1 << 16;
+    out[1] = -c_lsf[from];
+    for k in 1..dd {
+        let ftmp = c_lsf[from + 2 * k];
+        out[k + 1] = (out[k - 1] << 1) - rshift_round(ftmp * out[k], 16);
+        var n = k;
+        while (n > 1) {
+            out[n] = out[n] + out[n - 2] - rshift_round(ftmp * out[n - 1], 16);
+            n = n - 1;
+        }
+        out[1] = out[1] - ftmp;
+    }
+}
+
+fn bwexpander_32(ar: [int], d: int, chirp0: int) -> unit {
+    var chirp = chirp0;
+    let chirp_minus_one = chirp - 65536;
+    for i in 0..d - 1 {
+        ar[i] = smulww(chirp, ar[i]);
+        chirp = chirp + rshift_round(chirp * chirp_minus_one, 16);
+    }
+    ar[d - 1] = smulww(chirp, ar[d - 1]);
+}
+
+fn lpc_fit(a_qout: [int], a_qin: [int], qout: int, qin: int, d: int) -> unit {
+    var i = 0;
+    var idx = 0;
+    while (i < 10) {
+        var maxabs = 0;
+        for k in 0..d {
+            let absval = iabs(a_qin[k]);
+            if (absval > maxabs) {
+                maxabs = absval;
+                idx = k;
+            }
+        }
+        maxabs = rshift_round(maxabs, qin - qout);
+        if (maxabs > 32767) {
+            maxabs = imin(maxabs, 163838);
+            let chirp = 65470 - (((maxabs - 32767) << 14) / ((maxabs * (idx + 1)) >> 2));
+            bwexpander_32(a_qin, d, chirp);
+        } else {
+            break;
+        }
+        i = i + 1;
+    }
+    if (i == 10) {
+        for k in 0..d {
+            a_qout[k] = sat16(rshift_round(a_qin[k], qin - qout));
+            a_qin[k] = a_qout[k] << (qin - qout);
+        }
+    } else {
+        for k in 0..d {
+            a_qout[k] = i16(rshift_round(a_qin[k], qin - qout));
+        }
+    }
+}
+
+fn mul32_frac_q31(a: int, b: int) -> int {
+    rshift_round(a * b, 31)
+}
+
+/// True if the filter is stable enough (libopus' silk_LPC_inverse_pred_gain is not 0).
+fn lpc_stable(a_q12: [int], order: int) -> bool {
+    let a = zeros(MAX_LPC_ORDER);
+    var dc_resp = 0;
+    for k in 0..order {
+        dc_resp = dc_resp + a_q12[k];
+        a[k] = a_q12[k] << 12;
+    }
+    if (dc_resp >= 4096) {
+        return false;
+    }
+    var inv_gain_q30 = 1 << 30;
+    var k = order - 1;
+    while (k > 0) {
+        if (a[k] > A_LIMIT || a[k] < -A_LIMIT) {
+            return false;
+        }
+        let rc_q31 = -(a[k] << 7);
+        let rc_mult1_q30 = (1 << 30) - smmul(rc_q31, rc_q31);
+        inv_gain_q30 = i32(smmul(inv_gain_q30, rc_mult1_q30) << 2);
+        if (inv_gain_q30 < MIN_INV_GAIN_Q30) {
+            return false;
+        }
+        let mult2q = 32 - clz32(iabs(rc_mult1_q30));
+        let rc_mult2 = inverse32_varq(rc_mult1_q30, mult2q + 30);
+        for n in 0..(k + 1) >> 1 {
+            let tmp1 = a[n];
+            let tmp2 = a[k - n - 1];
+            var tmp64 = rshift_round(
+                sub_sat32(tmp1, mul32_frac_q31(tmp2, rc_q31)) * rc_mult2,
+                mult2q
+            );
+            if (tmp64 > INT32_MAX || tmp64 < INT32_MIN) {
+                return false;
+            }
+            a[n] = tmp64;
+            tmp64 = rshift_round(sub_sat32(tmp2, mul32_frac_q31(tmp1, rc_q31)) * rc_mult2, mult2q);
+            if (tmp64 > INT32_MAX || tmp64 < INT32_MIN) {
+                return false;
+            }
+            a[k - n - 1] = tmp64;
+        }
+        k = k - 1;
+    }
+    if (a[0] > A_LIMIT || a[0] < -A_LIMIT) {
+        return false;
+    }
+    let rc_q31 = -(a[0] << 7);
+    let rc_mult1_q30 = (1 << 30) - smmul(rc_q31, rc_q31);
+    inv_gain_q30 = i32(smmul(inv_gain_q30, rc_mult1_q30) << 2);
+    inv_gain_q30 >= MIN_INV_GAIN_Q30
+}
+
+fn nlsf2a(a_q12: [int], nlsf: [int], d: int) -> unit {
+    let ordering = if (d == 16) { ORDERING16 } else { ORDERING10 };
+    let cos_lsf = zeros(MAX_LPC_ORDER);
+    for k in 0..d {
+        let f_int = nlsf[k] >> 8;
+        let f_frac = nlsf[k] - (f_int << 8);
+        let cos_val = t.LSF_COS_TAB_Q12[f_int];
+        let delta = t.LSF_COS_TAB_Q12[f_int + 1] - cos_val;
+        cos_lsf[ordering[k]] = rshift_round((cos_val << 8) + delta * f_frac, 4);
+    }
+    let dd = d >> 1;
+    let p = zeros(MAX_LPC_ORDER / 2 + 1);
+    let q = zeros(MAX_LPC_ORDER / 2 + 1);
+    nlsf2a_find_poly(p, cos_lsf, 0, dd);
+    nlsf2a_find_poly(q, cos_lsf, 1, dd);
+    let a32 = zeros(MAX_LPC_ORDER);
+    for k in 0..dd {
+        let ptmp = p[k + 1] + p[k];
+        let qtmp = q[k + 1] - q[k];
+        a32[k] = -qtmp - ptmp;
+        a32[d - k - 1] = qtmp - ptmp;
+    }
+    lpc_fit(a_q12, a32, 12, 17, d);
+    var i = 0;
+    while (!lpc_stable(a_q12, d) && i < MAX_LPC_STABILIZE_ITERATIONS) {
+        bwexpander_32(a32, d, 65536 - (2 << i));
+        for k in 0..d {
+            a_q12[k] = i16(rshift_round(a32[k], 5));
+        }
+        i = i + 1;
+    }
+}
+
+/// The decoded parameters of a frame (libopus' silk_decoder_control).
+struct Control {
+    pitch_l: [int],
+    gains_q16: [int],
+    pred_coef_q12: [[int]],
+    ltp_coef_q14: [int],
+    ltp_scale_q14: int,
+}
+
+fn decode_pitch(c: Lane, pitch_l: [int]) -> unit {
+    let fs = c.fs_khz;
+    var cb = c.tb.cb_lags_stage3;
+    var size = 34;
+    if (fs == 8) {
+        if (c.nb_subfr == 4) {
+            cb = c.tb.cb_lags_stage2;
+            size = 11;
+        } else {
+            cb = c.tb.cb_lags_stage2_10_ms;
+            size = 3;
+        }
+    } else if (c.nb_subfr != 4) {
+        cb = c.tb.cb_lags_stage3_10_ms;
+        size = 12;
+    }
+    let min_lag = 2 * fs;
+    let max_lag = 18 * fs;
+    let lag = min_lag + c.lag_index;
+    for k in 0..c.nb_subfr {
+        pitch_l[k] = limit(lag + cb[k * size + c.contour_index], min_lag, max_lag);
+    }
+}
+
+fn decode_parameters(c: Lane, ctrl: Control, cond_coding: int) -> unit {
+    gains_dequant(c, ctrl.gains_q16, cond_coding == CODE_CONDITIONALLY);
+    let nlsf = zeros(MAX_LPC_ORDER);
+    nlsf_decode(c, nlsf);
+    nlsf2a(ctrl.pred_coef_q12[1], nlsf, c.lpc_order);
+    if (c.first_frame_after_reset) {
+        c.nlsf_interp_coef_q2 = 4;
+    }
+    if (c.nlsf_interp_coef_q2 < 4) {
+        let nlsf0 = zeros(MAX_LPC_ORDER);
+        for i in 0..c.lpc_order {
+            nlsf0[i] = c.prev_nlsf_q15[i] + ((c.nlsf_interp_coef_q2 * (nlsf[i] - c.prev_nlsf_q15[i])) >> 2);
+        }
+        nlsf2a(ctrl.pred_coef_q12[0], nlsf0, c.lpc_order);
+    } else {
+        for i in 0..c.lpc_order {
+            ctrl.pred_coef_q12[0][i] = ctrl.pred_coef_q12[1][i];
+        }
+    }
+    for i in 0..c.lpc_order {
+        c.prev_nlsf_q15[i] = nlsf[i];
+    }
+    if (c.signal_type == TYPE_VOICED) {
+        decode_pitch(c, ctrl.pitch_l);
+        let vq = if (c.per_index == 0) {
+            c.tb.ltp_vq_0
+        } else if (c.per_index == 1) {
+            c.tb.ltp_vq_1
+        } else {
+            c.tb.ltp_vq_2
+        };
+        for k in 0..c.nb_subfr {
+            let ix = c.ltp_index[k];
+            for i in 0..LTP_ORDER {
+                ctrl.ltp_coef_q14[k * LTP_ORDER + i] = vq[ix * LTP_ORDER + i] << 7;
+            }
+        }
+        ctrl.ltp_scale_q14 = t.LTP_SCALES_Q14[c.ltp_scale_index];
+    } else {
+        for k in 0..c.nb_subfr {
+            ctrl.pitch_l[k] = 0;
+        }
+        for i in 0..LTP_ORDER * c.nb_subfr {
+            ctrl.ltp_coef_q14[i] = 0;
+        }
+        c.per_index = 0;
+        ctrl.ltp_scale_q14 = 0;
+    }
+}
+
+// ---- Synthesis
+
+fn lpc_analysis_filter(
+    out: [int],
+    oo: int,
+    inp: [int],
+    io: int,
+    b: [int],
+    len: int,
+    d: int
+) -> unit {
+    for ix in d..len {
+        let p = io + ix - 1;
+        // Samples and coefficients are 16-bit already; wrapping the sum once at the end is what
+        // wrapping each step comes to.
+        var acc = 0;
+        for j in 0..d {
+            acc = acc + inp[p - j] * b[j];
+        }
+        acc = i32((inp[p + 1] << 12) - i32(acc));
+        out[oo + ix] = sat16(rshift_round(acc, 12));
+    }
+    for j in 0..d {
+        out[oo + j] = 0;
+    }
+}
+
+fn decode_core(c: Lane, ctrl: Control, xq: [int], xo: int, pulses: [int]) -> unit {
+    let s_ltp = zeros(c.ltp_mem_length);
+    let s_ltp_q15 = zeros(c.ltp_mem_length + c.frame_length);
+    let res_q14 = zeros(c.subfr_length);
+    let slpc = zeros(c.subfr_length + MAX_LPC_ORDER);
+    let offset_q10 = t.QUANTIZATION_OFFSETS_Q10[(c.signal_type >> 1) * 2 + c.quant_offset_type];
+    let nlsf_interpolation = c.nlsf_interp_coef_q2 < 4;
+    var rand_seed = c.seed;
+    let exc = c.exc_q14;
+    for i in 0..c.frame_length {
+        rand_seed = rand(rand_seed);
+        var e = pulses[i] << 14;
+        if (e > 0) {
+            e = e - (QUANT_LEVEL_ADJUST_Q10 << 4);
+        } else if (e < 0) {
+            e = e + (QUANT_LEVEL_ADJUST_Q10 << 4);
+        }
+        e = e + (offset_q10 << 4);
+        if (rand_seed < 0) {
+            e = -e;
+        }
+        exc[i] = e;
+        rand_seed = i32(rand_seed + pulses[i]);
+    }
+    for i in 0..MAX_LPC_ORDER {
+        slpc[i] = c.slpc_q14_buf[i];
+    }
+    var pexc = 0;
+    var pxq = xo;
+    var s_ltp_buf_idx = c.ltp_mem_length;
+    var lag = 0;
+    let order = c.lpc_order;
+    for k in 0..c.nb_subfr {
+        let a_q12 = ctrl.pred_coef_q12[k >> 1];
+        let b_off = k * LTP_ORDER;
+        let b_q14 = ctrl.ltp_coef_q14;
+        let signal_type = c.signal_type;
+        let gain_q10 = ctrl.gains_q16[k] >> 6;
+        var inv_gain_q31 = inverse32_varq(ctrl.gains_q16[k], 47);
+        var gain_adj_q16 = 1 << 16;
+        if (ctrl.gains_q16[k] != c.prev_gain_q16) {
+            gain_adj_q16 = div32_varq(c.prev_gain_q16, ctrl.gains_q16[k], 16);
+            for i in 0..MAX_LPC_ORDER {
+                slpc[i] = smulww(gain_adj_q16, slpc[i]);
+            }
+        }
+        c.prev_gain_q16 = ctrl.gains_q16[k];
+        var pres_is_exc = true;
+        if (signal_type == TYPE_VOICED) {
+            lag = ctrl.pitch_l[k];
+            if (k == 0 || (k == 2 && nlsf_interpolation)) {
+                let start_idx = c.ltp_mem_length - lag - order - LTP_ORDER / 2;
+                if (k == 2) {
+                    for i in 0..2 * c.subfr_length {
+                        c.out_buf[c.ltp_mem_length + i] = xq[xo + i];
+                    }
+                }
+                lpc_analysis_filter(
+                    s_ltp,
+                    start_idx,
+                    c.out_buf,
+                    start_idx + k * c.subfr_length,
+                    a_q12,
+                    c.ltp_mem_length - start_idx,
+                    order
+                );
+                if (k == 0) {
+                    inv_gain_q31 = i32(smulwb(inv_gain_q31, ctrl.ltp_scale_q14) << 2);
+                }
+                for i in 0..lag + LTP_ORDER / 2 {
+                    s_ltp_q15[s_ltp_buf_idx - i - 1] = smulwb(
+                        inv_gain_q31,
+                        s_ltp[c.ltp_mem_length - i - 1]
+                    );
+                }
+            } else if (gain_adj_q16 != 1 << 16) {
+                for i in 0..lag + LTP_ORDER / 2 {
+                    s_ltp_q15[s_ltp_buf_idx - i - 1] = smulww(
+                        gain_adj_q16,
+                        s_ltp_q15[s_ltp_buf_idx - i - 1]
+                    );
+                }
+            }
+            var pred = s_ltp_buf_idx - lag + LTP_ORDER / 2;
+            for i in 0..c.subfr_length {
+                var ltp_pred_q13 = 2;
+                ltp_pred_q13 = ltp_pred_q13 + ((s_ltp_q15[pred] * b_q14[b_off]) >> 16);
+                ltp_pred_q13 = ltp_pred_q13 + ((s_ltp_q15[pred - 1] * b_q14[b_off + 1]) >> 16);
+                ltp_pred_q13 = ltp_pred_q13 + ((s_ltp_q15[pred - 2] * b_q14[b_off + 2]) >> 16);
+                ltp_pred_q13 = ltp_pred_q13 + ((s_ltp_q15[pred - 3] * b_q14[b_off + 3]) >> 16);
+                ltp_pred_q13 = ltp_pred_q13 + ((s_ltp_q15[pred - 4] * b_q14[b_off + 4]) >> 16);
+                pred = pred + 1;
+                res_q14[i] = exc[pexc + i] + (ltp_pred_q13 << 1);
+                s_ltp_q15[s_ltp_buf_idx] = res_q14[i] << 1;
+                s_ltp_buf_idx = s_ltp_buf_idx + 1;
+            }
+            pres_is_exc = false;
+        }
+        for i in 0..c.subfr_length {
+            var lpc_pred_q10 = order >> 1;
+            for j in 0..order {
+                lpc_pred_q10 = lpc_pred_q10 + ((slpc[MAX_LPC_ORDER + i - 1 - j] * a_q12[j]) >> 16);
+            }
+            let res = if (pres_is_exc) { exc[pexc + i] } else { res_q14[i] };
+            slpc[MAX_LPC_ORDER + i] = add_sat32(res, lshift_sat32(lpc_pred_q10, 4));
+            xq[pxq + i] = sat16(rshift_round(smulww(slpc[MAX_LPC_ORDER + i], gain_q10), 8));
+        }
+        for i in 0..MAX_LPC_ORDER {
+            slpc[i] = slpc[c.subfr_length + i];
+        }
+        pexc = pexc + c.subfr_length;
+        pxq = pxq + c.subfr_length;
+    }
+    for i in 0..MAX_LPC_ORDER {
+        c.slpc_q14_buf[i] = slpc[i];
+    }
+}
+
+fn decode_frame(s: Silk, c: Lane, d: rd.Dec, out: [int], oo: int, cond_coding: int) -> unit {
+    let l = c.frame_length;
+    let ctrl = Control {
+        pitch_l: zeros(4),
+        gains_q16: zeros(4),
+        pred_coef_q12: [zeros(MAX_LPC_ORDER), zeros(MAX_LPC_ORDER)],
+        ltp_coef_q14: zeros(LTP_ORDER * 4),
+        ltp_scale_q14: 0
+    };
+    let pulses = s.pulses;
+    decode_indices(c, d, c.n_frames_decoded, false, cond_coding);
+    decode_pulses(d, c.tb, pulses, c.signal_type, c.quant_offset_type, c.frame_length);
+    decode_parameters(c, ctrl, cond_coding);
+    decode_core(c, ctrl, out, oo, pulses);
+    let mv_len = c.ltp_mem_length - l;
+    for i in 0..mv_len {
+        c.out_buf[i] = c.out_buf[i + l];
+    }
+    for i in 0..l {
+        c.out_buf[mv_len + i] = out[oo + i];
+    }
+    c.first_frame_after_reset = false;
+    c.lag_prev = ctrl.pitch_l[c.nb_subfr - 1];
+}
+
+// ---- Stereo and resampling
+
+fn stereo_decode_pred(d: rd.Dec, tb: Tables, pred_q13: [int]) -> unit {
+    let n = rd.icdf(d, tb.stereo_pred_joint_icdf, 8);
+    let ix = [[0, 0, n / 5], [0, 0, n - 5 * (n / 5)]];
+    for k in 0..2 {
+        ix[k][0] = rd.icdf(d, tb.uniform3_icdf, 8);
+        ix[k][1] = rd.icdf(d, tb.uniform5_icdf, 8);
+    }
+    for k in 0..2 {
+        ix[k][0] = ix[k][0] + 3 * ix[k][2];
+        let low_q13 = t.STEREO_PRED_QUANT_Q13[ix[k][0]];
+        let step_q13 = smulwb(t.STEREO_PRED_QUANT_Q13[ix[k][0] + 1] - low_q13, 6554);
+        pred_q13[k] = smlabb(low_q13, step_q13, 2 * ix[k][1] + 1);
+    }
+    pred_q13[0] = pred_q13[0] - pred_q13[1];
+}
+
+fn stereo_ms_to_lr(
+    s: Silk,
+    x1: [int],
+    x2: [int],
+    pred_q13: [int],
+    fs_khz: int,
+    frame_length: int
+) -> unit {
+    x1[0] = s.s_mid[0];
+    x1[1] = s.s_mid[1];
+    x2[0] = s.s_side[0];
+    x2[1] = s.s_side[1];
+    s.s_mid[0] = x1[frame_length];
+    s.s_mid[1] = x1[frame_length + 1];
+    s.s_side[0] = x2[frame_length];
+    s.s_side[1] = x2[frame_length + 1];
+    var pred0 = s.pred_prev_q13[0];
+    var pred1 = s.pred_prev_q13[1];
+    let interp = 8 * fs_khz;
+    let denom_q16 = (1 << 16) / interp;
+    let delta0 = rshift_round(smulbb(pred_q13[0] - s.pred_prev_q13[0], denom_q16), 16);
+    let delta1 = rshift_round(smulbb(pred_q13[1] - s.pred_prev_q13[1], denom_q16), 16);
+    for n in 0..frame_length {
+        if (n < interp) {
+            pred0 = pred0 + delta0;
+            pred1 = pred1 + delta1;
+        } else if (n == interp) {
+            pred0 = pred_q13[0];
+            pred1 = pred_q13[1];
+        }
+        var sum = ((x1[n] + x1[n + 2]) + (x1[n + 1] << 1)) << 9;
+        sum = smlawb(x2[n + 1] << 8, sum, pred0);
+        sum = smlawb(sum, x1[n + 1] << 11, pred1);
+        x2[n + 1] = sat16(rshift_round(sum, 8));
+    }
+    s.pred_prev_q13[0] = pred_q13[0];
+    s.pred_prev_q13[1] = pred_q13[1];
+    for n in 0..frame_length {
+        let sum = x1[n + 1] + x2[n + 1];
+        let diff = x1[n + 1] - x2[n + 1];
+        x1[n + 1] = sat16(sum);
+        x2[n + 1] = sat16(diff);
+    }
+}
+
+fn up2_hq(st: [int], out: [int], oo: int, inp: [int], io: int, len: int) -> unit {
+    // Three all-pass sections per output phase, with the state in locals (Q10).
+    var s0 = st[0];
+    var s1 = st[1];
+    var s2 = st[2];
+    var s3 = st[3];
+    var s4 = st[4];
+    var s5 = st[5];
+    for k in 0..len {
+        let in32 = inp[io + k] << 10;
+        var y = in32 - s0;
+        var x = (y * 1746) >> 16;
+        var out1 = s0 + x;
+        s0 = in32 + x;
+        y = out1 - s1;
+        x = (y * 14986) >> 16;
+        var out2 = s1 + x;
+        s1 = out1 + x;
+        y = out2 - s2;
+        x = y + ((y * -26453) >> 16);
+        out1 = s2 + x;
+        s2 = out2 + x;
+        var v = ((out1 >> 9) + 1) >> 1;
+        out[oo + 2 * k] = if (v > 32767) { 32767 } else if (v < -32768) { -32768 } else { v };
+        y = in32 - s3;
+        x = (y * 6854) >> 16;
+        out1 = s3 + x;
+        s3 = in32 + x;
+        y = out1 - s4;
+        x = (y * 25769) >> 16;
+        out2 = s4 + x;
+        s4 = out1 + x;
+        y = out2 - s5;
+        x = y + ((y * -9994) >> 16);
+        out1 = s5 + x;
+        s5 = out2 + x;
+        v = ((out1 >> 9) + 1) >> 1;
+        out[oo + 2 * k + 1] = if (v > 32767) { 32767 } else if (v < -32768) { -32768 } else { v };
+    }
+    st[0] = s0;
+    st[1] = s1;
+    st[2] = s2;
+    st[3] = s3;
+    st[4] = s4;
+    st[5] = s5;
+}
+
+/// Upsamples `len` samples of `inp` from `io` into `out` from `oo`; returns the next output index.
+fn iir_fir(r: Resampler, out: [int], oo0: int, inp: [int], io0: int, len0: int) -> int {
+    let buf = r.buf;
+    for i in 0..8 {
+        buf[i] = r.sfir[i];
+    }
+    let inc = r.inv_ratio_q16;
+    var oo = oo0;
+    var io = io0;
+    var len = len0;
+    var n_in = 0;
+    while (true) {
+        n_in = imin(len, r.batch_size);
+        up2_hq(r.siir, buf, 8, inp, io, n_in);
+        let max_index_q16 = n_in << 17;
+        var index_q16 = 0;
+        while (index_q16 < max_index_q16) {
+            let ti = smulwb(index_q16 & 0xFFFF, 12);
+            let p = index_q16 >> 16;
+            // 16-bit samples (saturated by up2_hq) times 16-bit taps: no casts needed.
+            let c = ti * 4;
+            let r = (11 - ti) * 4;
+            let res = buf[p] * FRAC_FIR_12[c]
+                + buf[p + 1] * FRAC_FIR_12[c + 1]
+                + buf[p + 2] * FRAC_FIR_12[c + 2]
+                + buf[p + 3] * FRAC_FIR_12[c + 3]
+                + buf[p + 4] * FRAC_FIR_12[r + 3]
+                + buf[p + 5] * FRAC_FIR_12[r + 2]
+                + buf[p + 6] * FRAC_FIR_12[r + 1]
+                + buf[p + 7] * FRAC_FIR_12[r];
+            let v = ((res >> 14) + 1) >> 1;
+            out[oo] = if (v > 32767) { 32767 } else if (v < -32768) { -32768 } else { v };
+            oo = oo + 1;
+            index_q16 = index_q16 + inc;
+        }
+        io = io + n_in;
+        len = len - n_in;
+        if (len > 0) {
+            for i in 0..8 {
+                buf[i] = buf[(n_in << 1) + i];
+            }
+        } else {
+            break;
+        }
+    }
+    for i in 0..8 {
+        r.sfir[i] = buf[(n_in << 1) + i];
+    }
+    oo
+}
+
+fn resample(r: Resampler, out: [int], inp: [int], io: int, in_len: int) -> unit {
+    let n = r.fs_in_khz - r.input_delay;
+    for i in 0..n {
+        r.delay_buf[r.input_delay + i] = inp[io + i];
+    }
+    let _o = iir_fir(r, out, 0, r.delay_buf, 0, r.fs_in_khz);
+    let _o2 = iir_fir(r, out, r.fs_out_khz, inp, io + n, in_len - r.fs_in_khz);
+    for i in 0..r.input_delay {
+        r.delay_buf[i] = inp[io + in_len - r.input_delay + i];
+    }
+}
+
+/// Decodes one SILK frame (10 or 20 ms) of the current packet from `d`, writing its samples at
+/// 48 kHz (interleaved, `s.channels` channels) into `out` from `oo`. `first` marks the first
+/// call for a packet of `payload_ms`. Returns the samples per channel, or 0 if it cannot.
+pub fn decode(
+    s: Silk,
+    d: rd.Dec,
+    internal_channels: int,
+    internal_rate: int,
+    payload_ms: int,
+    first: bool,
+    out: [int],
+    oo: int
+) -> int {
+    let api = s.channels;
+    let ch = s.ch;
+    if (first) {
+        for n in 0..internal_channels {
+            ch[n].n_frames_decoded = 0;
+        }
+    }
+    if (internal_channels > s.n_channels_internal) {
+        ch[1] = lane(s.tb);
+    }
+    let stereo_to_mono = internal_channels == 1
+        && s.n_channels_internal == 2
+        && internal_rate == 1000 * ch[0].fs_khz;
+    if (ch[0].n_frames_decoded == 0) {
+        for n in 0..internal_channels {
+            let c = ch[n];
+            if (payload_ms == 10) {
+                c.n_frames_per_packet = 1;
+                c.nb_subfr = 2;
+            } else if (payload_ms == 20) {
+                c.n_frames_per_packet = 1;
+                c.nb_subfr = 4;
+            } else if (payload_ms == 40) {
+                c.n_frames_per_packet = 2;
+                c.nb_subfr = 4;
+            } else if (payload_ms == 60) {
+                c.n_frames_per_packet = 3;
+                c.nb_subfr = 4;
+            } else {
+                return 0;
+            }
+            set_fs(c, (internal_rate >> 10) + 1);
+        }
+    }
+    if (api == 2
+        && internal_channels == 2
+        && (s.n_channels_api == 1 || s.n_channels_internal == 1)) {
+        s.pred_prev_q13[0] = 0;
+        s.pred_prev_q13[1] = 0;
+        s.s_side[0] = 0;
+        s.s_side[1] = 0;
+        let r0 = ch[0].resampler;
+        ch[1].resampler = Resampler {
+            siir: copy_of(r0.siir),
+            sfir: copy_of(r0.sfir),
+            delay_buf: copy_of(r0.delay_buf),
+            input_delay: r0.input_delay,
+            fs_in_khz: r0.fs_in_khz,
+            fs_out_khz: r0.fs_out_khz,
+            batch_size: r0.batch_size,
+            inv_ratio_q16: r0.inv_ratio_q16,
+            buf: copy_of(r0.buf)
+        };
+        ch[1].has_resampler = true;
+    }
+    s.n_channels_api = api;
+    s.n_channels_internal = internal_channels;
+    var decode_only_middle = false;
+    let ms_pred_q13 = zeros(2);
+    if (ch[0].n_frames_decoded == 0) {
+        for n in 0..internal_channels {
+            let c = ch[n];
+            for i in 0..c.n_frames_per_packet {
+                c.vad_flags[i] = rd.bit_logp(d, 1);
+            }
+            c.lbrr_flag = rd.bit_logp(d, 1);
+        }
+        for n in 0..internal_channels {
+            let c = ch[n];
+            for i in 0..3 {
+                c.lbrr_flags[i] = 0;
+            }
+            if (c.lbrr_flag != 0) {
+                if (c.n_frames_per_packet == 1) {
+                    c.lbrr_flags[0] = 1;
+                } else {
+                    let table = if (c.n_frames_per_packet == 2) {
+                        s.tb.lbrr_flags_2_icdf
+                    } else {
+                        s.tb.lbrr_flags_3_icdf
+                    };
+                    let sym = rd.icdf(d, table, 8) + 1;
+                    for i in 0..c.n_frames_per_packet {
+                        c.lbrr_flags[i] = (sym >> i) & 1;
+                    }
+                }
+            }
+        }
+        // The low-bitrate redundancy of the previous packet is not needed: skip it.
+        for i in 0..ch[0].n_frames_per_packet {
+            for n in 0..internal_channels {
+                let c = ch[n];
+                if (c.lbrr_flags[i] != 0) {
+                    if (internal_channels == 2 && n == 0) {
+                        stereo_decode_pred(d, s.tb, ms_pred_q13);
+                        if (ch[1].lbrr_flags[i] == 0) {
+                            decode_only_middle = rd.icdf(d, s.tb.stereo_only_code_mid_icdf, 8) == 1;
+                        }
+                    }
+                    let cond = if (i > 0 && c.lbrr_flags[i - 1] != 0) {
+                        CODE_CONDITIONALLY
+                    } else {
+                        CODE_INDEPENDENTLY
+                    };
+                    decode_indices(c, d, i, true, cond);
+                    decode_pulses(
+                        d,
+                        s.tb,
+                        s.pulses,
+                        c.signal_type,
+                        c.quant_offset_type,
+                        c.frame_length
+                    );
+                }
+            }
+        }
+    }
+    if (internal_channels == 2) {
+        stereo_decode_pred(d, s.tb, ms_pred_q13);
+        if (ch[1].vad_flags[ch[0].n_frames_decoded] == 0) {
+            decode_only_middle = rd.icdf(d, s.tb.stereo_only_code_mid_icdf, 8) == 1;
+        } else {
+            decode_only_middle = false;
+        }
+    }
+    if (internal_channels == 2 && !decode_only_middle && s.prev_decode_only_middle) {
+        let c1 = ch[1];
+        for i in 0..c1.out_buf.len() {
+            c1.out_buf[i] = 0;
+        }
+        for i in 0..MAX_LPC_ORDER {
+            c1.slpc_q14_buf[i] = 0;
+        }
+        c1.lag_prev = 100;
+        c1.last_gain_index = 10;
+        c1.first_frame_after_reset = true;
+    }
+    let tmp = s.tmp;
+    let has_side = !decode_only_middle;
+    var n_out_dec = 0;
+    for n in 0..internal_channels {
+        let c = ch[n];
+        if (n == 0 || has_side) {
+            let frame_index = ch[0].n_frames_decoded - n;
+            let cond = if (frame_index <= 0) {
+                CODE_INDEPENDENTLY
+            } else if (n > 0 && s.prev_decode_only_middle) {
+                CODE_INDEPENDENTLY_NO_LTP_SCALING
+            } else {
+                CODE_CONDITIONALLY
+            };
+            decode_frame(s, c, d, tmp[n], 2, cond);
+            n_out_dec = c.frame_length;
+        } else {
+            for i in 0..n_out_dec {
+                tmp[n][2 + i] = 0;
+            }
+        }
+        c.n_frames_decoded = c.n_frames_decoded + 1;
+    }
+    if (api == 2 && internal_channels == 2) {
+        stereo_ms_to_lr(s, tmp[0], tmp[1], ms_pred_q13, ch[0].fs_khz, n_out_dec);
+    } else {
+        tmp[0][0] = s.s_mid[0];
+        tmp[0][1] = s.s_mid[1];
+        s.s_mid[0] = tmp[0][n_out_dec];
+        s.s_mid[1] = tmp[0][n_out_dec + 1];
+    }
+    let n_out = (n_out_dec * 48000) / (ch[0].fs_khz * 1000);
+    let res = s.resampled;
+    for n in 0..imin(api, internal_channels) {
+        resample(ch[n].resampler, res, tmp[n], 1, n_out_dec);
+        for i in 0..n_out {
+            out[oo + n + api * i] = res[i];
+        }
+    }
+    if (api == 2 && internal_channels == 1) {
+        if (stereo_to_mono) {
+            resample(ch[1].resampler, res, tmp[0], 1, n_out_dec);
+            for i in 0..n_out {
+                out[oo + 1 + 2 * i] = res[i];
+            }
+        } else {
+            for i in 0..n_out {
+                out[oo + 1 + 2 * i] = out[oo + 2 * i];
+            }
+        }
+    }
+    s.prev_decode_only_middle = decode_only_middle;
+    n_out
+}

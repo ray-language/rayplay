@@ -1139,9 +1139,6 @@ fn starts_with(b: bytes, at: int, size: int, tag: string) -> bool {
 pub fn open(b: bytes) -> Result<Stream, string> {
     let p = ogg.open(b)?;
     let (ib, iat, isize) = ogg.packet(p, 0);
-    if (starts_with(ib, iat, isize, "OpusHead")) {
-        return Result.Err("Opus in Ogg is not supported (only Vorbis)");
-    }
     let id = reader(ib, iat, isize);
     if (!signature(id, 1)) {
         return Result.Err("Ogg without Vorbis audio");

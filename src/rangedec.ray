@@ -1,0 +1,247 @@
+// The range decoder of Opus (RFC 6716, section 4.1), shared by SILK and CELT: symbols coded
+// with frequency tables from the front of a frame, and raw bits read from its back. A port of
+// libopus' entdec.c, with 32-bit unsigned arithmetic kept in 64-bit ints.
+
+/// Decoder state over `size` octets of `b` from `at`.
+pub struct Dec {
+    b: bytes,
+    at: int,
+    /// Octets available (shrunk when the end of a frame holds something else).
+    storage: int,
+    /// Octets read from the front and from the back.
+    offs: int,
+    end_offs: int,
+    /// Raw bits read from the back but not yet used, and how many.
+    end_window: int,
+    nend_bits: int,
+    /// Bits read so far, for `tell`.
+    nbits_total: int,
+    rng: int,
+    val: int,
+    /// The scale of the last `decode`, for `update`.
+    ext: int,
+    /// The octet partly consumed by the last renormalization.
+    rem: int,
+    /// Set when a value was out of its range (a damaged frame).
+    error: bool,
+}
+
+const SYM_BITS: int = 8;
+
+const CODE_BITS: int = 32;
+
+const SYM_MAX: int = 255;
+
+const CODE_TOP: int = 0x80000000;
+
+const CODE_BOT: int = 0x800000;
+
+const CODE_EXTRA: int = 7;
+
+const WINDOW_SIZE: int = 32;
+
+const UINT_BITS: int = 8;
+
+pub const BITRES: int = 3;
+
+/// The number of bits in `x` (0 for 0), for x below 2^32.
+pub fn ilog(x: int) -> int {
+    if (x <= 0) {
+        return 0;
+    }
+    var v = x;
+    var n = 1;
+    if (v >= 0x10000) {
+        v = v >> 16;
+        n = n + 16;
+    }
+    if (v >= 0x100) {
+        v = v >> 8;
+        n = n + 8;
+    }
+    if (v >= 0x10) {
+        v = v >> 4;
+        n = n + 4;
+    }
+    if (v >= 4) {
+        v = v >> 2;
+        n = n + 2;
+    }
+    if (v >= 2) {
+        n = n + 1;
+    }
+    n
+}
+
+fn read_byte(d: Dec) -> int {
+    if (d.offs < d.storage) {
+        let v = d.b[d.at + d.offs];
+        d.offs = d.offs + 1;
+        v
+    } else {
+        0
+    }
+}
+
+fn read_byte_from_end(d: Dec) -> int {
+    if (d.end_offs < d.storage) {
+        d.end_offs = d.end_offs + 1;
+        d.b[d.at + d.storage - d.end_offs]
+    } else {
+        0
+    }
+}
+
+fn normalize(d: Dec) -> unit {
+    while (d.rng <= CODE_BOT) {
+        d.nbits_total = d.nbits_total + SYM_BITS;
+        d.rng = d.rng << SYM_BITS;
+        var sym = d.rem;
+        d.rem = read_byte(d);
+        sym = ((sym << SYM_BITS) | d.rem) >> (SYM_BITS - CODE_EXTRA);
+        d.val = ((d.val << SYM_BITS) + (SYM_MAX ^ (sym & SYM_MAX))) & (CODE_TOP - 1);
+    }
+}
+
+/// A decoder over `size` octets of `b` from `at`.
+pub fn dec(b: bytes, at: int, size: int) -> Dec {
+    let d = Dec {
+        b: b,
+        at: at,
+        storage: size,
+        offs: 0,
+        end_offs: 0,
+        end_window: 0,
+        nend_bits: 0,
+        nbits_total: CODE_BITS + 1 - ((CODE_BITS - CODE_EXTRA) / SYM_BITS) * SYM_BITS,
+        rng: 1 << CODE_EXTRA,
+        val: 0,
+        ext: 0,
+        rem: 0,
+        error: false
+    };
+    d.rem = read_byte(d);
+    d.val = d.rng - 1 - (d.rem >> (SYM_BITS - CODE_EXTRA));
+    normalize(d);
+    d
+}
+
+/// The cumulative frequency of the next symbol, in a table totalling `ft`.
+pub fn decode(d: Dec, ft: int) -> int {
+    d.ext = d.rng / ft;
+    let s = d.val / d.ext;
+    ft - if (s + 1 < ft) { s + 1 } else { ft }
+}
+
+/// Like `decode` for a total of 2^bits.
+pub fn decode_bin(d: Dec, bits: int) -> int {
+    d.ext = d.rng >> bits;
+    let s = d.val / d.ext;
+    let ft = 1 << bits;
+    ft - if (s + 1 < ft) { s + 1 } else { ft }
+}
+
+/// Consumes the symbol whose frequencies are [fl, fh) of `ft`, after `decode`.
+pub fn update(d: Dec, fl: int, fh: int, ft: int) -> unit {
+    let s = d.ext * (ft - fh);
+    d.val = d.val - s;
+    d.rng = if (fl > 0) { d.ext * (fh - fl) } else { d.rng - s };
+    normalize(d);
+}
+
+/// One bit whose probability of being 1 is 1/2^logp.
+pub fn bit_logp(d: Dec, logp: int) -> int {
+    let r = d.rng;
+    let v = d.val;
+    let s = r >> logp;
+    let one = v < s;
+    if (!one) {
+        d.val = v - s;
+    }
+    d.rng = if (one) { s } else { r - s };
+    normalize(d);
+    if (one) { 1 } else { 0 }
+}
+
+/// A symbol from an inverse cumulative table (values out of 2^ftb, decreasing to 0), from `at`.
+pub fn icdf_at(d: Dec, icdf: [int], at: int, ftb: int) -> int {
+    var s = d.rng;
+    let v = d.val;
+    let r = s >> ftb;
+    var ret = -1;
+    var t = 0;
+    var go = true;
+    while (go) {
+        t = s;
+        ret = ret + 1;
+        s = r * icdf[at + ret];
+        go = v < s;
+    }
+    d.val = v - s;
+    d.rng = t - s;
+    normalize(d);
+    ret
+}
+
+pub fn icdf(d: Dec, table: [int], ftb: int) -> int {
+    icdf_at(d, table, 0, ftb)
+}
+
+/// `bits` raw bits from the back of the frame.
+pub fn bits(d: Dec, n: int) -> int {
+    var window = d.end_window;
+    var available = d.nend_bits;
+    if (available < n) {
+        var more = true;
+        while (more) {
+            window = window | (read_byte_from_end(d) << available);
+            available = available + SYM_BITS;
+            more = available <= WINDOW_SIZE - SYM_BITS;
+        }
+    }
+    let ret = window & ((1 << n) - 1);
+    d.end_window = window >> n;
+    d.nend_bits = available - n;
+    d.nbits_total = d.nbits_total + n;
+    ret
+}
+
+/// A value uniformly distributed in [0, ft).
+pub fn uint(d: Dec, ft0: int) -> int {
+    let ft = ft0 - 1;
+    var ftb = ilog(ft);
+    if (ftb > UINT_BITS) {
+        ftb = ftb - UINT_BITS;
+        let f = (ft >> ftb) + 1;
+        let s = decode(d, f);
+        update(d, s, s + 1, f);
+        let t = (s << ftb) | bits(d, ftb);
+        if (t <= ft) {
+            return t;
+        }
+        d.error = true;
+        return ft;
+    }
+    let s = decode(d, ft0);
+    update(d, s, s + 1, ft0);
+    s
+}
+
+/// Bits used so far, rounded up.
+pub fn tell(d: Dec) -> int {
+    d.nbits_total - ilog(d.rng)
+}
+
+/// Bits used so far, in eighths.
+pub fn tell_frac(d: Dec) -> int {
+    let nbits = d.nbits_total << BITRES;
+    var l = ilog(d.rng);
+    var r = d.rng >> (l - 16);
+    for _ in 0..BITRES {
+        r = (r * r) >> 15;
+        let b = r >> 16;
+        l = (l << 1) | b;
+        r = r >> b;
+    }
+    nbits - l
+}

@@ -1,0 +1,672 @@
+// Ogg Opus (RFC 7845) and the Opus packet layer (RFC 6716): the identification header
+// (channels, pre-skip, output gain), the packets of 2.5 to 120 ms they carry, and the decoding
+// of each frame by SILK (speech, below 8 kHz), CELT (music, the whole band) or both (hybrid),
+// with the redundant CELT frames that smooth a switch between modes. A port of libopus'
+// opus_decoder.c; the output is always 48 kHz, mono or stereo.
+//
+// Every frame depends on the ones before it (overlaps, predictions, filters), so `seek`
+// resets the decoder and decodes, without keeping them, the packets before the target: half a
+// second for CELT, two for SILK, well past the 80 ms RFC 7845 asks for, so that what follows
+// comes out as it does when decoding from the start. Lost frames are not concealed: a damaged packet
+// becomes silence and the decoder starts over after it.
+
+import celt;
+import ogg;
+import rangedec as rd;
+import silk;
+import std/math;
+
+const MODE_SILK: int = 1000;
+
+const MODE_HYBRID: int = 1001;
+
+const MODE_CELT: int = 1002;
+
+const BW_NARROW: int = 1101;
+
+const BW_MEDIUM: int = 1102;
+
+const BW_WIDE: int = 1103;
+
+const BW_SUPERWIDE: int = 1104;
+
+const BW_FULL: int = 1105;
+
+const F20: int = 960;
+
+const F10: int = 480;
+
+const F5: int = 240;
+
+const F2_5: int = 120;
+
+/// Samples decoded and dropped before a seek target: CELT's state settles within half a second
+/// (the energy prediction decays at least 0.5 per frame); SILK's long-term prediction carries
+/// longer through voiced speech.
+const PREROLL_CELT: int = 24000;
+
+const PREROLL_SILK: int = 96000;
+
+/// The decoder state of the Opus layer.
+struct Decoder {
+    channels: int,
+    celt: celt.Celt,
+    silk: silk.Silk,
+    prev_mode: int,
+    prev_redundancy: bool,
+    mode: int,
+    bandwidth: int,
+    frame_size: int,
+    stream_channels: int,
+    /// Work buffers: SILK's output (48 kHz, 16-bit scale) and the redundant CELT frame.
+    pcm_silk: [int],
+    redundant: [float],
+}
+
+fn new_decoder(channels: int) -> Decoder {
+    var pcm_silk: [int] = [];
+    for _ in 0..5760 * 2 {
+        pcm_silk.push(0);
+    }
+    var redundant: [float] = [];
+    for _ in 0..F5 * 2 {
+        redundant.push(0.0);
+    }
+    Decoder {
+        channels: channels,
+        celt: celt.new(channels),
+        silk: silk.new(channels),
+        prev_mode: 0,
+        prev_redundancy: false,
+        mode: 0,
+        bandwidth: 0,
+        frame_size: F2_5,
+        stream_channels: channels,
+        pcm_silk: pcm_silk,
+        redundant: redundant
+    }
+}
+
+fn reset_decoder(dec: Decoder) -> unit {
+    celt.reset(dec.celt);
+    silk.reset(dec.silk);
+    dec.prev_mode = 0;
+    dec.prev_redundancy = false;
+    dec.mode = 0;
+    dec.bandwidth = 0;
+    dec.frame_size = F2_5;
+    dec.stream_channels = dec.channels;
+}
+
+/// The samples per frame of a packet, from its first octet (TOC).
+fn samples_per_frame(toc: int) -> int {
+    if ((toc & 0x80) != 0) {
+        return (48000 << ((toc >> 3) & 3)) / 400;
+    }
+    if ((toc & 0x60) == 0x60) {
+        return if ((toc & 0x08) != 0) { 960 } else { 480 };
+    }
+    let size = (toc >> 3) & 3;
+    if (size == 3) { 2880 } else { (48000 << size) / 100 }
+}
+
+fn mode_of(toc: int) -> int {
+    if ((toc & 0x80) != 0) {
+        MODE_CELT
+    } else if ((toc & 0x60) == 0x60) {
+        MODE_HYBRID
+    } else {
+        MODE_SILK
+    }
+}
+
+fn bandwidth_of(toc: int) -> int {
+    if ((toc & 0x80) != 0) {
+        let bw = BW_MEDIUM + ((toc >> 5) & 3);
+        return if (bw == BW_MEDIUM) { BW_NARROW } else { bw };
+    }
+    if ((toc & 0x60) == 0x60) {
+        return if ((toc & 0x10) != 0) { BW_FULL } else { BW_SUPERWIDE };
+    }
+    BW_NARROW + ((toc >> 5) & 3)
+}
+
+/// The frames of a packet: where each starts and its size, or an empty list if the packet is
+/// malformed (libopus' opus_packet_parse).
+fn frames_of(b: bytes, at: int, len0: int) -> [(int, int)] {
+    var none: [(int, int)] = [];
+    if (len0 < 1) {
+        return none;
+    }
+    let toc = b[at];
+    let framesize = samples_per_frame(toc);
+    var p = at + 1;
+    var len = len0 - 1;
+    var count = 1;
+    var cbr = false;
+    var sizes: [int] = [];
+    var last_size = len;
+    let code = toc & 3;
+    if (code == 1) {
+        count = 2;
+        cbr = true;
+        if ((len & 1) != 0) {
+            return none;
+        }
+        last_size = len / 2;
+        sizes.push(last_size);
+    } else if (code == 2) {
+        count = 2;
+        if (len < 1) {
+            return none;
+        }
+        var size = b[p];
+        var used = 1;
+        if (size >= 252) {
+            if (len < 2) {
+                return none;
+            }
+            size = 4 * b[p + 1] + size;
+            used = 2;
+        }
+        len = len - used;
+        if (size > len) {
+            return none;
+        }
+        p = p + used;
+        sizes.push(size);
+        last_size = len - size;
+    } else if (code == 3) {
+        if (len < 1) {
+            return none;
+        }
+        let ch = b[p];
+        p = p + 1;
+        count = ch & 0x3F;
+        if (count <= 0 || framesize * count > 5760) {
+            return none;
+        }
+        len = len - 1;
+        if ((ch & 0x40) != 0) {
+            var more = true;
+            while (more) {
+                if (len <= 0) {
+                    return none;
+                }
+                let pad = b[p];
+                p = p + 1;
+                len = len - 1;
+                let tmp = if (pad == 255) { 254 } else { pad };
+                len = len - tmp;
+                more = pad == 255;
+            }
+        }
+        if (len < 0) {
+            return none;
+        }
+        cbr = (ch & 0x80) == 0;
+        if (!cbr) {
+            last_size = len;
+            for _ in 0..count - 1 {
+                if (len < 1) {
+                    return none;
+                }
+                var size = b[p];
+                var used = 1;
+                if (size >= 252) {
+                    if (len < 2) {
+                        return none;
+                    }
+                    size = 4 * b[p + 1] + size;
+                    used = 2;
+                }
+                len = len - used;
+                if (size > len) {
+                    return none;
+                }
+                p = p + used;
+                sizes.push(size);
+                last_size = last_size - (used + size);
+            }
+            if (last_size < 0) {
+                return none;
+            }
+        } else {
+            last_size = len / count;
+            if (last_size * count != len) {
+                return none;
+            }
+            for _ in 0..count - 1 {
+                sizes.push(last_size);
+            }
+        }
+    }
+    if (last_size > 1275) {
+        return none;
+    }
+    sizes.push(last_size);
+    var out: [(int, int)] = [];
+    for s in sizes {
+        out.push((p, s));
+        p = p + s;
+    }
+    out
+}
+
+/// Samples in a packet (0 if malformed).
+fn packet_samples(b: bytes, at: int, len: int) -> int {
+    let frames = frames_of(b, at, len);
+    if (frames.len() == 0) {
+        return 0;
+    }
+    frames.len() * samples_per_frame(b[at])
+}
+
+/// out = w² · in2 + (1 - w²) · in1 over `F2_5` samples, w the CELT window.
+fn smooth_fade(
+    in1: [float],
+    i1: int,
+    in2: [float],
+    i2: int,
+    out: [float],
+    o: int,
+    channels: int
+) -> unit {
+    for c in 0..channels {
+        for i in 0..F2_5 {
+            let w0 = celt.window(i);
+            let w = w0 * w0;
+            let k = i * channels + c;
+            out[o + k] = w * in2[i2 + k] + (1.0 - w) * in1[i1 + k];
+        }
+    }
+}
+
+/// Decodes one frame of `len` octets at `at` (the mode, bandwidth and size are the packet's)
+/// into `pcm` from `po`. False if it is damaged.
+fn decode_frame(dec: Decoder, b: bytes, at: int, len0: int, pcm: [float], po: int) -> bool {
+    let ch = dec.channels;
+    let frame_size = dec.frame_size;
+    if (len0 <= 1) {
+        // No payload (discontinuous transmission): silence rather than comfort noise.
+        for i in 0..frame_size * ch {
+            pcm[po + i] = 0.0;
+        }
+        return true;
+    }
+    let mode = dec.mode;
+    let bandwidth = dec.bandwidth;
+    var len = len0;
+    let d = rd.dec(b, at, len);
+    let pcm_silk = dec.pcm_silk;
+    if (mode != MODE_CELT) {
+        if (dec.prev_mode == MODE_CELT) {
+            silk.reset(dec.silk);
+        }
+        let internal_rate = if (mode == MODE_SILK) {
+            if (bandwidth == BW_NARROW) {
+                8000
+            } else if (bandwidth == BW_MEDIUM) {
+                12000
+            } else {
+                16000
+            }
+        } else {
+            16000
+        };
+        let payload_ms = math.max(10, 1000 * frame_size / 48000);
+        var decoded = 0;
+        while (decoded < frame_size) {
+            let n = silk.decode(
+                dec.silk,
+                d,
+                dec.stream_channels,
+                internal_rate,
+                payload_ms,
+                decoded == 0,
+                pcm_silk,
+                decoded * ch
+            );
+            if (n <= 0) {
+                return false;
+            }
+            decoded = decoded + n;
+        }
+    }
+    var redundancy = false;
+    var celt_to_silk = false;
+    var redundancy_bytes = 0;
+    if (mode != MODE_CELT
+        && rd.tell(d) + 17 + if (mode == MODE_HYBRID) { 20 } else { 0 } <= 8 * len) {
+        redundancy = if (mode == MODE_HYBRID) { rd.bit_logp(d, 12) == 1 } else { true };
+        if (redundancy) {
+            celt_to_silk = rd.bit_logp(d, 1) == 1;
+            redundancy_bytes = if (mode == MODE_HYBRID) {
+                rd.uint(d, 256) + 2
+            } else {
+                len - ((rd.tell(d) + 7) >> 3)
+            };
+            len = len - redundancy_bytes;
+            if (len * 8 < rd.tell(d)) {
+                len = 0;
+                redundancy_bytes = 0;
+                redundancy = false;
+            }
+            d.storage = d.storage - redundancy_bytes;
+        }
+    }
+    let start_band = if (mode != MODE_CELT) { 17 } else { 0 };
+    let c = dec.celt;
+    c.end = if (bandwidth == BW_NARROW) {
+        13
+    } else if (bandwidth == BW_MEDIUM || bandwidth == BW_WIDE) {
+        17
+    } else if (bandwidth == BW_SUPERWIDE) {
+        19
+    } else {
+        21
+    };
+    let redundant = dec.redundant;
+    if (redundancy && celt_to_silk) {
+        c.start = 0;
+        let rdec = rd.dec(b, at + len, redundancy_bytes);
+        let _ok = celt.decode(c, rdec, redundancy_bytes, dec.stream_channels, F5, redundant, 0);
+    }
+    c.start = start_band;
+    var ok = true;
+    if (mode != MODE_SILK) {
+        let celt_frame_size = math.min(F20, frame_size);
+        if (mode != dec.prev_mode && dec.prev_mode > 0 && !dec.prev_redundancy) {
+            celt.reset(c);
+        }
+        ok = celt.decode(c, d, len, dec.stream_channels, celt_frame_size, pcm, po);
+    } else {
+        for i in 0..frame_size * ch {
+            pcm[po + i] = 0.0;
+        }
+        if (dec.prev_mode == MODE_HYBRID && !(redundancy && celt_to_silk && dec.prev_redundancy)) {
+            // A hybrid to SILK switch: the CELT MDCT fades out by decoding a silence frame.
+            c.start = 0;
+            let silence = bytes_of([0xFF, 0xFF]);
+            let _ok = celt.decode(c, rd.dec(silence, 0, 2), 2, dec.stream_channels, F2_5, pcm, po);
+        }
+    }
+    if (mode != MODE_CELT) {
+        for i in 0..frame_size * ch {
+            pcm[po + i] = pcm[po + i] + (1.0 / 32768.0) * (pcm_silk[i] as float);
+        }
+    }
+    if (redundancy && !celt_to_silk) {
+        celt.reset(c);
+        c.start = 0;
+        let rdec = rd.dec(b, at + len, redundancy_bytes);
+        let _ok = celt.decode(c, rdec, redundancy_bytes, dec.stream_channels, F5, redundant, 0);
+        let tail = po + ch * (frame_size - F2_5);
+        smooth_fade(pcm, tail, redundant, ch * F2_5, pcm, tail, ch);
+    }
+    if (redundancy && celt_to_silk && (dec.prev_mode != MODE_SILK || dec.prev_redundancy)) {
+        for i in 0..F2_5 * ch {
+            pcm[po + i] = redundant[i];
+        }
+        smooth_fade(redundant, ch * F2_5, pcm, po + ch * F2_5, pcm, po + ch * F2_5, ch);
+    }
+    dec.prev_mode = mode;
+    dec.prev_redundancy = redundancy && !celt_to_silk;
+    ok
+}
+
+/// Decodes the packet of `len` octets at `at` into `pcm`; its samples, or -1 if damaged.
+fn decode_packet(dec: Decoder, b: bytes, at: int, len: int, pcm: [float]) -> int {
+    let frames = frames_of(b, at, len);
+    if (frames.len() == 0) {
+        return -1;
+    }
+    let toc = b[at];
+    dec.mode = mode_of(toc);
+    dec.bandwidth = bandwidth_of(toc);
+    dec.frame_size = samples_per_frame(toc);
+    dec.stream_channels = if ((toc & 4) != 0) { 2 } else { 1 };
+    var n = 0;
+    for f in frames {
+        if (!decode_frame(dec, b, f.0, f.1, pcm, n * dec.channels)) {
+            return -1;
+        }
+        n = n + dec.frame_size;
+    }
+    n
+}
+
+/// An Ogg Opus track being played.
+pub struct Stream {
+    packets: ogg.Stream,
+    rate: int,
+    channels: int,
+    /// Frames in the track (after the pre-skip).
+    total: int,
+    /// Samples to drop at the start, and the output gain (linear).
+    preskip: int,
+    gain: float,
+    /// Per packet: the sample its output starts at (counting the pre-skip) and its length.
+    starts: [int],
+    lengths: [int],
+    /// The next packet to decode.
+    next: int,
+    /// True if some packet has SILK frames (SILK-only or hybrid).
+    has_silk: bool,
+    dec: Decoder,
+    pcm: [float],
+}
+
+fn u16_le(b: bytes, at: int) -> int {
+    b[at] | (b[at + 1] << 8)
+}
+
+fn starts_with(b: bytes, at: int, size: int, tag: string) -> bool {
+    let t = tag.to_bytes();
+    size >= t.len() && b.sub_bytes(at, at + t.len()) == t
+}
+
+/// True if the first packet of the Ogg file `b` is an Opus identification header.
+pub fn sniff(b: bytes) -> bool {
+    // The first page's first packet starts after the 27-octet header and its lacing.
+    if (b.len() < 28) {
+        return false;
+    }
+    let body = 27 + b[26];
+    body + 8 <= b.len() && starts_with(b, body, 8, "OpusHead")
+}
+
+/// Opens the Opus stream of the Ogg file `b`.
+pub fn open(b: bytes) -> Result<Stream, string> {
+    let p = ogg.open(b)?;
+    let (hb, hat, hsize) = ogg.packet(p, 0);
+    if (!starts_with(hb, hat, hsize, "OpusHead") || hsize < 19) {
+        return Result.Err("Ogg without Opus audio");
+    }
+    let version = hb[hat + 8];
+    let channels = hb[hat + 9];
+    let preskip = u16_le(hb, hat + 10);
+    var gain_q8 = u16_le(hb, hat + 16);
+    if (gain_q8 >= 32768) {
+        gain_q8 = gain_q8 - 65536;
+    }
+    let family = hb[hat + 18];
+    if ((version >> 4) != 0) {
+        return Result.Err("Opus: unsupported version ${to_string(version)}");
+    }
+    if (channels < 1 || channels > 2 || family > 1) {
+        return Result.Err("Opus with ${to_string(channels)} channels (only mono and stereo)");
+    }
+    if (family == 1) {
+        // A channel mapping table: one stream (coupled if stereo) in order, or it is refused.
+        if (hsize < 21 + channels) {
+            return Result.Err("Opus: bad channel mapping");
+        }
+        let streams = hb[hat + 19];
+        let coupled = hb[hat + 20];
+        let simple = streams == 1 && coupled == channels - 1;
+        var in_order = true;
+        for i in 0..channels {
+            if (hb[hat + 21 + i] != i) {
+                in_order = false;
+            }
+        }
+        if (!simple || !in_order) {
+            return Result.Err("Opus with ${to_string(streams)} streams (only one, mono or stereo)");
+        }
+    }
+    if (p.offsets.len() < 2) {
+        return Result.Err("Opus without its headers");
+    }
+    let (tb, tat, tsize) = ogg.packet(p, 1);
+    if (!starts_with(tb, tat, tsize, "OpusTags")) {
+        return Result.Err("Opus without its headers");
+    }
+    // Each packet's place, from the durations in their TOC; the granule positions (at 48 kHz,
+    // counting the pre-skip) say where the stream starts and ends.
+    let n = p.offsets.len();
+    var starts: [int] = [];
+    var lengths: [int] = [];
+    var at = 0;
+    var first_granule = -1;
+    var first_offset = 0;
+    var last_granule = -1;
+    var has_silk = false;
+    for k in 0..n {
+        starts.push(at);
+        var len = 0;
+        if (k >= 2) {
+            let (pb, pat, psize) = ogg.packet(p, k);
+            len = packet_samples(pb, pat, psize);
+            if (len > 0 && mode_of(pb[pat]) != MODE_CELT) {
+                has_silk = true;
+            }
+        }
+        lengths.push(len);
+        at = at + len;
+        let g = p.granules[k];
+        if (k >= 2 && g >= 0) {
+            if (first_granule < 0) {
+                first_granule = g;
+                first_offset = g - at;
+            }
+            last_granule = g;
+        }
+    }
+    // A stream that does not start at granule 0 (cut from a longer one) counts from its start.
+    let offset = if (first_offset > 0) { first_offset } else { 0 };
+    var total = at - preskip;
+    if (last_granule >= 0 && last_granule - offset - preskip < total) {
+        total = last_granule - offset - preskip;
+    }
+    var pcm: [float] = [];
+    for _ in 0..5760 * channels {
+        pcm.push(0.0);
+    }
+    Result.Ok(
+        Stream {
+            packets: p,
+            rate: 48000,
+            channels: channels,
+            total: if (total > 0) { total } else { 0 },
+            preskip: preskip,
+            gain: math.pow(10.0, (gain_q8 as float) / (20.0 * 256.0)),
+            starts: starts,
+            lengths: lengths,
+            next: 2,
+            has_silk: has_silk,
+            dec: new_decoder(channels),
+            pcm: pcm
+        }
+    )
+}
+
+/// A decoded sample, with the output gain, rounded and clamped to 16 bits.
+fn to_16(v: float) -> int {
+    let x = v * 32768.0;
+    if (x >= 32767.0) {
+        return 32767;
+    }
+    if (x <= -32768.0) {
+        return -32768;
+    }
+    math.round(x) as int
+}
+
+/// Decodes packet `k` into `s.pcm`; its samples, or -1 if damaged (the decoder is then reset).
+fn decode_at(s: Stream, k: int) -> int {
+    let (b, at, size) = ogg.packet(s.packets, k);
+    let n = decode_packet(s.dec, b, at, size, s.pcm);
+    if (n < 0) {
+        reset_decoder(s.dec);
+    }
+    n
+}
+
+/// Decodes the next packet with audio, appending its samples to `out`; returns the frame its
+/// first sample is (negative within the pre-skip), or None at the end. A damaged packet
+/// becomes silence.
+pub fn next(s: Stream, out: [int]) -> Option<int> {
+    let n = s.starts.len();
+    while (s.next < n) {
+        let k = s.next;
+        s.next = k + 1;
+        let len = s.lengths[k];
+        if (len == 0) {
+            continue;
+        }
+        let got = decode_at(s, k);
+        let ch = s.channels;
+        if (got != len) {
+            for _ in 0..len * ch {
+                out.push(0);
+            }
+        } else {
+            let pcm = s.pcm;
+            let g = s.gain;
+            for i in 0..len * ch {
+                out.push(to_16(pcm[i] * g));
+            }
+        }
+        return Option.Some(s.starts[k] - s.preskip);
+    }
+    Option.None
+}
+
+/// Makes `next` continue from the packet holding frame `pos`, after resetting the decoder and
+/// decoding (without keeping them) the packets of the pre-roll before it.
+pub fn seek(s: Stream, pos: int) -> unit {
+    let target = pos + s.preskip;
+    let n = s.starts.len();
+    var lo = 2;
+    var hi = n;
+    while (lo < hi) {
+        let mid = (lo + hi) / 2;
+        if (s.starts[mid] <= target) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    var k = lo - 1;
+    if (k < 2) {
+        k = 2;
+    }
+    reset_decoder(s.dec);
+    if (pos >= s.total) {
+        s.next = n;
+        return;
+    }
+    let preroll = if (s.has_silk) { PREROLL_SILK } else { PREROLL_CELT };
+    var j = k;
+    while (j > 2 && s.starts[k] - s.starts[j] < preroll) {
+        j = j - 1;
+    }
+    while (j < k && j < n) {
+        if (s.lengths[j] > 0) {
+            let _n = decode_at(s, j);
+        }
+        j = j + 1;
+    }
+    s.next = k;
+}

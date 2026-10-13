@@ -1,0 +1,2746 @@
+// The CELT layer of Opus (RFC 6716, section 4.3): the MDCT codec for music and the upper band
+// of hybrid frames. A port of libopus' floating-point decoder (celt_decoder.c, bands.c,
+// quant_bands.c, rate.c, vq.c, cwrs.c, laplace.c), for the 48 kHz mode with frames of 2.5 to
+// 20 ms. Each frame codes the energy of 21 bands (coarse, fine and final bits), splits the bits
+// left among the bands, and codes each band's shape as pulses on a sphere (PVQ), folding the
+// spectrum below where no pulses were sent; the inverse MDCT of the spectrum, overlapped with a
+// short window, goes through a pitch post-filter and de-emphasis.
+//
+// Lost frames are not concealed: a damaged or missing frame becomes silence (the caller resets).
+
+import celt_tables as t;
+import rangedec as rd;
+import std/math;
+
+const NB_EBANDS: int = 21;
+
+const OVERLAP: int = 120;
+
+const SHORT_MDCT: int = 120;
+
+const MAX_LM: int = 3;
+
+const BUFFER: int = 2048;
+
+const BITRES: int = 3;
+
+const MAX_FINE_BITS: int = 8;
+
+const FINE_OFFSET: int = 21;
+
+const QTHETA_OFFSET: int = 4;
+
+const QTHETA_OFFSET_TWOPHASE: int = 16;
+
+const LOG_MAX_PSEUDO: int = 6;
+
+const ALLOC_STEPS: int = 6;
+
+const COMBFILTER_MINPERIOD: int = 15;
+
+const SPREAD_NONE: int = 0;
+
+const SPREAD_AGGRESSIVE: int = 3;
+
+const VERY_SMALL: float = 1e-30;
+
+const PREEMPH: float = 0.8500061;
+
+/// Width of a row of the PVQ codeword counts.
+const PVQ_W: int = 180;
+
+const TRIM_ICDF: [int] = [126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0];
+
+const SPREAD_ICDF: [int] = [25, 23, 2, 0];
+
+const TAPSET_ICDF: [int] = [2, 1, 0];
+
+const SMALL_ENERGY_ICDF: [int] = [2, 1, 0];
+
+const LOG2_FRAC: [int] = [
+    0,
+    8,
+    13,
+    16,
+    19,
+    21,
+    23,
+    24,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    32,
+    33,
+    34,
+    34,
+    35,
+    36,
+    36,
+    37,
+    37
+];
+
+/// Time-frequency changes: per frame size, 4 × transient + 2 × tf_select + the band's flag.
+const TF_SELECT: [int] = [
+    0,
+    -1,
+    0,
+    -1,
+    0,
+    -1,
+    0,
+    -1,
+    0,
+    -1,
+    0,
+    -2,
+    1,
+    0,
+    1,
+    -1,
+    0,
+    -2,
+    0,
+    -3,
+    2,
+    0,
+    1,
+    -1,
+    0,
+    -2,
+    0,
+    -3,
+    3,
+    0,
+    1,
+    -1
+];
+
+const PRED_COEF: [float] = [0.8984375, 0.796875, 0.6484375, 0.5];
+
+const BETA_COEF: [float] = [0.920013427734375, 0.67999267578125, 0.3699951171875, 0.20001220703125];
+
+const BETA_INTRA: float = 0.149993896484375;
+
+const COMB_GAINS: [float] = [
+    0.306640625,
+    0.2170410156,
+    0.1296386719,
+    0.4638671875,
+    0.2680664062,
+    0.0,
+    0.7998046875,
+    0.1000976562,
+    0.0
+];
+
+const ORDERY: [int] = [
+    1,
+    0,
+    3,
+    0,
+    2,
+    1,
+    7,
+    0,
+    4,
+    3,
+    6,
+    1,
+    5,
+    2,
+    15,
+    0,
+    8,
+    7,
+    12,
+    3,
+    11,
+    4,
+    14,
+    1,
+    9,
+    6,
+    13,
+    2,
+    10,
+    5
+];
+
+const BIT_INTERLEAVE: [int] = [0, 1, 1, 1, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3];
+
+const BIT_DEINTERLEAVE: [int] = [
+    0x00,
+    0x03,
+    0x0C,
+    0x0F,
+    0x30,
+    0x33,
+    0x3C,
+    0x3F,
+    0xC0,
+    0xC3,
+    0xCC,
+    0xCF,
+    0xF0,
+    0xF3,
+    0xFC,
+    0xFF
+];
+
+const EXP2_TABLE8: [int] = [16384, 17866, 19483, 21247, 23170, 25267, 27554, 30048];
+
+const SQRT_HALF: float = 0.70710678;
+
+const SPREAD_FACTOR: [int] = [15, 10, 5];
+
+/// A complex FFT of m = 15 × 2^k points (60 to 480), by the prime factor algorithm: the 15-point
+/// transforms as 3 × 5 (again prime factors, so no twiddles), then 15 radix-2 transforms of 2^k
+/// points.
+struct Fft {
+    m: int,
+    p: int,
+    /// For each 3-point transform (per n2 and b), its three inputs.
+    in_idx: [int],
+    /// For each output of the 5-point stage (per n2, ka, kb), where it goes for the p-point stage.
+    mid_idx: [int],
+    /// For each output of the p-point stage, its index in the result.
+    out_idx: [int],
+    /// e^(-2πi j/p).
+    cp: [float],
+    sp: [float],
+    re: [float],
+    im: [float],
+    wr: [float],
+    wi: [float],
+    ar: [float],
+    ai: [float],
+}
+
+const S3: float = 0.8660254037844386;
+
+const C51: float = 0.30901699437494745;
+
+const C52: float = -0.8090169943749475;
+
+const S51: float = 0.9510565162951535;
+
+const S52: float = 0.5877852522924731;
+
+fn floats(n: int) -> [float] {
+    var v: [float] = [];
+    for _ in 0..n {
+        v.push(0.0);
+    }
+    v
+}
+
+fn ints(n: int, x: int) -> [int] {
+    var v: [int] = [];
+    for _ in 0..n {
+        v.push(x);
+    }
+    v
+}
+
+/// The inverse of `a` modulo `m`.
+fn inverse(a: int, m: int) -> int {
+    for x in 1..m {
+        if ((a * x) % m == 1) {
+            return x;
+        }
+    }
+    1
+}
+
+fn fft_of(m: int) -> Fft {
+    let p = m / 15;
+    var levels = 0;
+    while ((1 << levels) < p) {
+        levels = levels + 1;
+    }
+    var rev: [int] = [];
+    for i in 0..p {
+        var x = i;
+        var y = 0;
+        for _ in 0..levels {
+            y = (y << 1) | (x & 1);
+            x = x >> 1;
+        }
+        rev.push(y);
+    }
+    // Input n = (p · n1 + 15 · n2) mod m, with n1 = (5a + 3b) mod 15.
+    var in_idx: [int] = [];
+    for n2 in 0..p {
+        for b in 0..5 {
+            for a in 0..3 {
+                in_idx.push((p * ((5 * a + 3 * b) % 15) + 15 * n2) % m);
+            }
+        }
+    }
+    // k1 = (10 ka + 6 kb) mod 15; the p-point stage takes its inputs bit-reversed.
+    var mid_idx: [int] = [];
+    for n2 in 0..p {
+        for ka in 0..3 {
+            for kb in 0..5 {
+                mid_idx.push(((10 * ka + 6 * kb) % 15) * p + rev[n2]);
+            }
+        }
+    }
+    let a = p * inverse(p % 15, 15);
+    let b = if (p > 1) { 15 * inverse(15 % p, p) } else { 0 };
+    var out_idx: [int] = [];
+    for k1 in 0..15 {
+        for k2 in 0..p {
+            out_idx.push((k1 * a + k2 * b) % m);
+        }
+    }
+    var cp: [float] = [];
+    var sp: [float] = [];
+    for j in 0..p {
+        let w = -2.0 * math.PI * (j as float) / (p as float);
+        cp.push(math.cos(w));
+        sp.push(math.sin(w));
+    }
+    Fft {
+        m: m,
+        p: p,
+        in_idx: in_idx,
+        mid_idx: mid_idx,
+        out_idx: out_idx,
+        cp: cp,
+        sp: sp,
+        re: floats(m),
+        im: floats(m),
+        wr: floats(m),
+        wi: floats(m),
+        ar: floats(m),
+        ai: floats(m)
+    }
+}
+
+/// The forward DFT of `f.re`/`f.im`, left in `f.ar`/`f.ai` in the order of `f.out_idx`.
+fn fft(f: Fft) -> unit {
+    let p = f.p;
+    let re = f.re;
+    let im = f.im;
+    let wr = f.wr;
+    let wi = f.wi;
+    let ar = f.ar;
+    let ai = f.ai;
+    let in_idx = f.in_idx;
+    // 3-point transforms: wr/wi[(n2 · 3 + ka) · 5 + b].
+    var q = 0;
+    for n2 in 0..p {
+        for b in 0..5 {
+            let i0 = in_idx[q];
+            let i1 = in_idx[q + 1];
+            let i2 = in_idx[q + 2];
+            q = q + 3;
+            let x0r = re[i0];
+            let x0i = im[i0];
+            let sr = re[i1] + re[i2];
+            let si = im[i1] + im[i2];
+            let dr = S3 * (re[i1] - re[i2]);
+            let di = S3 * (im[i1] - im[i2]);
+            let mr = x0r - 0.5 * sr;
+            let mi = x0i - 0.5 * si;
+            let o = n2 * 15 + b;
+            wr[o] = x0r + sr;
+            wi[o] = x0i + si;
+            wr[o + 5] = mr + di;
+            wi[o + 5] = mi - dr;
+            wr[o + 10] = mr - di;
+            wi[o + 10] = mi + dr;
+        }
+    }
+    // 5-point transforms, into the rows of the p-point stage.
+    let mid_idx = f.mid_idx;
+    var o = 0;
+    while (o < 15 * p) {
+        let x0r = wr[o];
+        let x0i = wi[o];
+        let a1r = wr[o + 1] + wr[o + 4];
+        let a1i = wi[o + 1] + wi[o + 4];
+        let b1r = wr[o + 1] - wr[o + 4];
+        let b1i = wi[o + 1] - wi[o + 4];
+        let a2r = wr[o + 2] + wr[o + 3];
+        let a2i = wi[o + 2] + wi[o + 3];
+        let b2r = wr[o + 2] - wr[o + 3];
+        let b2i = wi[o + 2] - wi[o + 3];
+        let m1r = x0r + C51 * a1r + C52 * a2r;
+        let m1i = x0i + C51 * a1i + C52 * a2i;
+        let m2r = x0r + C52 * a1r + C51 * a2r;
+        let m2i = x0i + C52 * a1i + C51 * a2i;
+        // v1 = s1 b1 + s2 b2, v2 = s2 b1 - s1 b2; -i·v = (v.i, -v.r).
+        let v1r = S51 * b1r + S52 * b2r;
+        let v1i = S51 * b1i + S52 * b2i;
+        let v2r = S52 * b1r - S51 * b2r;
+        let v2i = S52 * b1i - S51 * b2i;
+        var k = mid_idx[o];
+        ar[k] = x0r + a1r + a2r;
+        ai[k] = x0i + a1i + a2i;
+        k = mid_idx[o + 1];
+        ar[k] = m1r + v1i;
+        ai[k] = m1i - v1r;
+        k = mid_idx[o + 2];
+        ar[k] = m2r + v2i;
+        ai[k] = m2i - v2r;
+        k = mid_idx[o + 3];
+        ar[k] = m2r - v2i;
+        ai[k] = m2i + v2r;
+        k = mid_idx[o + 4];
+        ar[k] = m1r - v1i;
+        ai[k] = m1i + v1r;
+        o = o + 5;
+    }
+    // Radix-2 transforms of p points on each row (inputs already bit-reversed), the first two
+    // stages at once: their twiddles are 1 and -i.
+    let cp = f.cp;
+    let sp = f.sp;
+    for k1 in 0..15 {
+        let base = k1 * p;
+        var i = base;
+        while (i < base + p) {
+            let s0r = ar[i] + ar[i + 1];
+            let s0i = ai[i] + ai[i + 1];
+            let d0r = ar[i] - ar[i + 1];
+            let d0i = ai[i] - ai[i + 1];
+            let s1r = ar[i + 2] + ar[i + 3];
+            let s1i = ai[i + 2] + ai[i + 3];
+            let d1r = ar[i + 2] - ar[i + 3];
+            let d1i = ai[i + 2] - ai[i + 3];
+            ar[i] = s0r + s1r;
+            ai[i] = s0i + s1i;
+            ar[i + 2] = s0r - s1r;
+            ai[i + 2] = s0i - s1i;
+            ar[i + 1] = d0r + d1i;
+            ai[i + 1] = d0i - d1r;
+            ar[i + 3] = d0r - d1i;
+            ai[i + 3] = d0i + d1r;
+            i = i + 4;
+        }
+        var len = 8;
+        while (len <= p) {
+            let half = len / 2;
+            let step = p / len;
+            for qq in 0..half {
+                let wc = cp[qq * step];
+                let ws = sp[qq * step];
+                var j = base + qq;
+                while (j < base + p) {
+                    let kk = j + half;
+                    let br = ar[kk] * wc - ai[kk] * ws;
+                    let bi = ar[kk] * ws + ai[kk] * wc;
+                    ar[kk] = ar[j] - br;
+                    ai[kk] = ai[j] - bi;
+                    ar[j] = ar[j] + br;
+                    ai[j] = ai[j] + bi;
+                    j = j + len;
+                }
+            }
+            len = len * 2;
+        }
+    }
+    // The result is in `ar`/`ai`, output n at index `out_idx[n]` of the transform.
+}
+
+/// The decoder of one stream (its state carries from frame to frame).
+pub struct Celt {
+    /// Output channels.
+    channels: int,
+    /// The bands coded: 17 on in hybrid frames, the end from the bandwidth.
+    start: int,
+    end: int,
+    rng: int,
+    postfilter_period: int,
+    postfilter_period_old: int,
+    postfilter_gain: float,
+    postfilter_gain_old: float,
+    postfilter_tapset: int,
+    postfilter_tapset_old: int,
+    preemph_mem: [float],
+    /// Per channel: the synthesized signal, BUFFER samples of history plus the overlap.
+    mem: [[float]],
+    old_band_e: [float],
+    old_log_e: [float],
+    old_log_e2: [float],
+    /// The PVQ codeword counts U(n, k), PVQ_W per row.
+    pvq: [int],
+    /// Per transform size (1920 >> shift): the FFT and the twiddles.
+    ffts: [Fft],
+    trig: [[float]],
+    // Work buffers for one frame.
+    x: [float],
+    freq: [float],
+    norm: [float],
+    iy: [int],
+    tmp: [float],
+}
+
+/// A decoder for `channels` output channels (1 or 2).
+pub fn new(channels: int) -> Celt {
+    var pvq = ints(15 * PVQ_W, 0);
+    let cap = 1 << 40;
+    for n in 0..15 {
+        for k in 0..PVQ_W {
+            var v = 0;
+            if (n == 0) {
+                v = if (k == 0) { 1 } else { 0 };
+            } else if (k > 0) {
+                v = pvq[(n - 1) * PVQ_W + k] + pvq[n * PVQ_W + k - 1] + pvq[(n - 1) * PVQ_W + k - 1];
+                if (v > cap) {
+                    v = cap;
+                }
+            }
+            pvq[n * PVQ_W + k] = v;
+        }
+    }
+    var ffts: [Fft] = [];
+    var trig: [[float]] = [];
+    for shift in 0..MAX_LM + 1 {
+        let n = 1920 >> shift;
+        ffts.push(fft_of(n / 4));
+        var tr: [float] = [];
+        for i in 0..n / 2 {
+            tr.push(math.cos(2.0 * math.PI * ((i as float) + 0.125) / (n as float)));
+        }
+        trig.push(tr);
+    }
+    var mem: [[float]] = [];
+    for _ in 0..2 {
+        mem.push(floats(BUFFER + OVERLAP));
+    }
+    let st = Celt {
+        channels: channels,
+        start: 0,
+        end: NB_EBANDS,
+        rng: 0,
+        postfilter_period: 0,
+        postfilter_period_old: 0,
+        postfilter_gain: 0.0,
+        postfilter_gain_old: 0.0,
+        postfilter_tapset: 0,
+        postfilter_tapset_old: 0,
+        preemph_mem: floats(2),
+        mem: mem,
+        old_band_e: floats(2 * NB_EBANDS),
+        old_log_e: floats(2 * NB_EBANDS),
+        old_log_e2: floats(2 * NB_EBANDS),
+        pvq: pvq,
+        ffts: ffts,
+        trig: trig,
+        x: floats(2 * 960),
+        freq: floats(960),
+        norm: floats(2 * 960),
+        iy: ints(176, 0),
+        tmp: floats(960)
+    };
+    reset(st);
+    st
+}
+
+/// Back to the state of a new decoder (libopus' OPUS_RESET_STATE).
+pub fn reset(st: Celt) -> unit {
+    st.rng = 0;
+    st.postfilter_period = 0;
+    st.postfilter_period_old = 0;
+    st.postfilter_gain = 0.0;
+    st.postfilter_gain_old = 0.0;
+    st.postfilter_tapset = 0;
+    st.postfilter_tapset_old = 0;
+    st.preemph_mem[0] = 0.0;
+    st.preemph_mem[1] = 0.0;
+    for c in 0..2 {
+        let m = st.mem[c];
+        for i in 0..BUFFER + OVERLAP {
+            m[i] = 0.0;
+        }
+    }
+    for i in 0..2 * NB_EBANDS {
+        st.old_band_e[i] = 0.0;
+        st.old_log_e[i] = -28.0;
+        st.old_log_e2[i] = -28.0;
+    }
+}
+
+fn imin(a: int, b: int) -> int {
+    if (a < b) { a } else { b }
+}
+
+fn imax(a: int, b: int) -> int {
+    if (a > b) { a } else { b }
+}
+
+fn fmax(a: float, b: float) -> float {
+    if (a > b) { a } else { b }
+}
+
+fn fmin(a: float, b: float) -> float {
+    if (a < b) { a } else { b }
+}
+
+/// C's signed division (towards zero), as celt_sudiv.
+fn sudiv(n: int, d: int) -> int {
+    n / d
+}
+
+fn exp2(x: float) -> float {
+    math.exp(0.6931471805599453 * x)
+}
+
+// ---- Energy
+
+fn laplace_decode(d: rd.Dec, fs0: int, decay: int) -> int {
+    var val = 0;
+    var fl = 0;
+    var fs = fs0;
+    let fm = rd.decode_bin(d, 15);
+    if (fm >= fs) {
+        val = val + 1;
+        fl = fs;
+        let ft = 32768 - 2 * 16 - fs;
+        fs = ((ft * (16384 - decay)) >> 15) + 1;
+        while (fs > 1 && fm >= fl + 2 * fs) {
+            fs = fs * 2;
+            fl = fl + fs;
+            fs = (((fs - 2) * decay) >> 15) + 1;
+            val = val + 1;
+        }
+        if (fs <= 1) {
+            let di = (fm - fl) >> 1;
+            val = val + di;
+            fl = fl + 2 * di;
+        }
+        if (fm < fl + fs) {
+            val = -val;
+        } else {
+            fl = fl + fs;
+        }
+    }
+    rd.update(d, fl, imin(fl + fs, 32768), 32768);
+    val
+}
+
+fn unquant_coarse_energy(
+    st: Celt,
+    d: rd.Dec,
+    start: int,
+    end: int,
+    intra: bool,
+    c_count: int,
+    lm: int
+) -> unit {
+    let base = lm * 84 + if (intra) { 42 } else { 0 };
+    var prev = [0.0, 0.0];
+    let coef = if (intra) { 0.0 } else { PRED_COEF[lm] };
+    let beta = if (intra) { BETA_INTRA } else { BETA_COEF[lm] };
+    let budget = d.storage * 8;
+    let old = st.old_band_e;
+    for i in start..end {
+        for c in 0..c_count {
+            let tell = rd.tell(d);
+            var qi = 0;
+            if (budget - tell >= 15) {
+                let pi = 2 * imin(i, 20);
+                qi = laplace_decode(
+                    d,
+                    t.E_PROB_MODEL[base + pi] << 7,
+                    t.E_PROB_MODEL[base + pi + 1] << 6
+                );
+            } else if (budget - tell >= 2) {
+                qi = rd.icdf(d, SMALL_ENERGY_ICDF, 2);
+                qi = (qi >> 1) ^ (0 - (qi & 1));
+            } else if (budget - tell >= 1) {
+                qi = 0 - rd.bit_logp(d, 1);
+            } else {
+                qi = -1;
+            }
+            let q = qi as float;
+            let k = i + c * NB_EBANDS;
+            old[k] = fmax(-9.0, old[k]);
+            let tmp = coef * old[k] + prev[c] + q;
+            old[k] = tmp;
+            prev[c] = prev[c] + q - beta * q;
+        }
+    }
+}
+
+fn unquant_fine_energy(
+    st: Celt,
+    d: rd.Dec,
+    start: int,
+    end: int,
+    fine_quant: [int],
+    c_count: int
+) -> unit {
+    let old = st.old_band_e;
+    for i in start..end {
+        if (fine_quant[i] <= 0) {
+            continue;
+        }
+        for c in 0..c_count {
+            let q2 = rd.bits(d, fine_quant[i]);
+            let offset = ((q2 as float) + 0.5) * ((1 << (14 - fine_quant[i])) as float) * (1.0 / 16384.0) - 0.5;
+            old[i + c * NB_EBANDS] = old[i + c * NB_EBANDS] + offset;
+        }
+    }
+}
+
+fn unquant_energy_finalise(
+    st: Celt,
+    d: rd.Dec,
+    start: int,
+    end: int,
+    fine_quant: [int],
+    fine_priority: [int],
+    bits_left0: int,
+    c_count: int
+) -> unit {
+    let old = st.old_band_e;
+    var bits_left = bits_left0;
+    for prio in 0..2 {
+        var i = start;
+        while (i < end && bits_left >= c_count) {
+            if (fine_quant[i] < MAX_FINE_BITS && fine_priority[i] == prio) {
+                for c in 0..c_count {
+                    let q2 = rd.bits(d, 1);
+                    let offset = ((q2 as float) - 0.5) * ((1 << (14 - fine_quant[i] - 1)) as float) * (1.0 / 16384.0);
+                    old[i + c * NB_EBANDS] = old[i + c * NB_EBANDS] + offset;
+                    bits_left = bits_left - 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// ---- Bit allocation
+
+fn init_caps(cap: [int], lm: int, c_count: int) -> unit {
+    for i in 0..NB_EBANDS {
+        let n = (t.EBANDS[i + 1] - t.EBANDS[i]) << lm;
+        cap[i] = ((t.CACHE_CAPS[NB_EBANDS * (2 * lm + c_count - 1) + i] + 64) * c_count * n) >> 2;
+    }
+}
+
+/// The results of the allocation besides the per-band bits.
+struct Alloc {
+    coded_bands: int,
+    balance: int,
+    intensity: int,
+    dual_stereo: bool,
+}
+
+fn interp_bits2pulses(
+    d: rd.Dec,
+    start: int,
+    end: int,
+    skip_start: int,
+    bits1: [int],
+    bits2: [int],
+    thresh: [int],
+    cap: [int],
+    total0: int,
+    skip_rsv: int,
+    intensity_rsv0: int,
+    dual_stereo_rsv0: int,
+    bits: [int],
+    ebits: [int],
+    fine_priority: [int],
+    c_count: int,
+    lm: int
+) -> Alloc {
+    var total = total0;
+    var intensity_rsv = intensity_rsv0;
+    var dual_stereo_rsv = dual_stereo_rsv0;
+    let alloc_floor = c_count << BITRES;
+    let stereo = if (c_count > 1) { 1 } else { 0 };
+    let log_m = lm << BITRES;
+    var lo = 0;
+    var hi = 1 << ALLOC_STEPS;
+    for _ in 0..ALLOC_STEPS {
+        let mid = (lo + hi) >> 1;
+        var psum = 0;
+        var done = false;
+        var j = end - 1;
+        while (j >= start) {
+            let tmp = bits1[j] + ((mid * bits2[j]) >> ALLOC_STEPS);
+            if (tmp >= thresh[j] || done) {
+                done = true;
+                psum = psum + imin(tmp, cap[j]);
+            } else if (tmp >= alloc_floor) {
+                psum = psum + alloc_floor;
+            }
+            j = j - 1;
+        }
+        if (psum > total) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    var psum = 0;
+    var done = false;
+    var j = end - 1;
+    while (j >= start) {
+        var tmp = bits1[j] + ((lo * bits2[j]) >> ALLOC_STEPS);
+        if (tmp < thresh[j] && !done) {
+            tmp = if (tmp >= alloc_floor) { alloc_floor } else { 0 };
+        } else {
+            done = true;
+        }
+        tmp = imin(tmp, cap[j]);
+        bits[j] = tmp;
+        psum = psum + tmp;
+        j = j - 1;
+    }
+    var coded_bands = end;
+    while (true) {
+        let jj = coded_bands - 1;
+        if (jj <= skip_start) {
+            total = total + skip_rsv;
+            break;
+        }
+        var left = total - psum;
+        let percoeff = left / (t.EBANDS[coded_bands] - t.EBANDS[start]);
+        left = left - (t.EBANDS[coded_bands] - t.EBANDS[start]) * percoeff;
+        let rem = imax(left - (t.EBANDS[jj] - t.EBANDS[start]), 0);
+        let band_width = t.EBANDS[coded_bands] - t.EBANDS[jj];
+        var band_bits = bits[jj] + percoeff * band_width + rem;
+        if (band_bits >= imax(thresh[jj], alloc_floor + (1 << BITRES))) {
+            if (rd.bit_logp(d, 1) == 1) {
+                break;
+            }
+            psum = psum + (1 << BITRES);
+            band_bits = band_bits - (1 << BITRES);
+        }
+        psum = psum - (bits[jj] + intensity_rsv);
+        if (intensity_rsv > 0) {
+            intensity_rsv = LOG2_FRAC[jj - start];
+        }
+        psum = psum + intensity_rsv;
+        if (band_bits >= alloc_floor) {
+            psum = psum + alloc_floor;
+            bits[jj] = alloc_floor;
+        } else {
+            bits[jj] = 0;
+        }
+        coded_bands = coded_bands - 1;
+    }
+    var intensity = 0;
+    if (intensity_rsv > 0) {
+        intensity = start + rd.uint(d, coded_bands + 1 - start);
+    }
+    if (intensity <= start) {
+        total = total + dual_stereo_rsv;
+        dual_stereo_rsv = 0;
+    }
+    var dual_stereo = false;
+    if (dual_stereo_rsv > 0) {
+        dual_stereo = rd.bit_logp(d, 1) == 1;
+    }
+    var left = total - psum;
+    let percoeff = left / (t.EBANDS[coded_bands] - t.EBANDS[start]);
+    left = left - (t.EBANDS[coded_bands] - t.EBANDS[start]) * percoeff;
+    for jj in start..coded_bands {
+        bits[jj] = bits[jj] + percoeff * (t.EBANDS[jj + 1] - t.EBANDS[jj]);
+    }
+    for jj in start..coded_bands {
+        let tmp = imin(left, t.EBANDS[jj + 1] - t.EBANDS[jj]);
+        bits[jj] = bits[jj] + tmp;
+        left = left - tmp;
+    }
+    var balance = 0;
+    var jj = start;
+    while (jj < coded_bands) {
+        let n0 = t.EBANDS[jj + 1] - t.EBANDS[jj];
+        let n = n0 << lm;
+        let bit = bits[jj] + balance;
+        var excess = 0;
+        if (n > 1) {
+            excess = imax(bit - cap[jj], 0);
+            bits[jj] = bit - excess;
+            let den = c_count * n + if (c_count == 2 && n > 2 && !dual_stereo && jj < intensity) {
+                1
+            } else {
+                0
+            };
+            let nclogn = den * (t.LOG_N[jj] + log_m);
+            var offset = (nclogn >> 1) - den * FINE_OFFSET;
+            if (n == 2) {
+                offset = offset + ((den << BITRES) >> 2);
+            }
+            if (bits[jj] + offset < (den * 2) << BITRES) {
+                offset = offset + (nclogn >> 2);
+            } else if (bits[jj] + offset < (den * 3) << BITRES) {
+                offset = offset + (nclogn >> 3);
+            }
+            var e = imax(0, bits[jj] + offset + (den << (BITRES - 1)));
+            e = (e / den) >> BITRES;
+            if (c_count * e > (bits[jj] >> BITRES)) {
+                e = (bits[jj] >> stereo) >> BITRES;
+            }
+            e = imin(e, MAX_FINE_BITS);
+            ebits[jj] = e;
+            fine_priority[jj] = if (e * (den << BITRES) >= bits[jj] + offset) { 1 } else { 0 };
+            bits[jj] = bits[jj] - ((c_count * e) << BITRES);
+        } else {
+            excess = imax(0, bit - (c_count << BITRES));
+            bits[jj] = bit - excess;
+            ebits[jj] = 0;
+            fine_priority[jj] = 1;
+        }
+        if (excess > 0) {
+            let extra_fine = imin(excess >> (stereo + BITRES), MAX_FINE_BITS - ebits[jj]);
+            ebits[jj] = ebits[jj] + extra_fine;
+            let extra_bits = (extra_fine * c_count) << BITRES;
+            fine_priority[jj] = if (extra_bits >= excess - balance) { 1 } else { 0 };
+            excess = excess - extra_bits;
+        }
+        balance = excess;
+        jj = jj + 1;
+    }
+    while (jj < end) {
+        ebits[jj] = (bits[jj] >> stereo) >> BITRES;
+        bits[jj] = 0;
+        fine_priority[jj] = if (ebits[jj] < 1) { 1 } else { 0 };
+        jj = jj + 1;
+    }
+    Alloc {
+        coded_bands: coded_bands,
+        balance: balance,
+        intensity: intensity,
+        dual_stereo: dual_stereo
+    }
+}
+
+fn compute_allocation(
+    d: rd.Dec,
+    start: int,
+    end: int,
+    offsets: [int],
+    cap: [int],
+    alloc_trim: int,
+    total0: int,
+    pulses: [int],
+    ebits: [int],
+    fine_priority: [int],
+    c_count: int,
+    lm: int
+) -> Alloc {
+    var total = imax(total0, 0);
+    var skip_start = start;
+    let skip_rsv = if (total >= 1 << BITRES) { 1 << BITRES } else { 0 };
+    total = total - skip_rsv;
+    var intensity_rsv = 0;
+    var dual_stereo_rsv = 0;
+    if (c_count == 2) {
+        intensity_rsv = LOG2_FRAC[end - start];
+        if (intensity_rsv > total) {
+            intensity_rsv = 0;
+        } else {
+            total = total - intensity_rsv;
+            dual_stereo_rsv = if (total >= 1 << BITRES) { 1 << BITRES } else { 0 };
+            total = total - dual_stereo_rsv;
+        }
+    }
+    let bits1 = ints(NB_EBANDS, 0);
+    let bits2 = ints(NB_EBANDS, 0);
+    let thresh = ints(NB_EBANDS, 0);
+    let trim_offset = ints(NB_EBANDS, 0);
+    for j in start..end {
+        let w = t.EBANDS[j + 1] - t.EBANDS[j];
+        thresh[j] = imax(c_count << BITRES, ((3 * w) << lm << BITRES) >> 4);
+        trim_offset[j] = (c_count * w * (alloc_trim - 5 - lm) * (end - j - 1) * (1 << (lm + BITRES))) >> 6;
+        if (w << lm == 1) {
+            trim_offset[j] = trim_offset[j] - (c_count << BITRES);
+        }
+    }
+    var lo = 1;
+    var hi = 11 - 1;
+    while (lo <= hi) {
+        var done = false;
+        var psum = 0;
+        let mid = (lo + hi) >> 1;
+        var j = end - 1;
+        while (j >= start) {
+            let n = t.EBANDS[j + 1] - t.EBANDS[j];
+            var bitsj = (c_count * n * t.BAND_ALLOCATION[mid * NB_EBANDS + j] << lm) >> 2;
+            if (bitsj > 0) {
+                bitsj = imax(0, bitsj + trim_offset[j]);
+            }
+            bitsj = bitsj + offsets[j];
+            if (bitsj >= thresh[j] || done) {
+                done = true;
+                psum = psum + imin(bitsj, cap[j]);
+            } else if (bitsj >= c_count << BITRES) {
+                psum = psum + (c_count << BITRES);
+            }
+            j = j - 1;
+        }
+        if (psum > total) {
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    hi = lo;
+    lo = lo - 1;
+    for j in start..end {
+        let n = t.EBANDS[j + 1] - t.EBANDS[j];
+        var bits1j = (c_count * n * t.BAND_ALLOCATION[lo * NB_EBANDS + j] << lm) >> 2;
+        var bits2j = if (hi >= 11) {
+            cap[j]
+        } else {
+            (c_count * n * t.BAND_ALLOCATION[hi * NB_EBANDS + j] << lm) >> 2
+        };
+        if (bits1j > 0) {
+            bits1j = imax(0, bits1j + trim_offset[j]);
+        }
+        if (bits2j > 0) {
+            bits2j = imax(0, bits2j + trim_offset[j]);
+        }
+        if (lo > 0) {
+            bits1j = bits1j + offsets[j];
+        }
+        bits2j = bits2j + offsets[j];
+        if (offsets[j] > 0) {
+            skip_start = j;
+        }
+        bits2j = imax(0, bits2j - bits1j);
+        bits1[j] = bits1j;
+        bits2[j] = bits2j;
+    }
+    interp_bits2pulses(
+        d,
+        start,
+        end,
+        skip_start,
+        bits1,
+        bits2,
+        thresh,
+        cap,
+        total,
+        skip_rsv,
+        intensity_rsv,
+        dual_stereo_rsv,
+        pulses,
+        ebits,
+        fine_priority,
+        c_count,
+        lm
+    )
+}
+
+fn cache_at(band: int, lm: int) -> int {
+    t.CACHE_INDEX[(lm + 1) * NB_EBANDS + band]
+}
+
+fn bits2pulses(band: int, lm: int, bits0: int) -> int {
+    let c = cache_at(band, lm);
+    var lo = 0;
+    var hi = t.CACHE_BITS[c];
+    let bits = bits0 - 1;
+    for _ in 0..LOG_MAX_PSEUDO {
+        let mid = (lo + hi + 1) >> 1;
+        if (t.CACHE_BITS[c + mid] >= bits) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let below = if (lo == 0) { -1 } else { t.CACHE_BITS[c + lo] };
+    if (bits - below <= t.CACHE_BITS[c + hi] - bits) { lo } else { hi }
+}
+
+fn pulses2bits(band: int, lm: int, pulses: int) -> int {
+    if (pulses == 0) { 0 } else { t.CACHE_BITS[cache_at(band, lm) + pulses] + 1 }
+}
+
+fn get_pulses(i: int) -> int {
+    if (i < 8) { i } else { (8 + (i & 7)) << ((i >> 3) - 1) }
+}
+
+// ---- Band shapes (PVQ)
+
+fn lcg(seed: int) -> int {
+    (1664525 * seed + 1013904223) & 0xFFFFFFFF
+}
+
+fn frac_mul16(a: int, b: int) -> int {
+    (16384 + a * b) >> 15
+}
+
+fn bitexact_cos(x: int) -> int {
+    let tmp = (4096 + x * x) >> 13;
+    let x2 = tmp;
+    let r = (32767 - x2) + frac_mul16(x2, -7651 + frac_mul16(x2, 8277 + frac_mul16(-626, x2)));
+    1 + r
+}
+
+fn bitexact_log2tan(isin0: int, icos0: int) -> int {
+    let lc = rd.ilog(icos0);
+    let ls = rd.ilog(isin0);
+    let icos = icos0 << (15 - lc);
+    let isin = isin0 << (15 - ls);
+    (ls - lc) * (1 << 11) + frac_mul16(
+        isin,
+        frac_mul16(isin, -2597) + 7932
+    ) - frac_mul16(icos, frac_mul16(icos, -2597) + 7932)
+}
+
+fn isqrt32(v: int) -> int {
+    var r = math.sqrt(v as float) as int;
+    while (r * r > v) {
+        r = r - 1;
+    }
+    while ((r + 1) * (r + 1) <= v) {
+        r = r + 1;
+    }
+    r
+}
+
+fn pvq_u(st: Celt, n: int, k: int) -> int {
+    let a = imin(n, k);
+    let b = imax(n, k);
+    st.pvq[a * PVQ_W + b]
+}
+
+/// Decodes the pulses of a band of `n` with `k` pulses into `st.iy`; returns their energy.
+fn decode_pulses(st: Celt, d: rd.Dec, n0: int, k0: int) -> float {
+    let v = pvq_u(st, n0, k0) + pvq_u(st, n0, k0 + 1);
+    var i = rd.uint(d, v);
+    let y = st.iy;
+    let u = st.pvq;
+    var n = n0;
+    var k = k0;
+    var yy = 0;
+    var at = 0;
+    while (n > 2) {
+        if (k >= n) {
+            let row = n * PVQ_W;
+            var p = u[row + k + 1];
+            let s = if (i >= p) { -1 } else { 0 };
+            i = i - (p & s);
+            let kk = k;
+            let q = u[row + n];
+            if (q > i) {
+                k = n;
+                var go = true;
+                while (go) {
+                    k = k - 1;
+                    p = u[k * PVQ_W + n];
+                    go = p > i;
+                }
+            } else {
+                p = u[row + k];
+                while (p > i) {
+                    k = k - 1;
+                    p = u[row + k];
+                }
+            }
+            i = i - p;
+            let val = (kk - k + s) ^ s;
+            y[at] = val;
+            yy = yy + val * val;
+        } else {
+            var p = u[k * PVQ_W + n];
+            let q = u[(k + 1) * PVQ_W + n];
+            if (p <= i && i < q) {
+                i = i - p;
+                y[at] = 0;
+            } else {
+                let s = if (i >= q) { -1 } else { 0 };
+                i = i - (q & s);
+                let kk = k;
+                var go = true;
+                while (go) {
+                    k = k - 1;
+                    p = u[k * PVQ_W + n];
+                    go = p > i;
+                }
+                i = i - p;
+                let val = (kk - k + s) ^ s;
+                y[at] = val;
+                yy = yy + val * val;
+            }
+        }
+        at = at + 1;
+        n = n - 1;
+    }
+    let p = 2 * k + 1;
+    let s = if (i >= p) { -1 } else { 0 };
+    i = i - (p & s);
+    let kk = k;
+    k = (i + 1) >> 1;
+    if (k != 0) {
+        i = i - (2 * k - 1);
+    }
+    var val = (kk - k + s) ^ s;
+    y[at] = val;
+    yy = yy + val * val;
+    at = at + 1;
+    let s2 = 0 - i;
+    val = (k + s2) ^ s2;
+    y[at] = val;
+    yy = yy + val * val;
+    yy as float
+}
+
+fn exp_rotation1(x: [float], xo: int, len: int, stride: int, c: float, s: float) -> unit {
+    let ms = -s;
+    var i = 0;
+    while (i < len - stride) {
+        let x1 = x[xo + i];
+        let x2 = x[xo + i + stride];
+        x[xo + i + stride] = c * x2 + s * x1;
+        x[xo + i] = c * x1 + ms * x2;
+        i = i + 1;
+    }
+    i = len - 2 * stride - 1;
+    while (i >= 0) {
+        let x1 = x[xo + i];
+        let x2 = x[xo + i + stride];
+        x[xo + i + stride] = c * x2 + s * x1;
+        x[xo + i] = c * x1 + ms * x2;
+        i = i - 1;
+    }
+}
+
+fn exp_rotation(
+    x: [float],
+    xo: int,
+    len0: int,
+    dir: int,
+    stride: int,
+    k: int,
+    spread: int
+) -> unit {
+    if (2 * k >= len0 || spread == SPREAD_NONE) {
+        return;
+    }
+    let factor = SPREAD_FACTOR[spread - 1];
+    let gain = (len0 as float) / ((len0 + factor * k) as float);
+    let theta = 0.5 * (gain * gain);
+    let c = math.cos(0.5 * math.PI * theta);
+    let s = math.cos(0.5 * math.PI * (1.0 - theta));
+    var stride2 = 0;
+    if (len0 >= 8 * stride) {
+        stride2 = 1;
+        while ((stride2 * stride2 + stride2) * stride + (stride >> 2) < len0) {
+            stride2 = stride2 + 1;
+        }
+    }
+    let len = len0 / stride;
+    for i in 0..stride {
+        if (dir < 0) {
+            if (stride2 != 0) {
+                exp_rotation1(x, xo + i * len, len, stride2, s, c);
+            }
+            exp_rotation1(x, xo + i * len, len, 1, c, s);
+        } else {
+            exp_rotation1(x, xo + i * len, len, 1, c, -s);
+            if (stride2 != 0) {
+                exp_rotation1(x, xo + i * len, len, stride2, s, -c);
+            }
+        }
+    }
+}
+
+fn renormalise_vector(x: [float], xo: int, n: int, gain: float) -> unit {
+    var e = 1e-15;
+    for i in 0..n {
+        e = e + x[xo + i] * x[xo + i];
+    }
+    let g = (1.0 / math.sqrt(e)) * gain;
+    for i in 0..n {
+        x[xo + i] = g * x[xo + i];
+    }
+}
+
+fn alg_unquant(
+    st: Celt,
+    d: rd.Dec,
+    x: [float],
+    xo: int,
+    n: int,
+    k: int,
+    spread: int,
+    b: int,
+    gain: float
+) -> int {
+    let ryy = decode_pulses(st, d, n, k);
+    let iy = st.iy;
+    let g = (1.0 / math.sqrt(ryy)) * gain;
+    for i in 0..n {
+        x[xo + i] = g * (iy[i] as float);
+    }
+    exp_rotation(x, xo, n, -1, b, k, spread);
+    if (b <= 1) {
+        return 1;
+    }
+    let n0 = n / b;
+    var mask = 0;
+    for i in 0..b {
+        var any = 0;
+        for j in 0..n0 {
+            any = any | iy[i * n0 + j];
+        }
+        if (any != 0) {
+            mask = mask | (1 << i);
+        }
+    }
+    mask
+}
+
+fn haar1(x: [float], xo: int, n0: int, stride: int) -> unit {
+    let n = n0 >> 1;
+    for i in 0..stride {
+        for j in 0..n {
+            let a = xo + stride * 2 * j + i;
+            let b = xo + stride * (2 * j + 1) + i;
+            let tmp1 = SQRT_HALF * x[a];
+            let tmp2 = SQRT_HALF * x[b];
+            x[a] = tmp1 + tmp2;
+            x[b] = tmp1 - tmp2;
+        }
+    }
+}
+
+fn deinterleave_hadamard(
+    st: Celt,
+    x: [float],
+    xo: int,
+    n0: int,
+    stride: int,
+    hadamard: bool
+) -> unit {
+    let n = n0 * stride;
+    let tmp = st.tmp;
+    if (hadamard) {
+        let ord = stride - 2;
+        for i in 0..stride {
+            for j in 0..n0 {
+                tmp[ORDERY[ord + i] * n0 + j] = x[xo + j * stride + i];
+            }
+        }
+    } else {
+        for i in 0..stride {
+            for j in 0..n0 {
+                tmp[i * n0 + j] = x[xo + j * stride + i];
+            }
+        }
+    }
+    for i in 0..n {
+        x[xo + i] = tmp[i];
+    }
+}
+
+fn interleave_hadamard(
+    st: Celt,
+    x: [float],
+    xo: int,
+    n0: int,
+    stride: int,
+    hadamard: bool
+) -> unit {
+    let n = n0 * stride;
+    let tmp = st.tmp;
+    if (hadamard) {
+        let ord = stride - 2;
+        for i in 0..stride {
+            for j in 0..n0 {
+                tmp[j * stride + i] = x[xo + ORDERY[ord + i] * n0 + j];
+            }
+        }
+    } else {
+        for i in 0..stride {
+            for j in 0..n0 {
+                tmp[j * stride + i] = x[xo + i * n0 + j];
+            }
+        }
+    }
+    for i in 0..n {
+        x[xo + i] = tmp[i];
+    }
+}
+
+fn compute_qn(n: int, b: int, offset: int, pulse_cap: int, stereo: bool) -> int {
+    var n2 = 2 * n - 1;
+    if (stereo && n == 2) {
+        n2 = n2 - 1;
+    }
+    var qb = sudiv(b + n2 * offset, n2);
+    qb = imin(b - pulse_cap - (4 << BITRES), qb);
+    qb = imin(8 << BITRES, qb);
+    if (qb < ((1 << BITRES) >> 1)) {
+        return 1;
+    }
+    let qn = EXP2_TABLE8[qb & 7] >> (14 - (qb >> BITRES));
+    ((qn + 1) >> 1) << 1
+}
+
+/// The state shared by the bands of a frame, and the outputs of `compute_theta`.
+struct Band {
+    d: rd.Dec,
+    i: int,
+    intensity: int,
+    spread: int,
+    tf_change: int,
+    remaining_bits: int,
+    seed: int,
+    disable_inv: bool,
+    avoid_split_noise: bool,
+    // compute_theta's results; `b` and `fill` are in and out.
+    b: int,
+    fill: int,
+    inv: bool,
+    imid: int,
+    iside: int,
+    delta: int,
+    itheta: int,
+    qalloc: int,
+}
+
+fn compute_theta(st: Celt, ctx: Band, n: int, bb: int, b0: int, lm: int, stereo: bool) -> unit {
+    let d = ctx.d;
+    let i = ctx.i;
+    let pulse_cap = t.LOG_N[i] + lm * (1 << BITRES);
+    let offset = (pulse_cap >> 1) - if (stereo && n == 2) {
+        QTHETA_OFFSET_TWOPHASE
+    } else {
+        QTHETA_OFFSET
+    };
+    var qn = compute_qn(n, ctx.b, offset, pulse_cap, stereo);
+    if (stereo && i >= ctx.intensity) {
+        qn = 1;
+    }
+    var itheta = 0;
+    var inv = false;
+    let tell = rd.tell_frac(d);
+    if (qn != 1) {
+        if (stereo && n > 2) {
+            let p0 = 3;
+            let x0 = qn / 2;
+            let ft = p0 * (x0 + 1) + x0;
+            let fs = rd.decode(d, ft);
+            let x = if (fs < (x0 + 1) * p0) { fs / p0 } else { x0 + 1 + (fs - (x0 + 1) * p0) };
+            let fl = if (x <= x0) { p0 * x } else { (x - 1 - x0) + (x0 + 1) * p0 };
+            let fh = if (x <= x0) { p0 * (x + 1) } else { (x - x0) + (x0 + 1) * p0 };
+            rd.update(d, fl, fh, ft);
+            itheta = x;
+        } else if (b0 > 1 || stereo) {
+            itheta = rd.uint(d, qn + 1);
+        } else {
+            let half = qn >> 1;
+            let ft = (half + 1) * (half + 1);
+            let fm = rd.decode(d, ft);
+            var fs = 1;
+            var fl = 0;
+            if (fm < ((half * (half + 1)) >> 1)) {
+                itheta = (isqrt32(8 * fm + 1) - 1) >> 1;
+                fs = itheta + 1;
+                fl = (itheta * (itheta + 1)) >> 1;
+            } else {
+                itheta = (2 * (qn + 1) - isqrt32(8 * (ft - fm - 1) + 1)) >> 1;
+                fs = qn + 1 - itheta;
+                fl = ft - (((qn + 1 - itheta) * (qn + 2 - itheta)) >> 1);
+            }
+            rd.update(d, fl, fl + fs, ft);
+        }
+        itheta = (itheta * 16384) / qn;
+    } else if (stereo) {
+        if (ctx.b > 2 << BITRES && ctx.remaining_bits > 2 << BITRES) {
+            inv = rd.bit_logp(d, 2) == 1;
+        }
+        if (ctx.disable_inv) {
+            inv = false;
+        }
+        itheta = 0;
+    }
+    let qalloc = rd.tell_frac(d) - tell;
+    ctx.b = ctx.b - qalloc;
+    var imid = 0;
+    var iside = 0;
+    var delta = 0;
+    if (itheta == 0) {
+        imid = 32767;
+        iside = 0;
+        ctx.fill = ctx.fill & ((1 << bb) - 1);
+        delta = -16384;
+    } else if (itheta == 16384) {
+        imid = 0;
+        iside = 32767;
+        ctx.fill = ctx.fill & (((1 << bb) - 1) << bb);
+        delta = 16384;
+    } else {
+        imid = bitexact_cos(itheta);
+        iside = bitexact_cos(16384 - itheta);
+        delta = frac_mul16((n - 1) << 7, bitexact_log2tan(iside, imid));
+    }
+    ctx.inv = inv;
+    ctx.imid = imid;
+    ctx.iside = iside;
+    ctx.delta = delta;
+    ctx.itheta = itheta;
+    ctx.qalloc = qalloc;
+}
+
+/// A band of one coefficient (per channel): just its sign.
+fn quant_band_n1(ctx: Band, x: [float], xo: int, yo: int, lowband_out: [float], lo: int) -> int {
+    var o = xo;
+    let count = if (yo >= 0) { 2 } else { 1 };
+    for c in 0..count {
+        var sign = 0;
+        if (ctx.remaining_bits >= 1 << BITRES) {
+            sign = rd.bits(ctx.d, 1);
+            ctx.remaining_bits = ctx.remaining_bits - (1 << BITRES);
+        }
+        x[o] = if (sign == 1) { -1.0 } else { 1.0 };
+        o = yo;
+    }
+    if (lo >= 0) {
+        lowband_out[lo] = x[xo];
+    }
+    1
+}
+
+fn quant_partition(
+    st: Celt,
+    ctx: Band,
+    x: [float],
+    xo: int,
+    n0: int,
+    b: int,
+    bb0: int,
+    lowband: [float],
+    lb: int,
+    lm0: int,
+    gain: float,
+    fill0: int
+) -> int {
+    let i = ctx.i;
+    var n = n0;
+    var lm = lm0;
+    var bb = bb0;
+    var fill = fill0;
+    let c = cache_at(i, lm);
+    var cm = 0;
+    if (lm != -1 && b > t.CACHE_BITS[c + t.CACHE_BITS[c]] + 12 && n > 2) {
+        n = n >> 1;
+        let yo = xo + n;
+        lm = lm - 1;
+        if (bb == 1) {
+            fill = (fill & 1) | (fill << 1);
+        }
+        bb = (bb + 1) >> 1;
+        ctx.b = b;
+        ctx.fill = fill;
+        compute_theta(st, ctx, n, bb, bb0, lm, false);
+        var bits = ctx.b;
+        fill = ctx.fill;
+        let imid = ctx.imid;
+        let iside = ctx.iside;
+        var delta = ctx.delta;
+        let itheta = ctx.itheta;
+        let qalloc = ctx.qalloc;
+        let mid = (1.0 / 32768.0) * (imid as float);
+        let side = (1.0 / 32768.0) * (iside as float);
+        if (bb0 > 1 && (itheta & 0x3FFF) != 0) {
+            if (itheta > 8192) {
+                delta = delta - (delta >> (4 - lm));
+            } else {
+                delta = imin(0, delta + ((n << BITRES) >> (5 - lm)));
+            }
+        }
+        var mbits = imax(0, imin(bits, (bits - delta) / 2));
+        var sbits = bits - mbits;
+        ctx.remaining_bits = ctx.remaining_bits - qalloc;
+        let lb2 = if (lb >= 0) { lb + n } else { -1 };
+        var rebalance = ctx.remaining_bits;
+        if (mbits >= sbits) {
+            cm = quant_partition(st, ctx, x, xo, n, mbits, bb, lowband, lb, lm, gain * mid, fill);
+            rebalance = mbits - (rebalance - ctx.remaining_bits);
+            if (rebalance > 3 << BITRES && itheta != 0) {
+                sbits = sbits + rebalance - (3 << BITRES);
+            }
+            cm = cm | (quant_partition(
+                st,
+                ctx,
+                x,
+                yo,
+                n,
+                sbits,
+                bb,
+                lowband,
+                lb2,
+                lm,
+                gain * side,
+                fill >> bb
+            ) << (bb0 >> 1));
+        } else {
+            cm = quant_partition(
+                st,
+                ctx,
+                x,
+                yo,
+                n,
+                sbits,
+                bb,
+                lowband,
+                lb2,
+                lm,
+                gain * side,
+                fill >> bb
+            ) << (bb0 >> 1);
+            rebalance = sbits - (rebalance - ctx.remaining_bits);
+            if (rebalance > 3 << BITRES && itheta != 16384) {
+                mbits = mbits + rebalance - (3 << BITRES);
+            }
+            cm = cm | quant_partition(
+                st,
+                ctx,
+                x,
+                xo,
+                n,
+                mbits,
+                bb,
+                lowband,
+                lb,
+                lm,
+                gain * mid,
+                fill
+            );
+        }
+        return cm;
+    }
+    var q = bits2pulses(i, lm, b);
+    var curr_bits = pulses2bits(i, lm, q);
+    ctx.remaining_bits = ctx.remaining_bits - curr_bits;
+    while (ctx.remaining_bits < 0 && q > 0) {
+        ctx.remaining_bits = ctx.remaining_bits + curr_bits;
+        q = q - 1;
+        curr_bits = pulses2bits(i, lm, q);
+        ctx.remaining_bits = ctx.remaining_bits - curr_bits;
+    }
+    if (q != 0) {
+        let k = get_pulses(q);
+        return alg_unquant(st, ctx.d, x, xo, n, k, ctx.spread, bb, gain);
+    }
+    let cm_mask = (1 << bb) - 1;
+    fill = fill & cm_mask;
+    if (fill == 0) {
+        for j in 0..n {
+            x[xo + j] = 0.0;
+        }
+        return 0;
+    }
+    if (lb < 0) {
+        for j in 0..n {
+            ctx.seed = lcg(ctx.seed);
+            // The seed as a signed 32-bit value, shifted down.
+            let s = if (ctx.seed >= 0x80000000) { ctx.seed - 0x100000000 } else { ctx.seed };
+            x[xo + j] = (s >> 20) as float;
+        }
+        cm = cm_mask;
+    } else {
+        for j in 0..n {
+            ctx.seed = lcg(ctx.seed);
+            let tmp = if ((ctx.seed & 0x8000) != 0) { 1.0 / 256.0 } else { -1.0 / 256.0 };
+            x[xo + j] = lowband[lb + j] + tmp;
+        }
+        cm = fill;
+    }
+    renormalise_vector(x, xo, n, gain);
+    cm
+}
+
+fn quant_band(
+    st: Celt,
+    ctx: Band,
+    x: [float],
+    xo: int,
+    n: int,
+    b: int,
+    bb0: int,
+    lowband0: [float],
+    lb0: int,
+    lm: int,
+    lowband_out: [float],
+    lo: int,
+    gain: float,
+    scratch: int,
+    fill0: int
+) -> int {
+    let n0 = n;
+    var n_b = n;
+    var bb = bb0;
+    var fill = fill0;
+    var time_divide = 0;
+    var recombine = 0;
+    let long_blocks = bb0 == 1;
+    var tf_change = ctx.tf_change;
+    n_b = n_b / bb;
+    if (n == 1) {
+        return quant_band_n1(ctx, x, xo, -1, lowband_out, lo);
+    }
+    if (tf_change > 0) {
+        recombine = tf_change;
+    }
+    var lowband = lowband0;
+    var lb = lb0;
+    if (scratch >= 0
+        && lb >= 0
+        && (recombine != 0 || ((n_b & 1) == 0 && tf_change < 0) || bb0 > 1)) {
+        // The scratch area is in `st.x`, the last band of the first channel.
+        let sx = st.x;
+        for j in 0..n {
+            sx[scratch + j] = lowband[lb + j];
+        }
+        lowband = sx;
+        lb = scratch;
+    }
+    for k in 0..recombine {
+        if (lb >= 0) {
+            haar1(lowband, lb, n >> k, 1 << k);
+        }
+        fill = BIT_INTERLEAVE[fill & 0xF] | (BIT_INTERLEAVE[fill >> 4] << 2);
+    }
+    bb = bb >> recombine;
+    n_b = n_b << recombine;
+    while ((n_b & 1) == 0 && tf_change < 0) {
+        if (lb >= 0) {
+            haar1(lowband, lb, n_b, bb);
+        }
+        fill = fill | (fill << bb);
+        bb = bb << 1;
+        n_b = n_b >> 1;
+        time_divide = time_divide + 1;
+        tf_change = tf_change + 1;
+    }
+    let b0 = bb;
+    let n_b0 = n_b;
+    if (b0 > 1 && lb >= 0) {
+        deinterleave_hadamard(st, lowband, lb, n_b >> recombine, b0 << recombine, long_blocks);
+    }
+    var cm = quant_partition(st, ctx, x, xo, n, b, bb, lowband, lb, lm, gain, fill);
+    if (b0 > 1) {
+        interleave_hadamard(st, x, xo, n_b >> recombine, b0 << recombine, long_blocks);
+    }
+    n_b = n_b0;
+    bb = b0;
+    for _ in 0..time_divide {
+        bb = bb >> 1;
+        n_b = n_b << 1;
+        cm = cm | (cm >> bb);
+        haar1(x, xo, n_b, bb);
+    }
+    for k in 0..recombine {
+        cm = BIT_DEINTERLEAVE[cm];
+        haar1(x, xo, n0 >> k, 1 << k);
+    }
+    bb = bb << recombine;
+    if (lo >= 0) {
+        let s = math.sqrt(n0 as float);
+        for j in 0..n0 {
+            lowband_out[lo + j] = s * x[xo + j];
+        }
+    }
+    cm & ((1 << bb) - 1)
+}
+
+fn stereo_merge(x: [float], xo: int, yo: int, mid: float, n: int) -> unit {
+    var xp = 0.0;
+    var side = 0.0;
+    for j in 0..n {
+        xp = xp + x[yo + j] * x[xo + j];
+        side = side + x[yo + j] * x[yo + j];
+    }
+    xp = mid * xp;
+    let mid2 = mid;
+    let el = mid2 * mid2 + side - 2.0 * xp;
+    let er = mid2 * mid2 + side + 2.0 * xp;
+    if (er < 0.0006 || el < 0.0006) {
+        for j in 0..n {
+            x[yo + j] = x[xo + j];
+        }
+        return;
+    }
+    let lgain = 1.0 / math.sqrt(el);
+    let rgain = 1.0 / math.sqrt(er);
+    for j in 0..n {
+        let l = mid * x[xo + j];
+        let r = x[yo + j];
+        x[xo + j] = lgain * (l - r);
+        x[yo + j] = rgain * (l + r);
+    }
+}
+
+fn quant_band_stereo(
+    st: Celt,
+    ctx: Band,
+    x: [float],
+    xo: int,
+    yo: int,
+    n: int,
+    b0: int,
+    bb: int,
+    lowband: [float],
+    lb: int,
+    lm: int,
+    lowband_out: [float],
+    lo: int,
+    scratch: int,
+    fill0: int
+) -> int {
+    if (n == 1) {
+        return quant_band_n1(ctx, x, xo, yo, lowband_out, lo);
+    }
+    let orig_fill = fill0;
+    ctx.b = b0;
+    ctx.fill = fill0;
+    compute_theta(st, ctx, n, bb, bb, lm, true);
+    let b = ctx.b;
+    let fill = ctx.fill;
+    let inv = ctx.inv;
+    let delta = ctx.delta;
+    let itheta = ctx.itheta;
+    let qalloc = ctx.qalloc;
+    let mid = (1.0 / 32768.0) * (ctx.imid as float);
+    let side = (1.0 / 32768.0) * (ctx.iside as float);
+    var cm = 0;
+    if (n == 2) {
+        var mbits = b;
+        var sbits = 0;
+        if (itheta != 0 && itheta != 16384) {
+            sbits = 1 << BITRES;
+        }
+        mbits = mbits - sbits;
+        let c = itheta > 8192;
+        ctx.remaining_bits = ctx.remaining_bits - (qalloc + sbits);
+        let x2 = if (c) { yo } else { xo };
+        let y2 = if (c) { xo } else { yo };
+        var sign = 0;
+        if (sbits != 0) {
+            sign = rd.bits(ctx.d, 1);
+        }
+        let sgn = (1 - 2 * sign) as float;
+        cm = quant_band(
+            st,
+            ctx,
+            x,
+            x2,
+            n,
+            mbits,
+            bb,
+            lowband,
+            lb,
+            lm,
+            lowband_out,
+            lo,
+            1.0,
+            scratch,
+            orig_fill
+        );
+        x[y2] = -sgn * x[x2 + 1];
+        x[y2 + 1] = sgn * x[x2];
+        x[xo] = mid * x[xo];
+        x[xo + 1] = mid * x[xo + 1];
+        x[yo] = side * x[yo];
+        x[yo + 1] = side * x[yo + 1];
+        var tmp = x[xo];
+        x[xo] = tmp - x[yo];
+        x[yo] = tmp + x[yo];
+        tmp = x[xo + 1];
+        x[xo + 1] = tmp - x[yo + 1];
+        x[yo + 1] = tmp + x[yo + 1];
+    } else {
+        var mbits = imax(0, imin(b, (b - delta) / 2));
+        var sbits = b - mbits;
+        ctx.remaining_bits = ctx.remaining_bits - qalloc;
+        var rebalance = ctx.remaining_bits;
+        if (mbits >= sbits) {
+            cm = quant_band(
+                st,
+                ctx,
+                x,
+                xo,
+                n,
+                mbits,
+                bb,
+                lowband,
+                lb,
+                lm,
+                lowband_out,
+                lo,
+                1.0,
+                scratch,
+                fill
+            );
+            rebalance = mbits - (rebalance - ctx.remaining_bits);
+            if (rebalance > 3 << BITRES && itheta != 0) {
+                sbits = sbits + rebalance - (3 << BITRES);
+            }
+            cm = cm | quant_band(
+                st,
+                ctx,
+                x,
+                yo,
+                n,
+                sbits,
+                bb,
+                lowband,
+                -1,
+                lm,
+                lowband_out,
+                -1,
+                side,
+                -1,
+                fill >> bb
+            );
+        } else {
+            cm = quant_band(
+                st,
+                ctx,
+                x,
+                yo,
+                n,
+                sbits,
+                bb,
+                lowband,
+                -1,
+                lm,
+                lowband_out,
+                -1,
+                side,
+                -1,
+                fill >> bb
+            );
+            rebalance = sbits - (rebalance - ctx.remaining_bits);
+            if (rebalance > 3 << BITRES && itheta != 16384) {
+                mbits = mbits + rebalance - (3 << BITRES);
+            }
+            cm = cm | quant_band(
+                st,
+                ctx,
+                x,
+                xo,
+                n,
+                mbits,
+                bb,
+                lowband,
+                lb,
+                lm,
+                lowband_out,
+                lo,
+                1.0,
+                scratch,
+                fill
+            );
+        }
+    }
+    if (n != 2) {
+        stereo_merge(x, xo, yo, mid, n);
+    }
+    if (inv) {
+        for j in 0..n {
+            x[yo + j] = -x[yo + j];
+        }
+    }
+    cm
+}
+
+fn quant_all_bands(
+    st: Celt,
+    d: rd.Dec,
+    start: int,
+    end: int,
+    c_count: int,
+    collapse: [int],
+    pulses: [int],
+    short_blocks: bool,
+    spread: int,
+    dual_stereo0: bool,
+    intensity: int,
+    tf_res: [int],
+    total_bits: int,
+    balance0: int,
+    lm: int,
+    coded_bands: int
+) -> unit {
+    let m = 1 << lm;
+    let bb = if (short_blocks) { m } else { 1 };
+    let n_frame = m * SHORT_MDCT;
+    let norm_offset = m * t.EBANDS[start];
+    let norm = st.norm;
+    let norm2 = m * t.EBANDS[NB_EBANDS - 1] - norm_offset;
+    let x = st.x;
+    var scratch = m * t.EBANDS[NB_EBANDS - 1];
+    var lowband_offset = 0;
+    var update_lowband = true;
+    var dual_stereo = dual_stereo0;
+    var balance = balance0;
+    let ctx = Band {
+        d: d,
+        i: 0,
+        intensity: intensity,
+        spread: spread,
+        tf_change: 0,
+        remaining_bits: 0,
+        seed: st.rng,
+        disable_inv: st.channels == 1,
+        avoid_split_noise: bb > 1,
+        b: 0,
+        fill: 0,
+        inv: false,
+        imid: 0,
+        iside: 0,
+        delta: 0,
+        itheta: 0,
+        qalloc: 0
+    };
+    for i in start..end {
+        ctx.i = i;
+        let last = i == end - 1;
+        let xo = m * t.EBANDS[i];
+        let yo = if (c_count == 2) { n_frame + m * t.EBANDS[i] } else { -1 };
+        let n = m * t.EBANDS[i + 1] - m * t.EBANDS[i];
+        let tell = rd.tell_frac(d);
+        if (i != start) {
+            balance = balance - tell;
+        }
+        let remaining_bits = total_bits - tell - 1;
+        ctx.remaining_bits = remaining_bits;
+        var b = 0;
+        if (i <= coded_bands - 1) {
+            let curr_balance = sudiv(balance, imin(3, coded_bands - i));
+            b = imax(0, imin(16383, imin(remaining_bits + 1, pulses[i] + curr_balance)));
+        }
+        if ((m * t.EBANDS[i] - n >= m * t.EBANDS[start] || i == start + 1)
+            && (update_lowband || lowband_offset == 0)) {
+            lowband_offset = i;
+        }
+        if (i == start + 1) {
+            // special_hybrid_folding: enough of the first band to fold the second.
+            let n1 = m * (t.EBANDS[start + 1] - t.EBANDS[start]);
+            let n2 = m * (t.EBANDS[start + 2] - t.EBANDS[start + 1]);
+            for j in 0..n2 - n1 {
+                norm[n1 + j] = norm[2 * n1 - n2 + j];
+            }
+            if (dual_stereo) {
+                for j in 0..n2 - n1 {
+                    norm[norm2 + n1 + j] = norm[norm2 + 2 * n1 - n2 + j];
+                }
+            }
+        }
+        let tf_change = tf_res[i];
+        ctx.tf_change = tf_change;
+        if (last) {
+            scratch = -1;
+        }
+        var effective_lowband = -1;
+        var x_cm = 0;
+        var y_cm = 0;
+        if (lowband_offset != 0 && (spread != SPREAD_AGGRESSIVE || bb > 1 || tf_change < 0)) {
+            effective_lowband = imax(0, m * t.EBANDS[lowband_offset] - norm_offset - n);
+            var fold_start = lowband_offset;
+            var go = true;
+            while (go) {
+                fold_start = fold_start - 1;
+                go = m * t.EBANDS[fold_start] > effective_lowband + norm_offset;
+            }
+            var fold_end = lowband_offset - 1;
+            go = true;
+            while (go) {
+                fold_end = fold_end + 1;
+                go = fold_end < i && m * t.EBANDS[fold_end] < effective_lowband + norm_offset + n;
+            }
+            var fold_i = fold_start;
+            go = true;
+            while (go) {
+                x_cm = x_cm | collapse[fold_i * c_count];
+                y_cm = y_cm | collapse[fold_i * c_count + c_count - 1];
+                fold_i = fold_i + 1;
+                go = fold_i < fold_end;
+            }
+        } else {
+            x_cm = (1 << bb) - 1;
+            y_cm = x_cm;
+        }
+        if (dual_stereo && i == intensity) {
+            dual_stereo = false;
+            for j in 0..m * t.EBANDS[i] - norm_offset {
+                norm[j] = 0.5 * (norm[j] + norm[norm2 + j]);
+            }
+        }
+        let lo1 = if (last) { -1 } else { m * t.EBANDS[i] - norm_offset };
+        if (dual_stereo) {
+            let lb1 = effective_lowband;
+            let lb2 = if (effective_lowband != -1) { norm2 + effective_lowband } else { -1 };
+            let lo2 = if (last) { -1 } else { norm2 + m * t.EBANDS[i] - norm_offset };
+            x_cm = quant_band(
+                st,
+                ctx,
+                x,
+                xo,
+                n,
+                b / 2,
+                bb,
+                norm,
+                lb1,
+                lm,
+                norm,
+                lo1,
+                1.0,
+                scratch,
+                x_cm
+            );
+            y_cm = quant_band(
+                st,
+                ctx,
+                x,
+                yo,
+                n,
+                b / 2,
+                bb,
+                norm,
+                lb2,
+                lm,
+                norm,
+                lo2,
+                1.0,
+                scratch,
+                y_cm
+            );
+        } else {
+            if (yo >= 0) {
+                x_cm = quant_band_stereo(
+                    st,
+                    ctx,
+                    x,
+                    xo,
+                    yo,
+                    n,
+                    b,
+                    bb,
+                    norm,
+                    effective_lowband,
+                    lm,
+                    norm,
+                    lo1,
+                    scratch,
+                    x_cm | y_cm
+                );
+            } else {
+                x_cm = quant_band(
+                    st,
+                    ctx,
+                    x,
+                    xo,
+                    n,
+                    b,
+                    bb,
+                    norm,
+                    effective_lowband,
+                    lm,
+                    norm,
+                    lo1,
+                    1.0,
+                    scratch,
+                    x_cm | y_cm
+                );
+            }
+            y_cm = x_cm;
+        }
+        collapse[i * c_count] = x_cm & 0xFF;
+        collapse[i * c_count + c_count - 1] = y_cm & 0xFF;
+        balance = balance + pulses[i] + tell;
+        update_lowband = b > n << BITRES;
+        ctx.avoid_split_noise = false;
+    }
+    st.rng = ctx.seed;
+}
+
+fn anti_collapse(
+    st: Celt,
+    collapse: [int],
+    lm: int,
+    c_count: int,
+    size: int,
+    start: int,
+    end: int,
+    pulses: [int]
+) -> unit {
+    let x = st.x;
+    var seed = st.rng;
+    for i in start..end {
+        let n0 = t.EBANDS[i + 1] - t.EBANDS[i];
+        let depth = ((1 + pulses[i]) / n0) >> lm;
+        let thresh = 0.5 * exp2(-0.125 * (depth as float));
+        let sqrt_1 = 1.0 / math.sqrt((n0 << lm) as float);
+        for c in 0..c_count {
+            var prev1 = st.old_log_e[c * NB_EBANDS + i];
+            var prev2 = st.old_log_e2[c * NB_EBANDS + i];
+            if (c_count == 1) {
+                prev1 = fmax(prev1, st.old_log_e[NB_EBANDS + i]);
+                prev2 = fmax(prev2, st.old_log_e2[NB_EBANDS + i]);
+            }
+            let ediff = fmax(0.0, st.old_band_e[c * NB_EBANDS + i] - fmin(prev1, prev2));
+            var r = 2.0 * exp2(-ediff);
+            if (lm == 3) {
+                r = r * 1.41421356;
+            }
+            r = fmin(thresh, r);
+            r = r * sqrt_1;
+            let xo = c * size + (t.EBANDS[i] << lm);
+            var renormalize = false;
+            for k in 0..1 << lm {
+                if ((collapse[i * c_count + c] & (1 << k)) == 0) {
+                    for j in 0..n0 {
+                        seed = lcg(seed);
+                        x[xo + (j << lm) + k] = if ((seed & 0x8000) != 0) { r } else { -r };
+                    }
+                    renormalize = true;
+                }
+            }
+            if (renormalize) {
+                renormalise_vector(x, xo, n0 << lm, 1.0);
+            }
+        }
+    }
+}
+
+// ---- Synthesis
+
+fn denormalise_bands(
+    x: [float],
+    xo: int,
+    freq: [float],
+    band_e: [float],
+    eo: int,
+    start0: int,
+    end0: int,
+    m: int,
+    silence: bool
+) -> unit {
+    let n = m * SHORT_MDCT;
+    var bound = m * t.EBANDS[end0];
+    var start = start0;
+    var end = end0;
+    if (silence) {
+        bound = 0;
+        start = 0;
+        end = 0;
+    }
+    for i in 0..m * t.EBANDS[start] {
+        freq[i] = 0.0;
+    }
+    for i in start..end {
+        let lg = band_e[eo + i] + t.E_MEANS[i];
+        let g = exp2(fmin(32.0, lg));
+        for j in m * t.EBANDS[i]..m * t.EBANDS[i + 1] {
+            freq[j] = x[xo + j] * g;
+        }
+    }
+    for i in bound..n {
+        freq[i] = 0.0;
+    }
+}
+
+/// The inverse MDCT of the coefficients `freq[fo + k × stride]` (1920 >> shift samples of
+/// output), overlapped into `out` from `oo` (libopus' clt_mdct_backward).
+fn imdct(st: Celt, shift: int, freq: [float], fo: int, stride: int, out: [float], oo: int) -> unit {
+    let n = 1920 >> shift;
+    let n2 = n >> 1;
+    let n4 = n >> 2;
+    let tr = st.trig[shift];
+    let f = st.ffts[shift];
+    let re = f.re;
+    let im = f.im;
+    for i in 0..n4 {
+        let x1 = freq[fo + 2 * stride * i];
+        let x2 = freq[fo + stride * (n2 - 1) - 2 * stride * i];
+        let yr = x2 * tr[i] + x1 * tr[n4 + i];
+        let yi = x1 * tr[i] - x2 * tr[n4 + i];
+        re[i] = yi;
+        im[i] = yr;
+    }
+    fft(f);
+    let base = oo + (OVERLAP >> 1);
+    let ar = f.ar;
+    let ai = f.ai;
+    let out_idx = f.out_idx;
+    for k in 0..n4 {
+        let at = base + 2 * out_idx[k];
+        out[at] = ar[k];
+        out[at + 1] = ai[k];
+    }
+    var p0 = base;
+    var p1 = base + n2 - 2;
+    for i in 0..(n4 + 1) >> 1 {
+        var re0 = out[p0 + 1];
+        var im0 = out[p0];
+        var t0 = tr[i];
+        var t1 = tr[n4 + i];
+        var yr = re0 * t0 + im0 * t1;
+        var yi = re0 * t1 - im0 * t0;
+        re0 = out[p1 + 1];
+        im0 = out[p1];
+        out[p0] = yr;
+        out[p1 + 1] = yi;
+        t0 = tr[n4 - i - 1];
+        t1 = tr[n2 - i - 1];
+        yr = re0 * t0 + im0 * t1;
+        yi = re0 * t1 - im0 * t0;
+        out[p1] = yr;
+        out[p0 + 1] = yi;
+        p0 = p0 + 2;
+        p1 = p1 - 2;
+    }
+    var xp1 = oo + OVERLAP - 1;
+    var yp1 = oo;
+    for i in 0..OVERLAP / 2 {
+        let x1 = out[xp1];
+        let x2 = out[yp1];
+        let w1 = t.WINDOW[i];
+        let w2 = t.WINDOW[OVERLAP - 1 - i];
+        out[yp1] = w2 * x2 - w1 * x1;
+        out[xp1] = w1 * x2 + w2 * x1;
+        yp1 = yp1 + 1;
+        xp1 = xp1 - 1;
+    }
+}
+
+fn synthesis(
+    st: Celt,
+    start: int,
+    eff_end: int,
+    c_count: int,
+    transient: bool,
+    lm: int,
+    silence: bool
+) -> unit {
+    let m = 1 << lm;
+    let n = m * SHORT_MDCT;
+    let bb = if (transient) { m } else { 1 };
+    let nb = if (transient) { SHORT_MDCT } else { SHORT_MDCT << lm };
+    let shift = if (transient) { MAX_LM } else { MAX_LM - lm };
+    let freq = st.freq;
+    let cc = st.channels;
+    let out_at = BUFFER - n;
+    if (cc == 2 && c_count == 1) {
+        denormalise_bands(st.x, 0, freq, st.old_band_e, 0, start, eff_end, m, silence);
+        for c in 0..2 {
+            for b in 0..bb {
+                imdct(st, shift, freq, b, bb, st.mem[c], out_at + nb * b);
+            }
+        }
+    } else if (cc == 1 && c_count == 2) {
+        denormalise_bands(st.x, 0, freq, st.old_band_e, 0, start, eff_end, m, silence);
+        let f2 = st.tmp;
+        denormalise_bands(st.x, n, f2, st.old_band_e, NB_EBANDS, start, eff_end, m, silence);
+        for i in 0..n {
+            freq[i] = 0.5 * freq[i] + 0.5 * f2[i];
+        }
+        for b in 0..bb {
+            imdct(st, shift, freq, b, bb, st.mem[0], out_at + nb * b);
+        }
+    } else {
+        for c in 0..cc {
+            denormalise_bands(
+                st.x,
+                c * n,
+                freq,
+                st.old_band_e,
+                c * NB_EBANDS,
+                start,
+                eff_end,
+                m,
+                silence
+            );
+            for b in 0..bb {
+                imdct(st, shift, freq, b, bb, st.mem[c], out_at + nb * b);
+            }
+        }
+    }
+}
+
+/// The pitch post-filter over `n` samples of `x` from `xo`, in place, cross-fading from the old
+/// parameters to the new over the overlap.
+fn comb_filter(
+    x: [float],
+    xo: int,
+    t0_in: int,
+    t1_in: int,
+    n: int,
+    g0: float,
+    g1: float,
+    tapset0: int,
+    tapset1: int
+) -> unit {
+    if (g0 == 0.0 && g1 == 0.0) {
+        return;
+    }
+    let t0 = imax(t0_in, COMBFILTER_MINPERIOD);
+    let t1 = imax(t1_in, COMBFILTER_MINPERIOD);
+    let g00 = g0 * COMB_GAINS[tapset0 * 3];
+    let g01 = g0 * COMB_GAINS[tapset0 * 3 + 1];
+    let g02 = g0 * COMB_GAINS[tapset0 * 3 + 2];
+    let g10 = g1 * COMB_GAINS[tapset1 * 3];
+    let g11 = g1 * COMB_GAINS[tapset1 * 3 + 1];
+    let g12 = g1 * COMB_GAINS[tapset1 * 3 + 2];
+    var x1 = x[xo - t1 + 1];
+    var x2 = x[xo - t1];
+    var x3 = x[xo - t1 - 1];
+    var x4 = x[xo - t1 - 2];
+    var overlap = OVERLAP;
+    if (g0 == g1 && t0 == t1 && tapset0 == tapset1) {
+        overlap = 0;
+    }
+    var i = 0;
+    while (i < overlap) {
+        let x0 = x[xo + i - t1 + 2];
+        let w = t.WINDOW[i];
+        let f = w * w;
+        let k = xo + i;
+        x[k] = x[k]
+            + ((1.0 - f) * g00) * x[k - t0]
+            + ((1.0 - f) * g01) * (x[k - t0 + 1] + x[k - t0 - 1])
+            + ((1.0 - f) * g02) * (x[k - t0 + 2] + x[k - t0 - 2])
+            + (f * g10) * x2
+            + (f * g11) * (x1 + x3)
+            + (f * g12) * (x0 + x4);
+        x4 = x3;
+        x3 = x2;
+        x2 = x1;
+        x1 = x0;
+        i = i + 1;
+    }
+    if (g1 == 0.0) {
+        return;
+    }
+    x4 = x[xo + i - t1 - 2];
+    x3 = x[xo + i - t1 - 1];
+    x2 = x[xo + i - t1];
+    x1 = x[xo + i - t1 + 1];
+    while (i < n) {
+        let k = xo + i;
+        let x0 = x[k - t1 + 2];
+        x[k] = x[k] + g10 * x2 + g11 * (x1 + x3) + g12 * (x0 + x4);
+        x4 = x3;
+        x3 = x2;
+        x2 = x1;
+        x1 = x0;
+        i = i + 1;
+    }
+}
+
+fn tf_decode(d: rd.Dec, start: int, end: int, transient: bool, tf_res: [int], lm: int) -> unit {
+    var budget = d.storage * 8;
+    var tell = rd.tell(d);
+    var logp = if (transient) { 2 } else { 4 };
+    let tf_select_rsv = lm > 0 && tell + logp + 1 <= budget;
+    if (tf_select_rsv) {
+        budget = budget - 1;
+    }
+    var tf_changed = 0;
+    var curr = 0;
+    for i in start..end {
+        if (tell + logp <= budget) {
+            curr = curr ^ rd.bit_logp(d, logp);
+            tell = rd.tell(d);
+            tf_changed = tf_changed | curr;
+        }
+        tf_res[i] = curr;
+        logp = if (transient) { 4 } else { 5 };
+    }
+    let tr = if (transient) { 4 } else { 0 };
+    var tf_select = 0;
+    if (tf_select_rsv
+        && TF_SELECT[lm * 8 + tr + tf_changed] != TF_SELECT[lm * 8 + tr + 2 + tf_changed]) {
+        tf_select = rd.bit_logp(d, 1);
+    }
+    for i in start..end {
+        tf_res[i] = TF_SELECT[lm * 8 + tr + 2 * tf_select + tf_res[i]];
+    }
+}
+
+/// Decodes a CELT frame of `frame_size` samples (120 × 2^lm) from `d`, whose frame is `len`
+/// octets, writing `frame_size` × channels interleaved samples (±1 full scale) into `pcm`
+/// from `po`. `stream_channels` is the frame's own channel count. False if the frame is damaged.
+pub fn decode(
+    st: Celt,
+    d: rd.Dec,
+    len: int,
+    stream_channels: int,
+    frame_size: int,
+    pcm: [float],
+    po: int
+) -> bool {
+    let c_count = stream_channels;
+    let cc = st.channels;
+    var lm = 0;
+    while (lm <= MAX_LM && (SHORT_MDCT << lm) != frame_size) {
+        lm = lm + 1;
+    }
+    if (lm > MAX_LM || len < 0 || len > 1275) {
+        return false;
+    }
+    let m = 1 << lm;
+    let n = m * SHORT_MDCT;
+    let start = st.start;
+    let end = st.end;
+    let eff_end = imin(end, NB_EBANDS);
+    let old = st.old_band_e;
+    if (c_count == 1) {
+        for i in 0..NB_EBANDS {
+            old[i] = fmax(old[i], old[NB_EBANDS + i]);
+        }
+    }
+    var total_bits = len * 8;
+    var tell = rd.tell(d);
+    var silence = false;
+    if (tell >= total_bits) {
+        silence = true;
+    } else if (tell == 1) {
+        silence = rd.bit_logp(d, 15) == 1;
+    }
+    if (silence) {
+        tell = len * 8;
+        d.nbits_total = d.nbits_total + tell - rd.tell(d);
+    }
+    var postfilter_gain = 0.0;
+    var postfilter_pitch = 0;
+    var postfilter_tapset = 0;
+    if (start == 0 && tell + 16 <= total_bits) {
+        if (rd.bit_logp(d, 1) == 1) {
+            let octave = rd.uint(d, 6);
+            postfilter_pitch = (16 << octave) + rd.bits(d, 4 + octave) - 1;
+            let qg = rd.bits(d, 3);
+            if (rd.tell(d) + 2 <= total_bits) {
+                postfilter_tapset = rd.icdf(d, TAPSET_ICDF, 2);
+            }
+            postfilter_gain = 0.09375 * ((qg + 1) as float);
+        }
+        tell = rd.tell(d);
+    }
+    var transient = false;
+    if (lm > 0 && tell + 3 <= total_bits) {
+        transient = rd.bit_logp(d, 3) == 1;
+        tell = rd.tell(d);
+    }
+    let intra = if (tell + 3 <= total_bits) { rd.bit_logp(d, 3) == 1 } else { false };
+    unquant_coarse_energy(st, d, start, end, intra, c_count, lm);
+    let tf_res = ints(NB_EBANDS, 0);
+    tf_decode(d, start, end, transient, tf_res, lm);
+    tell = rd.tell(d);
+    var spread = 2;
+    if (tell + 4 <= total_bits) {
+        spread = rd.icdf(d, SPREAD_ICDF, 5);
+    }
+    let cap = ints(NB_EBANDS, 0);
+    init_caps(cap, lm, c_count);
+    let offsets = ints(NB_EBANDS, 0);
+    var dynalloc_logp = 6;
+    total_bits = total_bits << BITRES;
+    tell = rd.tell_frac(d);
+    for i in start..end {
+        let width = (c_count * (t.EBANDS[i + 1] - t.EBANDS[i])) << lm;
+        let quanta = imin(width << BITRES, imax(6 << BITRES, width));
+        var loop_logp = dynalloc_logp;
+        var boost = 0;
+        while (tell + (loop_logp << BITRES) < total_bits && boost < cap[i]) {
+            let flag = rd.bit_logp(d, loop_logp);
+            tell = rd.tell_frac(d);
+            if (flag == 0) {
+                break;
+            }
+            boost = boost + quanta;
+            total_bits = total_bits - quanta;
+            loop_logp = 1;
+        }
+        offsets[i] = boost;
+        if (boost > 0) {
+            dynalloc_logp = imax(2, dynalloc_logp - 1);
+        }
+    }
+    let alloc_trim = if (tell + (6 << BITRES) <= total_bits) {
+        rd.icdf(d, TRIM_ICDF, 7)
+    } else {
+        5
+    };
+    var bits = ((len * 8) << BITRES) - rd.tell_frac(d) - 1;
+    let anti_collapse_rsv = if (transient && lm >= 2 && bits >= (lm + 2) << BITRES) {
+        1 << BITRES
+    } else {
+        0
+    };
+    bits = bits - anti_collapse_rsv;
+    let pulses = ints(NB_EBANDS, 0);
+    let fine_quant = ints(NB_EBANDS, 0);
+    let fine_priority = ints(NB_EBANDS, 0);
+    let a = compute_allocation(
+        d,
+        start,
+        end,
+        offsets,
+        cap,
+        alloc_trim,
+        bits,
+        pulses,
+        fine_quant,
+        fine_priority,
+        c_count,
+        lm
+    );
+    unquant_fine_energy(st, d, start, end, fine_quant, c_count);
+    for c in 0..cc {
+        let mem = st.mem[c];
+        for i in 0..BUFFER - n + OVERLAP {
+            mem[i] = mem[i + n];
+        }
+    }
+    let collapse = ints(c_count * NB_EBANDS, 0);
+    let x = st.x;
+    for i in 0..c_count * n {
+        x[i] = 0.0;
+    }
+    quant_all_bands(
+        st,
+        d,
+        start,
+        end,
+        c_count,
+        collapse,
+        pulses,
+        transient,
+        spread,
+        a.dual_stereo,
+        a.intensity,
+        tf_res,
+        len * (8 << BITRES) - anti_collapse_rsv,
+        a.balance,
+        lm,
+        a.coded_bands
+    );
+    var anti_collapse_on = false;
+    if (anti_collapse_rsv > 0) {
+        anti_collapse_on = rd.bits(d, 1) == 1;
+    }
+    unquant_energy_finalise(
+        st,
+        d,
+        start,
+        end,
+        fine_quant,
+        fine_priority,
+        len * 8 - rd.tell(d),
+        c_count
+    );
+    if (anti_collapse_on) {
+        anti_collapse(st, collapse, lm, c_count, n, start, end, pulses);
+    }
+    if (silence) {
+        for i in 0..c_count * NB_EBANDS {
+            old[i] = -28.0;
+        }
+    }
+    synthesis(st, start, eff_end, c_count, transient, lm, silence);
+    let out_at = BUFFER - n;
+    for c in 0..cc {
+        st.postfilter_period = imax(st.postfilter_period, COMBFILTER_MINPERIOD);
+        st.postfilter_period_old = imax(st.postfilter_period_old, COMBFILTER_MINPERIOD);
+        comb_filter(
+            st.mem[c],
+            out_at,
+            st.postfilter_period_old,
+            st.postfilter_period,
+            SHORT_MDCT,
+            st.postfilter_gain_old,
+            st.postfilter_gain,
+            st.postfilter_tapset_old,
+            st.postfilter_tapset
+        );
+        if (lm != 0) {
+            comb_filter(
+                st.mem[c],
+                out_at + SHORT_MDCT,
+                st.postfilter_period,
+                postfilter_pitch,
+                n - SHORT_MDCT,
+                st.postfilter_gain,
+                postfilter_gain,
+                st.postfilter_tapset,
+                postfilter_tapset
+            );
+        }
+    }
+    st.postfilter_period_old = st.postfilter_period;
+    st.postfilter_gain_old = st.postfilter_gain;
+    st.postfilter_tapset_old = st.postfilter_tapset;
+    st.postfilter_period = postfilter_pitch;
+    st.postfilter_gain = postfilter_gain;
+    st.postfilter_tapset = postfilter_tapset;
+    if (lm != 0) {
+        st.postfilter_period_old = st.postfilter_period;
+        st.postfilter_gain_old = st.postfilter_gain;
+        st.postfilter_tapset_old = st.postfilter_tapset;
+    }
+    if (c_count == 1) {
+        for i in 0..NB_EBANDS {
+            old[NB_EBANDS + i] = old[i];
+        }
+    }
+    if (!transient) {
+        for i in 0..2 * NB_EBANDS {
+            st.old_log_e2[i] = st.old_log_e[i];
+            st.old_log_e[i] = old[i];
+        }
+    } else {
+        for i in 0..2 * NB_EBANDS {
+            st.old_log_e[i] = fmin(st.old_log_e[i], old[i]);
+        }
+    }
+    for c in 0..2 {
+        for i in 0..start {
+            old[c * NB_EBANDS + i] = 0.0;
+            st.old_log_e[c * NB_EBANDS + i] = -28.0;
+            st.old_log_e2[c * NB_EBANDS + i] = -28.0;
+        }
+        for i in end..NB_EBANDS {
+            old[c * NB_EBANDS + i] = 0.0;
+            st.old_log_e[c * NB_EBANDS + i] = -28.0;
+            st.old_log_e2[c * NB_EBANDS + i] = -28.0;
+        }
+    }
+    st.rng = d.rng;
+    deemphasis(st, n, pcm, po);
+    rd.tell(d) <= 8 * len
+}
+
+fn deemphasis(st: Celt, n: int, pcm: [float], po: int) -> unit {
+    let cc = st.channels;
+    let from = BUFFER - n;
+    for c in 0..cc {
+        let x = st.mem[c];
+        var m = st.preemph_mem[c];
+        var o = po + c;
+        for j in 0..n {
+            let tmp = x[from + j] + VERY_SMALL + m;
+            m = PREEMPH * tmp;
+            pcm[o] = tmp * (1.0 / 32768.0);
+            o = o + cc;
+        }
+        st.preemph_mem[c] = m;
+    }
+}
+
+/// The low-overlap window at `i` (of 120), for the cross-fades of the Opus layer.
+pub fn window(i: int) -> float {
+    t.WINDOW[i]
+}
