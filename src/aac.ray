@@ -1,0 +1,1071 @@
+// An AAC decoder for the Low Complexity profile (ISO/IEC 14496-3), as in .m4a files from iTunes,
+// afconvert or ffmpeg: mono and stereo, long and short windows, M/S and intensity stereo,
+// perceptual noise substitution (PNS), temporal noise shaping (TNS) and pulses. HE-AAC files
+// (SBR, PS) play their AAC-LC core: at half the rate, without the high band. Each frame of 1024
+// samples overlaps the previous one, so `seek` decodes one frame before the one it wants.
+
+import aac_tables;
+import bits;
+import mp4;
+import std/math;
+
+const ONLY_LONG: int = 0;
+
+const LONG_START: int = 1;
+
+const EIGHT_SHORT: int = 2;
+
+const LONG_STOP: int = 3;
+
+const ZERO_HCB: int = 0;
+
+const ESC_HCB: int = 11;
+
+const NOISE_HCB: int = 13;
+
+const INTENSITY_HCB2: int = 14;
+
+const INTENSITY_HCB: int = 15;
+
+const RATES: [int] = [
+    96000,
+    88200,
+    64000,
+    48000,
+    44100,
+    32000,
+    24000,
+    22050,
+    16000,
+    12000,
+    11025,
+    8000,
+    7350
+];
+
+/// What the AudioSpecificConfig says.
+struct Config {
+    rate_index: int,
+    rate: int,
+    channels: int,
+}
+
+/// The configuration of `c`: the object type must be AAC-LC (2), alone or under SBR/PS.
+fn config_of(c: bytes) -> Result<Config, string> {
+    if (c.len() < 2) {
+        return Result.Err("AAC without its configuration");
+    }
+    let r = bits.over_range(c, 0, c.len());
+    var object = bits.get(r, 5);
+    if (object == 31) {
+        object = 32 + bits.get(r, 6);
+    }
+    let rate_index = bits.get(r, 4);
+    if (rate_index == 15) {
+        return Result.Err("AAC with an explicit sampling rate is not supported");
+    }
+    let channels = bits.get(r, 4);
+    if (object == 5 || object == 29) {
+        // Explicit SBR (and PS): the extension's rate, then the core's object type.
+        if (bits.get(r, 4) == 15) {
+            bits.skip(r, 24);
+        }
+        object = bits.get(r, 5);
+    }
+    if (object != 2) {
+        return Result.Err("AAC object type ${to_string(object)} is not supported (only LC)");
+    }
+    if (bits.get(r, 1) == 1) {
+        return Result.Err("AAC with 960-sample frames is not supported");
+    }
+    if (rate_index >= RATES.len()) {
+        return Result.Err("AAC: bad sampling rate index");
+    }
+    if (channels < 1 || channels > 2) {
+        return Result.Err(
+            "AAC with channel configuration ${to_string(channels)} (only mono and stereo)"
+        );
+    }
+    Result.Ok(Config { rate_index: rate_index, rate: RATES[rate_index], channels: channels })
+}
+
+/// The fast transform of one window size: a DCT-IV of `m` coefficients through a complex FFT
+/// of m/2 points, with its twiddles.
+struct Fft {
+    m: int,
+    rev: [int],
+    /// e^(-2πi k/(m/2)) for k < m/4.
+    tw_cos: [float],
+    tw_sin: [float],
+    /// e^(-iπ(4k+1)/(4m)) before the FFT and e^(-iπk/m) after it, for k < m/2.
+    pre_cos: [float],
+    pre_sin: [float],
+    post_cos: [float],
+    post_sin: [float],
+}
+
+fn fft_of(m: int) -> Fft {
+    let n = m / 2;
+    var levels = 0;
+    while ((1 << levels) < n) {
+        levels = levels + 1;
+    }
+    var rev: [int] = [];
+    for i in 0..n {
+        var x = i;
+        var y = 0;
+        for _ in 0..levels {
+            y = (y << 1) | (x & 1);
+            x = x >> 1;
+        }
+        rev.push(y);
+    }
+    var tw_cos: [float] = [];
+    var tw_sin: [float] = [];
+    for k in 0..n / 2 {
+        let a = 2.0 * math.PI * (k as float) / (n as float);
+        tw_cos.push(math.cos(a));
+        tw_sin.push(math.sin(a));
+    }
+    var pre_cos: [float] = [];
+    var pre_sin: [float] = [];
+    var post_cos: [float] = [];
+    var post_sin: [float] = [];
+    for k in 0..n {
+        let a = math.PI * ((4 * k + 1) as float) / ((4 * m) as float);
+        pre_cos.push(math.cos(a));
+        pre_sin.push(math.sin(a));
+        let b = math.PI * (k as float) / (m as float);
+        post_cos.push(math.cos(b));
+        post_sin.push(math.sin(b));
+    }
+    Fft {
+        m: m,
+        rev: rev,
+        tw_cos: tw_cos,
+        tw_sin: tw_sin,
+        pre_cos: pre_cos,
+        pre_sin: pre_sin,
+        post_cos: post_cos,
+        post_sin: post_sin
+    }
+}
+
+/// The IMDCT of `f.m` coefficients of `x` from `xo`, scaled by 2/N: 2m samples into `y`.
+fn imdct(f: Fft, x: [float], xo: int, y: [float]) -> unit {
+    let m = f.m;
+    let n = m / 2;
+    var re: [float] = [];
+    var im: [float] = [];
+    for _ in 0..n {
+        re.push(0.0);
+        im.push(0.0);
+    }
+    for k in 0..n {
+        let a = x[xo + 2 * k];
+        let b = x[xo + m - 1 - 2 * k];
+        let c = f.pre_cos[k];
+        let s = f.pre_sin[k];
+        let j = f.rev[k];
+        re[j] = a * c + b * s;
+        im[j] = b * c - a * s;
+    }
+    var len = 2;
+    while (len <= n) {
+        let half = len / 2;
+        let step = n / len;
+        var start = 0;
+        while (start < n) {
+            for t in 0..half {
+                let wc = f.tw_cos[t * step];
+                let ws = f.tw_sin[t * step];
+                let p = start + t;
+                let q = p + half;
+                // b · e^(-iθ)
+                let br = re[q] * wc + im[q] * ws;
+                let bi = im[q] * wc - re[q] * ws;
+                re[q] = re[p] - br;
+                im[q] = im[p] - bi;
+                re[p] = re[p] + br;
+                im[p] = im[p] + bi;
+            }
+            start = start + len;
+        }
+        len = len * 2;
+    }
+    // u[2k] = Re(W), u[m-1-2k] = -Im(W); y is u folded around the window's halves.
+    let scale = 1.0 / (m as float);
+    let h = m / 2;
+    for k in 0..n {
+        let c = f.post_cos[k];
+        let s = f.post_sin[k];
+        let wr = (re[k] * c + im[k] * s) * scale;
+        let wi = (im[k] * c - re[k] * s) * scale;
+        put_u(y, m, h, 2 * k, wr);
+        put_u(y, m, h, m - 1 - 2 * k, 0.0 - wi);
+    }
+}
+
+/// Places DCT-IV output u[i] in the IMDCT output: y[n] = u[n + m/2] for n < m/2,
+/// -u[3m/2 - 1 - n] for n < 3m/2 and -u[n - 3m/2] after that.
+fn put_u(y: [float], m: int, h: int, i: int, v: float) -> unit {
+    if (i >= h) {
+        y[i - h] = v;
+        y[m + h - 1 - i] = 0.0 - v;
+    } else {
+        y[m + h - 1 - i] = 0.0 - v;
+        y[i + 3 * h] = 0.0 - v;
+    }
+}
+
+/// The modified Bessel function I0, by its series.
+fn bessel_i0(x: float) -> float {
+    var sum = 1.0;
+    var term = 1.0;
+    var k = 1;
+    while (term > sum * 1e-17) {
+        let t = x / (2.0 * (k as float));
+        term = term * t * t;
+        sum = sum + term;
+        k = k + 1;
+    }
+    sum
+}
+
+/// The rising half of a Kaiser-Bessel-derived window of `n` samples in all.
+fn kbd(n: int, alpha: float) -> [float] {
+    let q = (n / 4) as float;
+    var w: [float] = [];
+    var total = 0.0;
+    for j in 0..n / 2 + 1 {
+        let d = ((j as float) - q) / q;
+        let v = bessel_i0(math.PI * alpha * math.sqrt(1.0 - d * d));
+        w.push(v);
+        total = total + v;
+    }
+    var out: [float] = [];
+    var acc = 0.0;
+    for j in 0..n / 2 {
+        acc = acc + w[j];
+        out.push(math.sqrt(acc / total));
+    }
+    out
+}
+
+/// The rising half of a sine window of `n` samples in all.
+fn sine(n: int) -> [float] {
+    var out: [float] = [];
+    for j in 0..n / 2 {
+        out.push(math.sin(math.PI / (n as float) * ((j as float) + 0.5)));
+    }
+    out
+}
+
+struct Tables {
+    sf: [int],
+    spectral: [int],
+    spectral_index: [int],
+    swb_long: [int],
+    swb_short: [int],
+    tns_long: int,
+    tns_short: int,
+    /// |q|^(4/3) and 2^((sf - 100) / 4).
+    pow43: [float],
+    gain: [float],
+    /// Rising window halves by shape (0 sine, 1 KBD).
+    long_win: [[float]],
+    short_win: [[float]],
+    fft_long: Fft,
+    fft_short: Fft,
+}
+
+fn tables(rate_index: int) -> Tables {
+    var pow43: [float] = [];
+    for i in 0..8192 {
+        pow43.push(math.pow(i as float, 4.0 / 3.0));
+    }
+    var gain: [float] = [];
+    for i in 0..256 {
+        gain.push(math.pow(2.0, ((i - 100) as float) / 4.0));
+    }
+    Tables {
+        sf: aac_tables.scalefactor(),
+        spectral: aac_tables.spectral(),
+        spectral_index: aac_tables.spectral_index(),
+        swb_long: aac_tables.swb_long()[rate_index],
+        swb_short: aac_tables.swb_short()[rate_index],
+        tns_long: aac_tables.tns_max_long()[rate_index],
+        tns_short: aac_tables.tns_max_short()[rate_index],
+        pow43: pow43,
+        gain: gain,
+        long_win: [sine(2048), kbd(2048, 4.0)],
+        short_win: [sine(256), kbd(256, 6.0)],
+        fft_long: fft_of(1024),
+        fft_short: fft_of(128)
+    }
+}
+
+/// One codeword of the two-level table `t` whose primary part starts at `base`.
+fn huff(r: bits.Bits, t: [int], base: int) -> int {
+    var e = t[base + bits.peek(r, aac_tables.PRIMARY_BITS)];
+    if (e < 0) {
+        let sub = 0 - e;
+        let n = sub & 31;
+        let w = bits.peek(r, aac_tables.PRIMARY_BITS + n) & ((1 << n) - 1);
+        e = t[(sub >> 5) + w];
+    }
+    bits.skip(r, e & 31);
+    e >> 5
+}
+
+/// TNS filters of one window.
+struct Filter {
+    length: int,
+    order: int,
+    down: bool,
+    /// The reflection coefficients, dequantized.
+    coefs: [float],
+}
+
+/// One individual channel stream, as read.
+struct Ics {
+    sequence: int,
+    shape: int,
+    max_sfb: int,
+    windows: int,
+    /// Windows in each group.
+    groups: [int],
+    swb: [int],
+    /// Per group and band (g * max_sfb + sfb): codebook and scale factor.
+    band: [int],
+    sf: [int],
+    filters: [[Filter]],
+    /// The dequantized spectrum: 1024 values (8 windows of 128 for short ones).
+    spec: [float],
+}
+
+fn ics_of(info: Ics) -> Ics {
+    Ics {
+        sequence: info.sequence,
+        shape: info.shape,
+        max_sfb: info.max_sfb,
+        windows: info.windows,
+        groups: info.groups,
+        swb: info.swb,
+        band: [],
+        sf: [],
+        filters: [],
+        spec: []
+    }
+}
+
+fn read_info(r: bits.Bits, t: Tables) -> Result<Ics, string> {
+    bits.skip(r, 1);
+    let sequence = bits.get(r, 2);
+    let shape = bits.get(r, 1);
+    var info = Ics {
+        sequence: sequence,
+        shape: shape,
+        max_sfb: 0,
+        windows: 1,
+        groups: [1],
+        swb: t.swb_long,
+        band: [],
+        sf: [],
+        filters: [],
+        spec: []
+    };
+    if (sequence == EIGHT_SHORT) {
+        info.max_sfb = bits.get(r, 4);
+        let grouping = bits.get(r, 7);
+        var groups = [1];
+        for i in 0..7 {
+            if (((grouping >> (6 - i)) & 1) == 1) {
+                groups[groups.len() - 1] = groups[groups.len() - 1] + 1;
+            } else {
+                groups.push(1);
+            }
+        }
+        info.windows = 8;
+        info.groups = groups;
+        info.swb = t.swb_short;
+    } else {
+        info.max_sfb = bits.get(r, 6);
+        if (bits.get(r, 1) == 1) {
+            return Result.Err("AAC: prediction (Main profile) is not supported");
+        }
+    }
+    if (info.max_sfb > info.swb.len() - 1) {
+        return Result.Err("AAC: too many bands");
+    }
+    Result.Ok(info)
+}
+
+fn read_sections(r: bits.Bits, ics: Ics) -> Result<unit, string> {
+    let width = if (ics.sequence == EIGHT_SHORT) { 3 } else { 5 };
+    let esc = (1 << width) - 1;
+    let max = ics.max_sfb;
+    var band: [int] = [];
+    for _ in 0..ics.groups.len() {
+        var k = 0;
+        while (k < max) {
+            let cb = bits.get(r, 4);
+            if (cb == 12) {
+                return Result.Err("AAC: reserved codebook");
+            }
+            var len = 0;
+            var more = true;
+            while (more) {
+                let inc = bits.get(r, width);
+                len = len + inc;
+                more = inc == esc;
+            }
+            if (len == 0 || k + len > max || bits.over(r)) {
+                return Result.Err("AAC: bad section");
+            }
+            for _ in 0..len {
+                band.push(cb);
+            }
+            k = k + len;
+        }
+    }
+    ics.band = band;
+    Result.Ok({ })
+}
+
+fn read_scalefactors(r: bits.Bits, ics: Ics, global_gain: int, t: Tables) -> Result<unit, string> {
+    var sf: [int] = [];
+    var gain = global_gain;
+    var position = 0;
+    var noise = global_gain - 90;
+    var noise_first = true;
+    for cb in ics.band {
+        if (cb == ZERO_HCB) {
+            sf.push(0);
+        } else if (cb == INTENSITY_HCB || cb == INTENSITY_HCB2) {
+            position = position + huff(r, t.sf, 0) - 60;
+            sf.push(position);
+        } else if (cb == NOISE_HCB) {
+            if (noise_first) {
+                noise = noise + bits.get(r, 9) - 256;
+                noise_first = false;
+            } else {
+                noise = noise + huff(r, t.sf, 0) - 60;
+            }
+            sf.push(noise);
+        } else {
+            gain = gain + huff(r, t.sf, 0) - 60;
+            if (gain < 0 || gain > 255) {
+                return Result.Err("AAC: scale factor out of range");
+            }
+            sf.push(gain);
+        }
+    }
+    ics.sf = sf;
+    Result.Ok({ })
+}
+
+fn read_tns(r: bits.Bits, ics: Ics) -> Result<unit, string> {
+    let short = ics.sequence == EIGHT_SHORT;
+    let max_order = if (short) { 7 } else { 12 };
+    var all: [[Filter]] = [];
+    for _ in 0..ics.windows {
+        var fs: [Filter] = [];
+        let n = bits.get(r, if (short) { 1 } else { 2 });
+        if (n > 0) {
+            let res = bits.get(r, 1) + 3;
+            for _ in 0..n {
+                let length = bits.get(r, if (short) { 4 } else { 6 });
+                let order = bits.get(r, if (short) { 3 } else { 5 });
+                if (order > max_order) {
+                    return Result.Err("AAC: TNS order too high");
+                }
+                var down = false;
+                var coefs: [float] = [];
+                if (order > 0) {
+                    down = bits.get(r, 1) == 1;
+                    let width = res - bits.get(r, 1);
+                    let iq = (((1 << (res - 1)) as float) - 0.5) / (math.PI / 2.0);
+                    let iq_neg = (((1 << (res - 1)) as float) + 0.5) / (math.PI / 2.0);
+                    for _ in 0..order {
+                        let c = bits.get_signed(r, width) as float;
+                        coefs.push(math.sin(c / if (c >= 0.0) { iq } else { iq_neg }));
+                    }
+                }
+                fs.push(Filter { length: length, order: order, down: down, coefs: coefs });
+            }
+        }
+        all.push(fs);
+    }
+    ics.filters = all;
+    Result.Ok({ })
+}
+
+/// The quantized spectrum: codewords of 4 or 2 values per band, window after window inside
+/// each band of a group.
+fn read_spectrum(r: bits.Bits, ics: Ics, t: Tables, q: [int]) -> Result<unit, string> {
+    let swb = ics.swb;
+    let max = ics.max_sfb;
+    var win = 0;
+    for g in 0..ics.groups.len() {
+        let glen = ics.groups[g];
+        for sfb in 0..max {
+            let cb = ics.band[g * max + sfb];
+            if (cb == ZERO_HCB || cb >= NOISE_HCB) {
+                continue;
+            }
+            let base = t.spectral_index[cb - 1];
+            let lo = swb[sfb];
+            let hi = swb[sfb + 1];
+            for w in 0..glen {
+                let off = (win + w) * 128;
+                var k = lo;
+                while (k < hi) {
+                    let v = huff(r, t.spectral, base);
+                    if (cb <= 4) {
+                        var vals = [v / 27, (v / 9) % 3, (v / 3) % 3, v % 3];
+                        for i in 0..4 {
+                            var x = vals[i];
+                            if (cb <= 2) {
+                                x = x - 1;
+                            } else if (x != 0 && bits.get(r, 1) == 1) {
+                                x = 0 - x;
+                            }
+                            q[off + k + i] = x;
+                        }
+                        k = k + 4;
+                    } else {
+                        let mod = if (cb <= 6) {
+                            9
+                        } else if (cb <= 8) {
+                            8
+                        } else if (cb <= 10) {
+                            13
+                        } else {
+                            17
+                        };
+                        var y = v / mod;
+                        var z = v % mod;
+                        if (cb <= 6) {
+                            y = y - 4;
+                            z = z - 4;
+                        } else {
+                            let ny = y != 0 && bits.get(r, 1) == 1;
+                            let nz = z != 0 && bits.get(r, 1) == 1;
+                            if (cb == ESC_HCB) {
+                                if (y == 16) {
+                                    y = escape(r)?;
+                                }
+                                if (z == 16) {
+                                    z = escape(r)?;
+                                }
+                            }
+                            if (ny) {
+                                y = 0 - y;
+                            }
+                            if (nz) {
+                                z = 0 - z;
+                            }
+                        }
+                        q[off + k] = y;
+                        q[off + k + 1] = z;
+                        k = k + 2;
+                    }
+                }
+            }
+        }
+        win = win + glen;
+    }
+    if (bits.over(r)) {
+        return Result.Err("AAC: truncated frame");
+    }
+    Result.Ok({ })
+}
+
+/// An escape value: N ones, a zero, then N + 4 bits.
+fn escape(r: bits.Bits) -> Result<int, string> {
+    var n = 0;
+    while (bits.get(r, 1) == 1) {
+        n = n + 1;
+        if (n > 8) {
+            return Result.Err("AAC: bad escape");
+        }
+    }
+    Result.Ok((1 << (n + 4)) + bits.get(r, n + 4))
+}
+
+/// Reads one individual channel stream; `common` is the shared ics_info of a pair, if any.
+fn read_ics(r: bits.Bits, t: Tables, common: Option<Ics>) -> Result<Ics, string> {
+    let global_gain = bits.get(r, 8);
+    let ics = match (common) {
+        Option.Some(info) => ics_of(info),
+        Option.None => read_info(r, t)?,
+    };
+    read_sections(r, ics)?;
+    read_scalefactors(r, ics, global_gain, t)?;
+    var pulses: [(int, int)] = [];
+    if (bits.get(r, 1) == 1) {
+        if (ics.sequence == EIGHT_SHORT) {
+            return Result.Err("AAC: pulses in a short window");
+        }
+        let n = bits.get(r, 2) + 1;
+        let start = bits.get(r, 6);
+        if (start >= ics.swb.len()) {
+            return Result.Err("AAC: bad pulse band");
+        }
+        var pos = ics.swb[start];
+        for _ in 0..n {
+            pos = pos + bits.get(r, 5);
+            pulses.push((pos, bits.get(r, 4)));
+        }
+    }
+    if (bits.get(r, 1) == 1) {
+        read_tns(r, ics)?;
+    }
+    if (bits.get(r, 1) == 1) {
+        return Result.Err("AAC: gain control (SSR profile) is not supported");
+    }
+    var q: [int] = [];
+    for _ in 0..1024 {
+        q.push(0);
+    }
+    read_spectrum(r, ics, t, q)?;
+    for p in pulses {
+        if (p.0 >= 1024) {
+            return Result.Err("AAC: pulse past the spectrum");
+        }
+        q[p.0] = if (q[p.0] > 0) { q[p.0] + p.1 } else { q[p.0] - p.1 };
+    }
+    dequantize(ics, t, q);
+    Result.Ok(ics)
+}
+
+fn dequantize(ics: Ics, t: Tables, q: [int]) -> unit {
+    var spec: [float] = [];
+    for _ in 0..1024 {
+        spec.push(0.0);
+    }
+    let swb = ics.swb;
+    let max = ics.max_sfb;
+    var win = 0;
+    for g in 0..ics.groups.len() {
+        for sfb in 0..max {
+            let cb = ics.band[g * max + sfb];
+            if (cb == ZERO_HCB || cb >= NOISE_HCB) {
+                continue;
+            }
+            let gain = t.gain[ics.sf[g * max + sfb]];
+            for w in 0..ics.groups[g] {
+                let off = (win + w) * 128;
+                for k in off + swb[sfb]..off + swb[sfb + 1] {
+                    let v = q[k];
+                    if (v > 0) {
+                        spec[k] = t.pow43[v] * gain;
+                    } else if (v < 0) {
+                        spec[k] = 0.0 - t.pow43[0 - v] * gain;
+                    }
+                }
+            }
+        }
+        win = win + ics.groups[g];
+    }
+    ics.spec = spec;
+}
+
+/// Fills the noise bands of `ics` (PNS) with random values of the band's energy. In a pair,
+/// `like` is the first channel: a band with M/S set and noise in both takes the same noise.
+fn noise(ics: Ics, seed: [int], like: Option<Ics>, ms: [bool]) -> unit {
+    let swb = ics.swb;
+    let max = ics.max_sfb;
+    var win = 0;
+    for g in 0..ics.groups.len() {
+        for sfb in 0..max {
+            let i = g * max + sfb;
+            if (ics.band[i] != NOISE_HCB) {
+                continue;
+            }
+            let scale = math.pow(2.0, (ics.sf[i] as float) / 4.0);
+            for w in 0..ics.groups[g] {
+                let off = (win + w) * 128;
+                let lo = off + swb[sfb];
+                let hi = off + swb[sfb + 1];
+                var energy = 0.0;
+                let copy = match (like) {
+                    Option.Some(o) => ms.len() > i && ms[i] && o.band[i] == NOISE_HCB,
+                    Option.None => false,
+                };
+                for k in lo..hi {
+                    var v = 0.0;
+                    if (copy) {
+                        if let Option.Some(o) = like {
+                            v = o.spec[k];
+                        }
+                    } else {
+                        // A linear congruential generator, as signed 32-bit values.
+                        let x = (seed[0] * 1664525 + 1013904223) & 0xFFFFFFFF;
+                        seed[0] = x;
+                        let signed = if (x >= 0x80000000) { x - 0x100000000 } else { x };
+                        v = signed as float;
+                    }
+                    ics.spec[k] = v;
+                    energy = energy + v * v;
+                }
+                if (energy > 0.0) {
+                    let f = scale / math.sqrt(energy);
+                    for k in lo..hi {
+                        ics.spec[k] = ics.spec[k] * f;
+                    }
+                }
+            }
+        }
+        win = win + ics.groups[g];
+    }
+}
+
+/// M/S and intensity stereo of a channel pair sharing one ics_info.
+fn stereo(a: Ics, b: Ics, ms: [bool]) -> unit {
+    let swb = a.swb;
+    let max = a.max_sfb;
+    var win = 0;
+    for g in 0..a.groups.len() {
+        for sfb in 0..max {
+            let i = g * max + sfb;
+            let used = ms.len() > i && ms[i];
+            let cb = b.band[i];
+            if (cb == INTENSITY_HCB || cb == INTENSITY_HCB2) {
+                var scale = math.pow(0.5, (b.sf[i] as float) / 4.0);
+                if ((cb == INTENSITY_HCB2) != used) {
+                    scale = 0.0 - scale;
+                }
+                for w in 0..a.groups[g] {
+                    let off = (win + w) * 128;
+                    for k in off + swb[sfb]..off + swb[sfb + 1] {
+                        b.spec[k] = a.spec[k] * scale;
+                    }
+                }
+            } else if (used && cb != NOISE_HCB && a.band[i] != NOISE_HCB) {
+                for w in 0..a.groups[g] {
+                    let off = (win + w) * 128;
+                    for k in off + swb[sfb]..off + swb[sfb + 1] {
+                        let l = a.spec[k];
+                        let r = b.spec[k];
+                        a.spec[k] = l + r;
+                        b.spec[k] = l - r;
+                    }
+                }
+            }
+        }
+        win = win + a.groups[g];
+    }
+}
+
+/// Temporal noise shaping: an all-pole filter over the spectrum of each window's filtered
+/// bands, from the top band down.
+fn tns(ics: Ics, t: Tables) -> unit {
+    let short = ics.sequence == EIGHT_SHORT;
+    let num_swb = ics.swb.len() - 1;
+    let max_tns = if (short) { t.tns_short } else { t.tns_long };
+    let limit = math.min(max_tns, ics.max_sfb);
+    for w in 0..ics.filters.len() {
+        var bottom = num_swb;
+        for f in ics.filters[w] {
+            let top = bottom;
+            bottom = if (top > f.length) { top - f.length } else { 0 };
+            if (f.order == 0) {
+                continue;
+            }
+            // Reflection coefficients to the LPC ones.
+            var lpc = [1.0];
+            for m in 1..f.order + 1 {
+                let k = f.coefs[m - 1];
+                var next = [1.0];
+                for i in 1..m {
+                    next.push(lpc[i] + k * lpc[m - i]);
+                }
+                next.push(k);
+                lpc = next;
+            }
+            let start = ics.swb[math.min(bottom, limit)];
+            let end = ics.swb[math.min(top, limit)];
+            let size = end - start;
+            if (size <= 0) {
+                continue;
+            }
+            let base = w * 128;
+            let inc = if (f.down) { -1 } else { 1 };
+            var at = base + if (f.down) { end - 1 } else { start };
+            var state: [float] = [];
+            for _ in 0..f.order {
+                state.push(0.0);
+            }
+            for _ in 0..size {
+                var y = ics.spec[at];
+                for j in 0..f.order {
+                    y = y - lpc[j + 1] * state[j];
+                }
+                var j = f.order - 1;
+                while (j > 0) {
+                    state[j] = state[j - 1];
+                    j = j - 1;
+                }
+                if (f.order > 0) {
+                    state[0] = y;
+                }
+                ics.spec[at] = y;
+                at = at + inc;
+            }
+        }
+    }
+}
+
+/// One channel's overlap state across frames.
+struct Overlap {
+    overlap: [float],
+    shape: int,
+}
+
+fn channel() -> Overlap {
+    var o: [float] = [];
+    for _ in 0..1024 {
+        o.push(0.0);
+    }
+    Overlap { overlap: o, shape: 0 }
+}
+
+/// The filter bank: the IMDCT of the frame, windowed and overlapped with the last one's
+/// second half. 1024 samples into `pcm`.
+fn synthesize(ch: Overlap, ics: Ics, t: Tables, pcm: [float]) -> unit {
+    let prev_long = t.long_win[ch.shape];
+    let cur_long = t.long_win[ics.shape];
+    let prev_short = t.short_win[ch.shape];
+    let cur_short = t.short_win[ics.shape];
+    let ov = ch.overlap;
+    var y: [float] = [];
+    for _ in 0..2048 {
+        y.push(0.0);
+    }
+    let seq = ics.sequence;
+    if (seq == EIGHT_SHORT) {
+        var z: [float] = [];
+        for _ in 0..256 {
+            z.push(0.0);
+        }
+        for w in 0..8 {
+            imdct(t.fft_short, ics.spec, w * 128, z);
+            let left = if (w == 0) { prev_short } else { cur_short };
+            let at = 448 + 128 * w;
+            for n in 0..128 {
+                y[at + n] = y[at + n] + z[n] * left[n];
+                y[at + 128 + n] = y[at + 128 + n] + z[128 + n] * cur_short[127 - n];
+            }
+        }
+        for n in 0..1024 {
+            pcm[n] = ov[n] + y[n];
+            ov[n] = y[1024 + n];
+        }
+    } else {
+        imdct(t.fft_long, ics.spec, 0, y);
+        for n in 0..1024 {
+            let w = if (seq == LONG_STOP) {
+                if (n < 448) { 0.0 } else if (n < 576) { prev_short[n - 448] } else { 1.0 }
+            } else {
+                prev_long[n]
+            };
+            pcm[n] = ov[n] + y[n] * w;
+        }
+        for n in 0..1024 {
+            let w = if (seq == LONG_START) {
+                if (n < 448) { 1.0 } else if (n < 576) { cur_short[127 - (n - 448)] } else { 0.0 }
+            } else {
+                cur_long[1023 - n]
+            };
+            ov[n] = y[1024 + n] * w;
+        }
+    }
+    ch.shape = ics.shape;
+}
+
+/// A decoded sample (in 16-bit units) rounded and clamped to 16 bits.
+fn to_16(v: float) -> int {
+    if (v >= 32767.0) {
+        return 32767;
+    }
+    if (v <= -32768.0) {
+        return -32768;
+    }
+    math.round(v) as int
+}
+
+/// Decodes one raw data block, appending its 1024 interleaved samples per channel to `out`.
+fn frame(s: Stream, at: int, size: int, out: [int]) -> Result<unit, string> {
+    let r = bits.over_range(s.b, at, at + size);
+    let t = s.t;
+    var streams: [Ics] = [];
+    while (streams.len() < s.channels) {
+        if (r.pos + 3 > r.end) {
+            return Result.Err("AAC: frame without all its channels");
+        }
+        let id = bits.get(r, 3);
+        if (id == 0 || id == 3) {
+            // A single channel (or LFE).
+            bits.skip(r, 4);
+            let ics = read_ics(r, t, Option.None)?;
+            noise(ics, s.seed, Option.None, []);
+            streams.push(ics);
+        } else if (id == 1) {
+            bits.skip(r, 4);
+            let common = bits.get(r, 1) == 1;
+            var ms: [bool] = [];
+            var info: Option<Ics> = Option.None;
+            if (common) {
+                let i = read_info(r, t)?;
+                let mask = bits.get(r, 2);
+                for _ in 0..i.groups.len() * i.max_sfb {
+                    ms.push(if (mask == 1) { bits.get(r, 1) == 1 } else { mask == 2 });
+                }
+                info = Option.Some(i);
+            }
+            let a = read_ics(r, t, info)?;
+            let b = read_ics(r, t, info)?;
+            noise(a, s.seed, Option.None, []);
+            noise(b, s.seed, Option.Some(a), ms);
+            if (common) {
+                stereo(a, b, ms);
+            }
+            streams.push(a);
+            streams.push(b);
+        } else if (id == 4) {
+            // Data stream element: skipped.
+            bits.skip(r, 4);
+            let align = bits.get(r, 1) == 1;
+            var n = bits.get(r, 8);
+            if (n == 255) {
+                n = n + bits.get(r, 8);
+            }
+            if (align) {
+                bits.align(r);
+            }
+            bits.skip(r, n * 8);
+        } else if (id == 6) {
+            // Fill element (SBR data among others): skipped.
+            var n = bits.get(r, 4);
+            if (n == 15) {
+                n = n + bits.get(r, 8) - 1;
+            }
+            bits.skip(r, n * 8);
+        } else if (id == 7) {
+            return Result.Err("AAC: frame without all its channels");
+        } else {
+            return Result.Err("AAC: unsupported element ${to_string(id)}");
+        }
+    }
+    let n = s.channels;
+    var pcm: [[float]] = [];
+    for c in 0..n {
+        let ics = streams[c];
+        tns(ics, t);
+        var p: [float] = [];
+        for _ in 0..1024 {
+            p.push(0.0);
+        }
+        synthesize(s.state[c], ics, t, p);
+        pcm.push(p);
+    }
+    for i in 0..1024 {
+        for c in 0..n {
+            out.push(to_16(pcm[c][i]));
+        }
+    }
+    Result.Ok({ })
+}
+
+/// An AAC track being played.
+pub struct Stream {
+    b: bytes,
+    t: Tables,
+    track: mp4.Track,
+    state: [Overlap],
+    /// The noise generator's state (one element, to share it): it runs on across the song, as
+    /// ffmpeg's does from the same seed, so PNS bands match its output. After a seek they get
+    /// other noise, as good.
+    seed: [int],
+    /// The next packet to decode.
+    next: int,
+    rate: int,
+    channels: int,
+    /// Decoded samples to drop at the start (the encoder's priming), and frames after that.
+    skip: int,
+    total: int,
+}
+
+/// Opens the AAC track `t` of the MP4 file `b`.
+pub fn open(b: bytes, t: mp4.Track) -> Result<Stream, string> {
+    let cfg = config_of(t.config)?;
+    // The edit list counts in the media's time scale, which for HE-AAC is twice the core's rate.
+    let scale = if (t.timescale > 0) { t.timescale } else { cfg.rate };
+    let skip = t.skip * cfg.rate / scale;
+    let decoded = t.offsets.len() * 1024 - skip;
+    let length = t.length * cfg.rate / scale;
+    var state: [Overlap] = [];
+    for _ in 0..cfg.channels {
+        state.push(channel());
+    }
+    Result.Ok(
+        Stream {
+            b: b,
+            t: tables(cfg.rate_index),
+            track: t,
+            state: state,
+            seed: [0x1F2E3D4C],
+            next: 0,
+            rate: cfg.rate,
+            channels: cfg.channels,
+            skip: skip,
+            total: if (length > 0 && length < decoded) { length } else { decoded }
+        }
+    )
+}
+
+fn reset(s: Stream) -> unit {
+    for c in 0..s.state.len() {
+        s.state[c] = channel();
+    }
+}
+
+/// Decodes the next packet, appending its samples to `out`; returns the frame its first sample
+/// is (negative within the priming), or None at the end. A damaged packet becomes silence.
+pub fn next(s: Stream, out: [int]) -> Option<int> {
+    let t = s.track;
+    let k = s.next;
+    if (k >= t.offsets.len()) {
+        return Option.None;
+    }
+    s.next = k + 1;
+    let before = out.len();
+    if let Result.Err(_) = frame(s, t.offsets[k], t.sizes[k], out) {
+        while (out.len() > before) {
+            let _drop = out.pop();
+        }
+        for _ in 0..1024 * s.channels {
+            out.push(0);
+        }
+        reset(s);
+    }
+    Option.Some(k * 1024 - s.skip)
+}
+
+/// Makes `next` continue from the packet that holds frame `pos`, after decoding (and dropping)
+/// the one before it, whose second half that packet overlaps.
+pub fn seek(s: Stream, pos: int) -> unit {
+    let n = s.track.offsets.len();
+    var k = (pos + s.skip) / 1024;
+    if (k > n) {
+        k = n;
+    }
+    reset(s);
+    if (k > 0) {
+        var scratch: [int] = [];
+        let _ok = frame(s, s.track.offsets[k - 1], s.track.sizes[k - 1], scratch);
+    }
+    s.next = k;
+}
