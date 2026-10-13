@@ -3,8 +3,10 @@
 // Sound is written to std/audio in 50 ms chunks; `write` parks the fiber while the device
 // is full, so the device sets the pace and commands are picked up between chunks.
 //
-// Position keeping: the device is (re)opened at every play, seek and resume, so
-// `audio.played_ms` counts from that point and `base_ms` remembers where the track was.
+// Position keeping: the device is (re)opened at every play and resume, so `audio.played_ms`
+// counts from that point and `base_ms` remembers where the track was. A seek while playing
+// keeps the device: closing it lets what is queued sound on under the new one (on iOS, a
+// quarter of a second or more of the old position over the new).
 
 import std/audio;
 import std/time;
@@ -53,6 +55,8 @@ struct State {
     handle: int,
     base_ms: int,
     frame: int,
+    /// Frames written since the device was opened.
+    written: int,
     note: string,
     in_background: bool,
     background_ms: int,
@@ -61,7 +65,9 @@ struct State {
 
 fn position_ms(s: State) -> int {
     if (s.playing && !s.paused && s.handle != 0) {
-        s.base_ms + audio.played_ms(s.handle).unwrap_or(0)
+        // Right after a seek, until what was queued has played, this is a little short of it.
+        let at = s.base_ms + audio.played_ms(s.handle).unwrap_or(0);
+        if (at < 0) { 0 } else { at }
     } else {
         s.base_ms
     }
@@ -110,6 +116,25 @@ fn open_at(s: State, ms: int) -> unit {
     }
     s.base_ms = ms;
     s.frame = ms * t.rate / 1000;
+    s.written = 0;
+}
+
+/// Moves playback to `ms` without reopening the device: the old position fades out in one
+/// chunk, then the new one fades in after what is still queued.
+fn seek_playing(s: State, ms: int) -> unit {
+    let t = s.tracks[s.current];
+    let frames = t.rate * CHUNK_MS / 1000;
+    let tail = synth.chunk_ramp(t, s.frame, frames, s.volume_prev, 0);
+    match (audio.write(s.handle, tail)) {
+        Result.Ok(_) => {
+            s.written = s.written + frames;
+        },
+        Result.Err(_) => { },
+    }
+    // The new position starts sounding once everything written so far has played.
+    s.base_ms = ms - s.written * 1000 / t.rate;
+    s.frame = ms * t.rate / 1000;
+    s.volume_prev = 0;
 }
 
 fn start(s: State, index: int, ms: int) -> unit {
@@ -175,7 +200,9 @@ fn handle(s: State, cmd: Cmd) -> bool {
             } else {
                 ms
             };
-            if (s.playing && !s.paused) {
+            if (s.playing && !s.paused && s.handle != 0) {
+                seek_playing(s, clamped);
+            } else if (s.playing && !s.paused) {
                 start(s, s.current, clamped);
             } else {
                 s.base_ms = clamped;
@@ -221,6 +248,7 @@ fn feed(s: State) -> unit {
     match (audio.write(s.handle, data)) {
         Result.Ok(_) => {
             s.frame = s.frame + frames;
+            s.written = s.written + frames;
             if (s.in_background) {
                 s.background_ms = s.background_ms + CHUNK_MS;
             }
@@ -245,6 +273,7 @@ pub fn run(cmds: Channel<Cmd>, tracks: [synth.Track]) -> unit {
         handle: 0,
         base_ms: 0,
         frame: 0,
+        written: 0,
         note: "",
         in_background: false,
         background_ms: 0,
