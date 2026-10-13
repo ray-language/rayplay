@@ -44,6 +44,9 @@ const CHUNK_MS: int = 50;
 
 const LATENCY_MS: int = 120;
 
+/// The fades around a seek: short enough not to be heard as a gap, long enough not to click.
+const FADE_MS: int = 10;
+
 struct State {
     tracks: [synth.Track],
     current: int,
@@ -119,22 +122,25 @@ fn open_at(s: State, ms: int) -> unit {
     s.written = 0;
 }
 
-/// Moves playback to `ms` without reopening the device: the old position fades out in one
-/// chunk, then the new one fades in after what is still queued.
+/// Moves playback to `ms` without reopening the device: the old position fades out and the
+/// new one fades in, each in a few milliseconds, after what is still queued.
 fn seek_playing(s: State, ms: int) -> unit {
     let t = s.tracks[s.current];
-    let frames = t.rate * CHUNK_MS / 1000;
-    let tail = synth.chunk_ramp(t, s.frame, frames, s.volume_prev, 0);
-    match (audio.write(s.handle, tail)) {
-        Result.Ok(_) => {
-            s.written = s.written + frames;
-        },
-        Result.Err(_) => { },
-    }
+    let frames = t.rate * FADE_MS / 1000;
+    write_counted(s, synth.chunk_ramp(t, s.frame, frames, s.volume_prev, 0), frames);
     // The new position starts sounding once everything written so far has played.
     s.base_ms = ms - s.written * 1000 / t.rate;
     s.frame = ms * t.rate / 1000;
-    s.volume_prev = 0;
+    write_counted(s, synth.chunk_ramp(t, s.frame, frames, 0, s.volume), frames);
+    s.frame = s.frame + frames;
+    s.volume_prev = s.volume;
+}
+
+/// Writes `data` (`frames` frames); a failed write is left for `feed` to report.
+fn write_counted(s: State, data: bytes, frames: int) -> unit {
+    if let Result.Ok(_) = audio.write(s.handle, data) {
+        s.written = s.written + frames;
+    }
 }
 
 fn start(s: State, index: int, ms: int) -> unit {
