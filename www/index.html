@@ -51,8 +51,8 @@
 <div class="list" id="list"></div>
 <!-- The program opens the native dialog and reads the file itself; the input is the fallback
      for a shell without one (there the whole file crosses the bridge as base64). -->
-<button class="load" id="pick">Load a song (MP3, FLAC or WAV)</button>
-<label class="load" id="fallback" hidden>Load a song (MP3, FLAC or WAV)<input id="file" type="file" accept=".mp3,.flac,.wav,audio/mpeg,audio/flac,audio/wav,audio/x-wav"></label>
+<button class="load" id="pick">Load a song (MP3, FLAC, WAV or AIFF)</button>
+<label class="load" id="fallback" hidden>Load a song (MP3, FLAC, WAV or AIFF)<input id="file" type="file" accept=".mp3,.flac,.wav,.aif,.aiff,.aifc,audio/mpeg,audio/flac,audio/wav,audio/x-wav,audio/aiff,audio/x-aiff"></label>
 <div class="status" id="status"></div>
 <script>
 (function () {
@@ -151,7 +151,7 @@
     let bin = '';
     for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
     // A plain string, not JSON: parsing a long JSON string costs the program ~55× its size.
-    await request('add:' + f.name.replace(/\.(wav|flac|mp3)$/i, '').replace(/\n/g, ' ') + '\n' + btoa(bin));
+    await request('add:' + f.name.replace(/\.(wav|aiff?|aifc|flac|mp3)$/i, '').replace(/\n/g, ' ') + '\n' + btoa(bin));
     e.target.value = '';
   };
 

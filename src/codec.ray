@@ -1,18 +1,19 @@
-// Turns an audio file into 16-bit PCM for the player, whatever its format: WAV, FLAC or MP3,
-// recognized by their content (not the file name). An ID3v2 tag in front is skipped.
+// Turns an audio file into 16-bit PCM for the player, whatever its format: WAV, AIFF, FLAC or
+// MP3, recognized by their content (not the file name). An ID3v2 tag in front is skipped.
 //
-// A WAV is PCM already and is kept as it is. FLAC and MP3 are kept compressed and decoded
+// A WAV or AIFF is PCM already and is kept as it is (as s16le). FLAC and MP3 are kept compressed and decoded
 // while they play: a `Stream` holds the file, its decoder and the few thousand samples
 // decoded ahead, and `read` serves any window of the track, seeking when it is not the next
 // one. So a song starts at once and costs its file size, not ten times it.
 
+import aiff;
 import flac;
 import mp3;
 import wav;
 
 /// The extensions the file dialogs and the page offer.
 pub fn extensions() -> [string] {
-    ["wav", "flac", "mp3"]
+    ["wav", "aiff", "aif", "aifc", "flac", "mp3"]
 }
 
 fn starts(b: bytes, at: int, tag: string) -> bool {
@@ -61,10 +62,13 @@ fn stream_of(dec: Decoder, rate: int, channels: int, total: int) -> Source {
     )
 }
 
-/// Recognizes `b` as WAV, FLAC or MP3 and gets it ready to play.
+/// Recognizes `b` as WAV, AIFF, FLAC or MP3 and gets it ready to play.
 pub fn open(b: bytes) -> Result<Source, string> {
     if (starts(b, 0, "RIFF")) {
         return Result.Ok(Source.Pcm(wav.parse(b)?));
+    }
+    if (starts(b, 0, "FORM")) {
+        return Result.Ok(Source.Pcm(aiff.parse(b)?));
     }
     let at = skip_id3(b);
     if (starts(b, at, "fLaC")) {
@@ -75,7 +79,7 @@ pub fn open(b: bytes) -> Result<Source, string> {
     // Some MP3s carry junk before the first frame: the indexer looks for one anyway.
     match (mp3.open(b, at)) {
         Result.Ok(m) => Result.Ok(stream_of(Decoder.Mp3(m), m.rate, m.channels, m.total)),
-        Result.Err(e) => Result.Err(if (looks_mp3) { e } else { "not a WAV, FLAC or MP3 file" }),
+        Result.Err(e) => Result.Err(if (looks_mp3) { e } else { "not a WAV, AIFF, FLAC or MP3 file" }),
     }
 }
 
@@ -158,7 +162,7 @@ pub fn read(s: Stream, from: int, frames: int) -> [int] {
     out
 }
 
-/// Decodes `b` whole, as WAV, FLAC or MP3 (tests and tools; the player streams).
+/// Decodes `b` whole, as WAV, AIFF, FLAC or MP3 (tests and tools; the player streams).
 pub fn decode(b: bytes) -> Result<wav.Pcm, string> {
     match (open(b)?) {
         Source.Pcm(p) => Result.Ok(p),
