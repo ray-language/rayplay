@@ -1,0 +1,120 @@
+// An AIFF and AIFF-C reader: Apple's counterpart of WAV, with big-endian integer PCM in IFF
+// chunks (`FORM` … `AIFF`/`AIFC`, then `COMM` and `SSND`). Samples of 8, 16, 24 or 32 bits,
+// mono or stereo; AIFF-C only uncompressed (`NONE`, `twos`) or little-endian 16-bit (`sowt`).
+// The result is 16-bit PCM like `wav.parse` gives: deeper samples are truncated, 8-bit ones
+// scaled up.
+
+import wav;
+
+fn read_u16(b: bytes, at: int) -> int {
+    (b[at] << 8) | b[at + 1]
+}
+
+fn read_u32(b: bytes, at: int) -> int {
+    (b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]
+}
+
+fn tag(b: bytes, at: int) -> string {
+    from_utf8(b.sub_bytes(at, at + 4)).unwrap_or("")
+}
+
+/// The sample rate, stored as an 80-bit IEEE extended float: a 15-bit exponent and a 64-bit
+/// mantissa with an explicit integer bit. The top 32 bits of the mantissa are enough for any
+/// rate below 2^31.
+fn extended_rate(b: bytes, at: int) -> int {
+    let e = (read_u16(b, at) & 0x7FFF) - 16383;
+    let hi = read_u32(b, at + 2);
+    if (e < 0 || e > 31) { 0 } else { hi >> (31 - e) }
+}
+
+/// Big-endian samples of `depth` bits in octets `from..to` to s16le. The output goes through
+/// `[int]` and is flushed to `bytes` every 768 KB, so a long file costs little more than its
+/// own size. `swap` = the samples are little-endian already (AIFF-C `sowt`, 16-bit only).
+fn to_s16le(b: bytes, from: int, to: int, depth: int, swap: bool) -> bytes {
+    var done = bytes_of([]);
+    var out: [int] = [];
+    let step = depth / 8;
+    var i = from;
+    while (i < to) {
+        if (swap) {
+            out.push(b[i]);
+            out.push(b[i + 1]);
+        } else if (step == 1) {
+            // 8-bit AIFF is signed: it becomes the high octet as it is.
+            out.push(0);
+            out.push(b[i]);
+        } else {
+            // The two most significant octets, low one first.
+            out.push(b[i + 1]);
+            out.push(b[i]);
+        }
+        i = i + step;
+        if (out.len() >= 786432) {
+            done = done + bytes_of(out);
+            out = [];
+        }
+    }
+    done + bytes_of(out)
+}
+
+/// Parses an AIFF or AIFF-C file.
+pub fn parse(b: bytes) -> Result<wav.Pcm, string> {
+    if (b.len() < 12 || tag(b, 0) != "FORM") {
+        return Result.Err("not an AIFF file");
+    }
+    let kind = tag(b, 8);
+    if (kind != "AIFF" && kind != "AIFC") {
+        return Result.Err("not an AIFF file");
+    }
+    var channels = 0;
+    var depth = 0;
+    var rate = 0;
+    var compression = "NONE";
+    var data_from = -1;
+    var data_to = -1;
+    var at = 12;
+    while (at + 8 <= b.len()) {
+        let id = tag(b, at);
+        let size = read_u32(b, at + 4);
+        let body = at + 8;
+        let end = if (body + size <= b.len()) { body + size } else { b.len() };
+        if (id == "COMM" && body + 18 <= b.len()) {
+            channels = read_u16(b, body);
+            depth = read_u16(b, body + 6);
+            rate = extended_rate(b, body + 8);
+            if (kind == "AIFC" && body + 22 <= b.len()) {
+                compression = tag(b, body + 18);
+            }
+        } else if (id == "SSND" && body + 8 <= b.len()) {
+            data_from = body + 8 + read_u32(b, body);
+            data_to = end;
+        }
+        // Chunks are word-aligned: an odd size carries one pad byte.
+        at = body + size + size % 2;
+    }
+    if (channels == 0) {
+        return Result.Err("AIFF without a COMM chunk");
+    }
+    if (data_from < 0) {
+        return Result.Err("AIFF without a SSND chunk");
+    }
+    let swap = compression == "sowt";
+    if (compression != "NONE" && compression != "twos" && !swap) {
+        return Result.Err(
+            "unsupported AIFF-C compression '${compression}' (only uncompressed PCM)"
+        );
+    }
+    if ((depth != 8 && depth != 16 && depth != 24 && depth != 32) || (swap && depth != 16)) {
+        return Result.Err("unsupported AIFF: ${to_string(depth)}-bit samples");
+    }
+    if (channels > 2 || rate < 8000 || rate > 192000) {
+        return Result.Err(
+            "unsupported AIFF: ${to_string(channels)} channels at ${to_string(rate)} Hz"
+        );
+    }
+    let frame = depth / 8 * channels;
+    let from = if (data_from < data_to) { data_from } else { data_to };
+    let whole = (data_to - from) / frame * frame;
+    let data = to_s16le(b, from, from + whole, depth, swap);
+    Result.Ok(wav.Pcm { rate: rate, channels: channels, data: data })
+}

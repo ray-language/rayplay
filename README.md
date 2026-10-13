@@ -10,9 +10,9 @@ con `std/audio`, y la página es solo la interfaz.
 
 - Tres pistas **procedurales** (un estudio pentatónico, un dron, un pulso de bajo), calculadas
   trozo a trozo: la app no lleva archivos de audio y ninguna pista ocupa memoria entera.
-- **Cargar una canción en MP3, FLAC o WAV** y añadirla a la lista (diálogo nativo en el
+- **Cargar una canción en MP3, FLAC, WAV o AIFF** y añadirla a la lista (diálogo nativo en el
   escritorio, selector del webview en el móvil). Los decodificadores están escritos en **raylang
-  puro** (`src/mp3.ray`, `src/flac.ray`, `src/wav.ray`) y la reproduce a su frecuencia y canales.
+  puro** (`src/mp3.ray`, `src/flac.ray`, `src/wav.ray`, `src/aiff.ray`) y la reproduce a su frecuencia y canales.
   El formato se reconoce por el contenido, no por el nombre.
 - **MP3 y FLAC se decodifican mientras suenan** (`codec.Stream`): al cargar solo se leen las
   cabeceras, así que la canción empieza al momento y ocupa lo que pesa el archivo. El seek salta
@@ -46,6 +46,7 @@ con `std/audio`, y la página es solo la interfaz.
 │  mp3.ray      MPEG-1/2/2.5 Layer III (port de minimp3)              │
 │  flac.ray     FLAC nativo, 4–32 bits, cualquier tamaño de bloque    │
 │  wav.ray      PCM de 16 bits (Pcm, Sink) y RIFF/WAVE (16 y 24 bits) │
+│  aiff.ray     AIFF y AIFF-C (8–32 bits, big-endian y `sowt`)        │
 │  bits.ray     lector de bits big-endian sobre bytes                 │
 │  b64.ray      base64 → bytes rápido (std/base64 no aguantaba 56 MB) │
 └────────────────────────────────────────────────────────────────────┘
@@ -67,7 +68,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 35 tests: MP3, FLAC, WAV, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
+make test            # 37 tests: MP3, FLAC, WAV, AIFF, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -101,26 +102,28 @@ el emulador Android.
 
 | Qué | Verificado |
 |---|---|
-| Backend | `make test`: 35 tests, VM y nativo (`make test-native`) |
-| Decodificadores | FLAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono, nivel 12, el codificador de Apple). MP3 idéntico a minimp3 compilado en C salvo ±1 en el 0,1 % de las muestras (floats de 64 frente a 32 bits): CBR, VBR, mono, joint y simple stereo, MPEG-2 22 kHz, MPEG-2.5 8 kHz, con ID3v2/ID3v1 y el recorte gapless de LAME. Una pista de 5 min en nativo (Mac), entera en streaming: FLAC 1,2 s y 68 MB de pico (el archivo pesa 30), MP3 1,2 s y 16 MB (antes, decodificándola entera al cargar: 287 y 256 MB). Abrir y servir el primer trozo, ~1 ms. Tras 40 saltos aleatorios por archivo, las muestras coinciden exactamente con la decodificación completa |
+| Backend | `make test`: 37 tests, VM y nativo (`make test-native`) |
+| Decodificadores | AIFF idéntico bit a bit a ffmpeg (8, 16, 24 y 32 bits; mono y estéreo; AIFF-C `NONE` y `sowt`; archivos de `afconvert` de Apple). FLAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono, nivel 12, el codificador de Apple). MP3 idéntico a minimp3 compilado en C salvo ±1 en el 0,1 % de las muestras (floats de 64 frente a 32 bits): CBR, VBR, mono, joint y simple stereo, MPEG-2 22 kHz, MPEG-2.5 8 kHz, con ID3v2/ID3v1 y el recorte gapless de LAME. Una pista de 5 min en nativo (Mac), entera en streaming: FLAC 1,2 s y 68 MB de pico (el archivo pesa 30), MP3 1,2 s y 16 MB (antes, decodificándola entera al cargar: 287 y 256 MB). Abrir y servir el primer trozo, ~1 ms. Tras 40 saltos aleatorios por archivo, las muestras coinciden exactamente con la decodificación completa |
 | Programa completo | `ray run` headless: monta `www/` y abre `ray://app/index.html` |
 | iOS | simulador iPhone 16 Pro (`ray bundle --ios --ios-target sim`, shell 1.27.19 con sesión `playback` y `UIBackgroundModes = audio`): arranca, la página llega por `ray://app`, el puente responde y el display muestra el `lifecycle` del shell; `audio.open` abre el dispositivo dentro del shell (comprobado con una mini app) |
 | Android | emulador arm64 (`ray bundle --android`, shell 1.27.19 con *foreground service* `mediaPlayback`): Play por `adb`, Home durante 10 s, vuelta: la posición pasó de 0:05 a 0:17 y el display dice «played in the background: 0:09». **El audio sigue en segundo plano** |
 | Desarrollo en vivo | `ray dev --device` + `ray dev-client` en el escritorio (1.27.25, headless): recibe los 12 archivos, monta `www/` y abre `ray://app/index.html`. Las shells `--dev` de iOS y Android se generan con `background_audio`; en un **iPhone real**, la shell de desarrollo arranca la app y suena (con los chasquidos del hallazgo 4) |
 | Segundo plano en iPhone real | **verificado** (29 sep 2026): Play, cambio de app, vuelta: el audio sigue y el display muestra lo reproducido en segundo plano |
-| MP3 y FLAC en iPhone real | **verificado** (12 oct 2026, iPhone 12, app nativa): MP3 y FLAC de 24 bits y 5 min cargados con el `<input type=file>` suenan limpios, también en segundo plano; con la decodificación en streaming empiezan al momento y el seek funciona en ambos sentidos |
+| MP3 y FLAC en iPhone real | **verificado** (12 oct 2026, iPhone 12, app nativa): MP3 y FLAC de 24 bits y 5 min cargados con el `<input type=file>` suenan limpios, también en segundo plano; con la decodificación en streaming empiezan al momento y el seek funciona en ambos sentidos. Con raylang 1.27.49, lo mismo; y un AIFF de 24 bits de `afconvert` (13 oct 2026) |
 
 ## Limitaciones
 
-- MP3 (Layer III; ni Layer I/II ni *free format*), FLAC nativo (no Ogg FLAC) y WAV PCM de 16 o
-  24 bits. Ni OGG/Vorbis ni AAC/M4A: la stdlib no trae decodificadores y estos no están escritos.
+- MP3 (Layer III; ni Layer I/II ni *free format*), FLAC nativo (no Ogg FLAC), WAV PCM de 16 o
+  24 bits y AIFF/AIFF-C PCM de 8 a 32 bits (no comprimido: ni µ-law, ni A-law, ni float). Ni OGG/Vorbis ni AAC/M4A: la stdlib no trae decodificadores y estos no están escritos.
   Lo que pase de 16 bits se trunca (sin dither); de un FLAC de más
   de dos canales se quedan los dos primeros. El reproductor no remuestrea: abre el dispositivo a
   la frecuencia de la pista.
 - En la shell de desarrollo (VM), decodificar va justo: en el Mac, 5 s de audio en 1,4–1,6 s
   (MP3) y 0,6 s (FLAC), unas 3,5× el tiempo real; un seek, 30–80 ms. En un teléfono puede no dar
   abasto; para probar con música de verdad, la app nativa.
-- Un WAV no se decodifica: se guarda como PCM tal cual (un WAV de 24 bits, ya reducido a 16).
+- Un WAV o un AIFF no se decodifica: se guarda como PCM (s16le) desde que se carga. Un WAV de
+  16 bits queda tal cual; uno de 24 bits y los AIFF (big-endian) se convierten al cargar: un AIFF
+  de 5 min tarda 0,2 s en nativo y ~4 s en la VM.
 - Cargar un archivo: en el escritorio, el programa abre el diálogo nativo y lo lee del disco.
   En iOS/Android no hay diálogo (`ui.pick_file_with` devuelve «file dialogs are not available on
   mobile (v1)», #152), así que la página usa su `<input type=file>` y el archivo cruza el puente
