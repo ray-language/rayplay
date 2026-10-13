@@ -1,0 +1,45 @@
+import dither;
+
+/// The average of `to_16` over `n` places for one `depth`-bit value.
+fn mean_of(v: int, depth: int, n: int) -> float {
+    var sum = 0;
+    for i in 0..n {
+        sum = sum + dither.to_16(v, depth, dither.place(7, i, 0));
+    }
+    (sum as float) / (n as float)
+}
+
+@test
+fn dither_keeps_what_is_below_the_16th_bit_on_average() {
+    // Half a step: truncating gives 0 every time; dithered, it averages one half.
+    let half = mean_of(128, 24, 20000);
+    assert(half > 0.45 && half < 0.55);
+    let quarter = mean_of(64, 24, 20000);
+    assert(quarter > 0.2 && quarter < 0.3);
+    // Silence stays centred, and a negative value is not pulled down by half a step.
+    let zero = mean_of(0, 24, 20000);
+    assert(zero > -0.05 && zero < 0.05);
+    let minus = mean_of(-128, 24, 20000);
+    assert(minus > -0.55 && minus < -0.45);
+}
+
+@test
+fn dither_stays_within_a_step_and_is_the_same_at_the_same_place() {
+    for i in 0..5000 {
+        let at = dither.place(1234, i, i % 2);
+        let v = (i * 7919) % 0x1000000 - 0x800000;
+        let out = dither.to_16(v, 24, at);
+        // Rounded, then ±1 of noise.
+        let d = out - ((v + 128) >> 8);
+        assert(d >= -1 && d <= 1);
+        assert_eq(out, dither.to_16(v, 24, at));
+    }
+    // 16 bits and fewer go through untouched (scaled up).
+    assert_eq(dither.to_16(-1234, 16, 0), -1234);
+    assert_eq(dither.to_16(-3, 8, 0), -768);
+    // The extremes clamp instead of wrapping.
+    for i in 0..200 {
+        assert(dither.to_16(0x7FFFFF, 24, i) <= 32767);
+        assert(dither.to_16(-0x800000, 24, i) >= -32768);
+    }
+}

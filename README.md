@@ -58,6 +58,7 @@ con `std/audio`, y la página es solo la interfaz.
 │  vorbis.ray   Vorbis I (floor 1, residuos 0–2, acoplamiento)        │
 │  mdct.ray     la IMDCT de AAC y Vorbis (DCT-IV por una FFT)         │
 │  bits.ray     lector de bits big-endian sobre bytes                 │
+│  dither.ray   de 24/32 bits a 16: dither TPDF según la posición     │
 │  b64.ray      base64 → bytes rápido (std/base64 no aguantaba 56 MB) │
 └────────────────────────────────────────────────────────────────────┘
 ```
@@ -78,7 +79,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 46 tests: MP3, AAC, Vorbis, FLAC, ALAC, WAV, AIFF, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
+make test            # 48 tests: MP3, AAC, Vorbis, FLAC, ALAC, WAV, AIFF, dither, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -119,7 +120,7 @@ el emulador Android.
 | Android | emulador arm64 (`ray bundle --android`, shell 1.27.19 con *foreground service* `mediaPlayback`): Play por `adb`, Home durante 10 s, vuelta: la posición pasó de 0:05 a 0:17 y el display dice «played in the background: 0:09». **El audio sigue en segundo plano** |
 | Desarrollo en vivo | `ray dev --device` + `ray dev-client` en el escritorio (1.27.25, headless): recibe los 12 archivos, monta `www/` y abre `ray://app/index.html`. Las shells `--dev` de iOS y Android se generan con `background_audio`; en un **iPhone real**, la shell de desarrollo arranca la app y suena (con los chasquidos del hallazgo 4) |
 | Segundo plano en iPhone real | **verificado** (29 sep 2026): Play, cambio de app, vuelta: el audio sigue y el display muestra lo reproducido en segundo plano |
-| MP3, FLAC, AIFF, ALAC, AAC y Ogg Vorbis en iPhone real, hasta 24/192 | **verificado** (12 oct 2026, iPhone 12, app nativa): MP3 y FLAC de 24 bits y 5 min cargados con el `<input type=file>` suenan limpios, también en segundo plano; con la decodificación en streaming empiezan al momento y el seek funciona en ambos sentidos. Con raylang 1.27.49, lo mismo; y un AIFF de 24 bits de `afconvert` (13 oct 2026). Un ALAC de 16 bits (.m4a de `afconvert`) suena bien, con los WAV y AIFF ya leídos directamente del archivo (13 oct 2026). Un AAC-LC de 6 s a 128 kb/s y otro de 5 min a 256 kb/s (.m4a de `afconvert`) suenan bien y el seek funciona (13 oct 2026); lo mismo con el decodificador acelerado. Un Ogg Vorbis de 6 s (q0.4) y otro de 5 min (de libvorbis) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). FLAC y ALAC de 24 bits a 96 y 192 kHz (un groove sintético de 33 s, bit a bit iguales a ffmpeg al pasar a 16 bits) suenan bien; con música rítmica, cada salto dejaba oír medio segundo de la posición vieja encima de la nueva al cerrar y reabrir la salida, y ahora el salto sigue en la misma salida con fundidos de 10 ms: los saltos suenan naturales y la traza de audio no da cortes (13 oct 2026). Next, el paso solo de una pista a la siguiente, pausa y reanudación ya no se solapan: con la misma frecuencia y canales la salida sigue (sin hueco entre pistas) y si no, se cierra cuando ha sonado su cola (13 oct 2026) |
+| MP3, FLAC, AIFF, ALAC, AAC y Ogg Vorbis en iPhone real, hasta 24/192 | **verificado** (12 oct 2026, iPhone 12, app nativa): MP3 y FLAC de 24 bits y 5 min cargados con el `<input type=file>` suenan limpios, también en segundo plano; con la decodificación en streaming empiezan al momento y el seek funciona en ambos sentidos. Con raylang 1.27.49, lo mismo; y un AIFF de 24 bits de `afconvert` (13 oct 2026). Un ALAC de 16 bits (.m4a de `afconvert`) suena bien, con los WAV y AIFF ya leídos directamente del archivo (13 oct 2026). Un AAC-LC de 6 s a 128 kb/s y otro de 5 min a 256 kb/s (.m4a de `afconvert`) suenan bien y el seek funciona (13 oct 2026); lo mismo con el decodificador acelerado. Un Ogg Vorbis de 6 s (q0.4) y otro de 5 min (de libvorbis) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). FLAC y ALAC de 24 bits a 96 y 192 kHz (un groove sintético de 33 s, bit a bit iguales a ffmpeg al pasar a 16 bits) suenan bien; con música rítmica, cada salto dejaba oír medio segundo de la posición vieja encima de la nueva al cerrar y reabrir la salida, y ahora el salto sigue en la misma salida con fundidos de 10 ms: los saltos suenan naturales y la traza de audio no da cortes (13 oct 2026). Next, el paso solo de una pista a la siguiente, pausa y reanudación ya no se solapan: con la misma frecuencia y canales la salida sigue (sin hueco entre pistas) y si no, se cierra cuando ha sonado su cola (13 oct 2026). Con el dither de 24 a 16 bits, los FLAC y ALAC de 24 bits suenan como antes (13 oct 2026) |
 
 ## Limitaciones
 
@@ -129,7 +130,8 @@ el emulador Android.
   ni frames de 960); de HE-AAC v1/v2 solo el núcleo LC, sin la banda alta de SBR (suena apagado,
   a media frecuencia). Vorbis mono o estéreo en Ogg, sin el floor 0 (LSP) y solo la primera pista
   de un Ogg encadenado; Opus no está escrito. Lo que pase de 16
-  bits se trunca (sin dither); de un FLAC de más de dos canales se quedan los dos primeros. El
+  bits se reduce a 16 con dither triangular (TPDF) y redondeo, porque `std/audio` solo acepta
+  s16le (hallazgo #167); de un FLAC de más de dos canales se quedan los dos primeros. El
   reproductor no remuestrea: abre el dispositivo a la frecuencia de la pista.
 - En la shell de desarrollo (VM), decodificar va justo: en el Mac, 5 s de audio en 1,4–1,6 s
   (MP3), 1 s (AAC) y 0,6 s (FLAC), unas 3,5–5× el tiempo real; un seek, 30–80 ms. En un teléfono puede no dar
