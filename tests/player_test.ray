@@ -2,8 +2,10 @@
 // output is a real-time null sink: no sound card needed, the clock still runs.
 
 import std/time;
+import codec;
 import player;
 import synth;
+import wav;
 
 fn start_player() -> Channel<player.Cmd> {
     let cmds: Channel<player.Cmd> = Channel.bounded(64);
@@ -69,5 +71,66 @@ fn seek_and_volume_are_clamped_and_notes_are_kept() {
     let s = player.query(cmds);
     assert_eq(s.note, "background 12:00:00");
     assert(s.background_ms >= 100);
+    send(cmds, player.Cmd.Quit);
+}
+
+/// A loaded track of `ms` milliseconds of quiet stereo at 44.1 kHz, the builtins' format.
+fn short_track(name: string, ms: int) -> synth.Track {
+    var data: [int] = [];
+    for _ in 0..44100 * ms / 1000 * 4 {
+        data.push(1);
+    }
+    let p = wav.Pcm { rate: 44100, channels: 2, data: bytes_of(data) };
+    synth.loaded(name, codec.open(wav.encode(p)).unwrap())
+}
+
+@test
+fn next_while_playing_goes_on_from_the_start_of_the_next_track() {
+    let cmds = start_player();
+    send(cmds, player.Cmd.Play(0));
+    time.sleep(500);
+    send(cmds, player.Cmd.Next);
+    time.sleep(700);
+    let s = player.query(cmds);
+    assert_eq(s.current, 1);
+    assert(s.playing);
+    // The next track starts once the queue of the last one has played.
+    assert(s.position_ms > 100);
+    assert(s.position_ms < 700);
+    send(cmds, player.Cmd.Quit);
+}
+
+@test
+fn a_track_that_ends_runs_into_the_next() {
+    let cmds = start_player();
+    send(cmds, player.Cmd.Add(short_track("a", 300)));
+    send(cmds, player.Cmd.Add(short_track("b", 3000)));
+    send(cmds, player.Cmd.Play(3));
+    time.sleep(1200);
+    let s = player.query(cmds);
+    assert_eq(s.current, 4);
+    assert(s.playing);
+    assert(s.position_ms > 300);
+    assert(s.position_ms < 1200);
+    send(cmds, player.Cmd.Quit);
+}
+
+@test
+fn a_pause_holds_where_the_sound_stopped_and_resumes_there() {
+    let cmds = start_player();
+    send(cmds, player.Cmd.Play(0));
+    time.sleep(600);
+    let before = player.query(cmds).position_ms;
+    send(cmds, player.Cmd.Toggle);
+    let paused = player.query(cmds);
+    assert(paused.paused);
+    // The queue still plays after the pause: the position is where it ran out, a bit ahead.
+    assert(paused.position_ms >= before);
+    assert(paused.position_ms < before + 600);
+    send(cmds, player.Cmd.Toggle);
+    time.sleep(500);
+    let s = player.query(cmds);
+    assert(!s.paused);
+    assert(s.position_ms > paused.position_ms);
     send(cmds, player.Cmd.Quit);
 }
