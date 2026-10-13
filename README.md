@@ -40,9 +40,9 @@ con `std/audio`, y la página es solo la interfaz.
 │  player.ray   ACTOR: una fibra con el dispositivo (std/audio) y la  │
 │               lista; comandos por canal; 50 ms por chunk            │
 │  synth.ray    las pistas: procedurales o archivo cargado → s16le    │
-│  codec.ray    reconoce el formato (salta ID3v2); Stream decodifica  │
-│               MP3/FLAC por frames mientras suena y sirve cualquier  │
-│               ventana (seek)                                        │
+│  codec.ray    reconoce el formato (salta ID3v2); Stream sirve       │
+│               cualquier ventana (seek): MP3/FLAC decodificados por  │
+│               frames, WAV/AIFF leídos tal cual del archivo          │
 │  mp3.ray      MPEG-1/2/2.5 Layer III (port de minimp3)              │
 │  flac.ray     FLAC nativo, 4–32 bits, cualquier tamaño de bloque    │
 │  wav.ray      PCM de 16 bits (Pcm, Sink) y RIFF/WAVE (16 y 24 bits) │
@@ -121,16 +121,16 @@ el emulador Android.
 - En la shell de desarrollo (VM), decodificar va justo: en el Mac, 5 s de audio en 1,4–1,6 s
   (MP3) y 0,6 s (FLAC), unas 3,5× el tiempo real; un seek, 30–80 ms. En un teléfono puede no dar
   abasto; para probar con música de verdad, la app nativa.
-- Un WAV o un AIFF no se decodifica: se guarda como PCM (s16le) desde que se carga. Un WAV de
-  16 bits queda tal cual; uno de 24 bits y los AIFF (big-endian) se convierten al cargar: un AIFF
-  de 5 min tarda 0,2 s en nativo y ~4 s en la VM.
+- Un WAV o un AIFF tampoco se convierte al cargar: se guarda el archivo tal cual y cada trozo
+  de 50 ms se pasa a 16 bits al reproducirlo (`wav.Raw`). Un AIFF de 5 min se abre en 12 ms y
+  ocupa lo que pesa (antes, convertido entero: 213 ms y 325 MB de pico).
 - Cargar un archivo: en el escritorio, el programa abre el diálogo nativo y lo lee del disco.
   En iOS/Android no hay diálogo (`ui.pick_file_with` devuelve «file dialogs are not available on
   mobile (v1)», #152), así que la página usa su `<input type=file>` y el archivo cruza el puente
   entero en base64. Va como string plano y no como JSON, porque `json.parse` gasta ~55× un string
   largo (#150), y se decodifica con `src/b64.ray` sobre los octetos de la petición: `std/base64`
-  pide un `string` y recortarlo copia (#161). Un WAV de 56 MB de 24 bits llega a unos 450 MB y
-  tarda 0,4 s en nativo; en la shell de desarrollo (VM) no cabe.
+  pide un `string` y recortarlo copia (#161). Un WAV de 56 MB de 24 bits llega a unos 470 MB
+  durante la subida (casi todo, la petición y su base64) y tarda 0,3 s en nativo; en la shell de desarrollo (VM) no cabe.
 - Sin cola persistente: la lista vuelve a las tres pistas al relanzar.
 
 ## Hallazgos de dogfood

@@ -1,19 +1,17 @@
 // The tracks. Three are procedural — a few minutes of sound computed chunk by chunk, so the
 // app ships no audio files and no track ever sits whole in memory — and a song the user
-// loads is either PCM (a WAV) or a compressed file decoded as it plays (FLAC, MP3).
+// loads stays as its file, turned into PCM as it plays (`codec.Stream`).
 // `chunk` renders any window of a track as s16le at the track's rate, which is all the
 // player needs.
 
 import std/math;
 import codec;
-import wav;
 
 pub enum Kind {
     Etude,
     Drone,
     Pulse,
-    Loaded(wav.Pcm),
-    Streamed(codec.Stream),
+    Loaded(codec.Stream),
 }
 
 pub struct Track {
@@ -45,36 +43,21 @@ pub fn builtin() -> [Track] {
     ]
 }
 
-/// A track from PCM (a WAV the user loaded).
-pub fn loaded(name: string, p: wav.Pcm) -> Track {
+/// A track from a file the user loaded, as `codec.open` left it.
+pub fn loaded(name: string, s: codec.Stream) -> Track {
     Track {
         name: name,
-        kind: Kind.Loaded(p),
-        rate: p.rate,
-        channels: p.channels,
-        duration_ms: wav.duration_ms(p)
-    }
-}
-
-/// A track from a file the user loaded, as `codec.open` left it.
-pub fn of_source(name: string, src: codec.Source) -> Track {
-    match (src) {
-        codec.Source.Pcm(p) => loaded(name, p),
-        codec.Source.Stream(s) => Track {
-            name: name,
-            kind: Kind.Streamed(s),
-            rate: s.rate,
-            channels: s.channels,
-            duration_ms: s.total * 1000 / s.rate
-        },
+        kind: Kind.Loaded(s),
+        rate: s.rate,
+        channels: s.channels,
+        duration_ms: s.total * 1000 / s.rate
     }
 }
 
 /// Frames in the track: exact for a loaded file, from the duration for a procedural one.
 pub fn total_frames(t: Track) -> int {
     match (t.kind) {
-        Kind.Loaded(p) => wav.frames(p),
-        Kind.Streamed(s) => s.total,
+        Kind.Loaded(s) => s.total,
         _ => t.duration_ms * t.rate / 1000,
     }
 }
@@ -155,27 +138,7 @@ pub fn chunk_ramp(t: Track, from: int, frames: int, volume_from: int, volume: in
     var out: [int] = [];
     let end = total_frames(t);
     match (t.kind) {
-        Kind.Loaded(p) => {
-            let block = 2 * p.channels;
-            for i in 0..frames {
-                let fr = from + i;
-                let gain = gain_from + step * ((i + 1) as float);
-                for ch in 0..t.channels {
-                    var sample = 0;
-                    if (fr < end) {
-                        let at = fr * block + ch * 2;
-                        var v = p.data[at] + p.data[at + 1] * 256;
-                        if (v >= 32768) {
-                            v = v - 65536;
-                        }
-                        sample = clamp16(((v as float) / 32768.0) * gain);
-                    }
-                    out.push(sample % 256);
-                    out.push(sample / 256);
-                }
-            }
-        },
-        Kind.Streamed(st) => {
+        Kind.Loaded(st) => {
             let samples = codec.read(st, from, frames);
             let ch = t.channels;
             for i in 0..frames {

@@ -1,6 +1,6 @@
 // 16-bit PCM, the one format the player plays (`Pcm`, and the `Sink` the decoders write it to),
-// and a RIFF/WAVE reader and writer for it. 24-bit WAVs are read too and reduced to 16 bits.
-// Everything is little-endian; `b[i]` is the octet at `i`.
+// `Raw`, uncompressed PCM left where it is in a loaded file, and a RIFF/WAVE reader and writer.
+// WAVs of 16 or 24 bits are read; everything is little-endian; `b[i]` is the octet at `i`.
 
 /// Interleaved s16le samples with their format.
 pub struct Pcm {
@@ -46,6 +46,54 @@ pub fn finish(s: Sink) -> bytes {
     s.done
 }
 
+/// Integer PCM still inside the file it came in (a WAV or an AIFF): where the samples start and
+/// how they are stored. Nothing is converted on load; `sample` reads any one of them as 16 bits.
+pub struct Raw {
+    b: bytes,
+    /// The octet the first sample starts at.
+    from: int,
+    /// Whole frames (samples per channel).
+    frames: int,
+    rate: int,
+    channels: int,
+    /// Bits per sample: 8, 16, 24 or 32.
+    depth: int,
+    /// Byte order of each sample.
+    big_endian: bool,
+}
+
+/// Sample `i` (interleaved) as a signed 16-bit value: its two most significant octets, so deeper
+/// samples are truncated and 8-bit ones (signed, as in AIFF) scaled up.
+pub fn sample(r: Raw, i: int) -> int {
+    let step = r.depth / 8;
+    let at = r.from + i * step;
+    let b = r.b;
+    var v = 0;
+    if (r.big_endian) {
+        v = if (step == 1) { b[at] << 8 } else { (b[at] << 8) | b[at + 1] };
+    } else {
+        v = (b[at + step - 1] << 8) | b[at + step - 2];
+    }
+    if (v >= 32768) { v - 65536 } else { v }
+}
+
+/// The whole of `r` as s16le (tests, tools): a 16-bit little-endian WAV is shared, not copied.
+pub fn to_pcm(r: Raw) -> Pcm {
+    let n = r.frames * r.channels;
+    if (r.depth == 16 && !r.big_endian) {
+        return Pcm {
+            rate: r.rate,
+            channels: r.channels,
+            data: r.b.sub_bytes(r.from, r.from + 2 * n)
+        };
+    }
+    let s = sink();
+    for i in 0..n {
+        put(s, sample(r, i));
+    }
+    Pcm { rate: r.rate, channels: r.channels, data: finish(s) }
+}
+
 fn read_u16(b: bytes, at: int) -> int {
     b[at] + b[at + 1] * 256
 }
@@ -58,28 +106,9 @@ fn tag(b: bytes, at: int) -> string {
     from_utf8(b.sub_bytes(at, at + 4)).unwrap_or("")
 }
 
-/// 24-bit samples to 16: keeps the two high octets of each one (truncation, no dither). The
-/// output goes through `[int]` and is flushed to `bytes` every 768 KB, so a long file costs
-/// little more than its own size.
-fn from_24(b: bytes, from: int, to: int) -> bytes {
-    var done = bytes_of([]);
-    var out: [int] = [];
-    var i = from;
-    while (i < to) {
-        out.push(b[i + 1]);
-        out.push(b[i + 2]);
-        i = i + 3;
-        if (out.len() >= 786432) {
-            done = done + bytes_of(out);
-            out = [];
-        }
-    }
-    done + bytes_of(out)
-}
-
-/// Parses a WAV file: PCM (format 1) or WAVE_FORMAT_EXTENSIBLE (0xFFFE) with 16- or 24-bit
-/// samples; the result is always 16-bit.
-pub fn parse(b: bytes) -> Result<Pcm, string> {
+/// Opens a WAV file: PCM (format 1) or WAVE_FORMAT_EXTENSIBLE (0xFFFE) with 16- or 24-bit
+/// samples. Only the header is read.
+pub fn open(b: bytes) -> Result<Raw, string> {
     if (b.len() < 12 || tag(b, 0) != "RIFF" || tag(b, 8) != "WAVE") {
         return Result.Err("not a WAV file");
     }
@@ -113,18 +142,27 @@ pub fn parse(b: bytes) -> Result<Pcm, string> {
             }
             let end = if (body + size <= b.len()) { body + size } else { b.len() };
             let frame = bits / 8 * channels;
-            let whole = (end - body) / frame * frame;
-            let data = if (bits == 24) {
-                from_24(b, body, body + whole)
-            } else {
-                b.sub_bytes(body, body + whole)
-            };
-            return Result.Ok(Pcm { rate: rate, channels: channels, data: data });
+            return Result.Ok(
+                Raw {
+                    b: b,
+                    from: body,
+                    frames: (end - body) / frame,
+                    rate: rate,
+                    channels: channels,
+                    depth: bits,
+                    big_endian: false
+                }
+            );
         }
         // Chunks are word-aligned: an odd size carries one pad byte.
         at = body + size + size % 2;
     }
     Result.Err("WAV without a data chunk")
+}
+
+/// Parses a WAV file into 16-bit PCM (24-bit samples truncated).
+pub fn parse(b: bytes) -> Result<Pcm, string> {
+    Result.Ok(to_pcm(open(b)?))
 }
 
 fn le16(v: int) -> [int] {
