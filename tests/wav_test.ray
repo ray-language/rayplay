@@ -40,13 +40,22 @@ fn wav24(samples: [int]) -> bytes {
 
 @test
 fn a_24_bit_wav_is_read_as_16_bit() {
-    // Frames (0x123456, -1) and (max, min); a trailing partial frame is dropped.
+    // Frames (0x123456, -1) and (max, min); a trailing partial frame is dropped. Dithered, each
+    // sample is within a step of its top 16 bits, and the extremes do not wrap.
     let p = wav.parse(wav24([0x56, 0x34, 0x12, 255, 255, 255, 255, 255, 127, 0, 0, 128, 9, 9]))
         .unwrap();
     assert_eq(p.rate, 48000);
     assert_eq(p.channels, 2);
     assert_eq(wav.frames(p), 2);
-    assert_eq(p.data == bytes_of([0x34, 0x12, 255, 255, 255, 127, 0, 128]), true);
+    let want = [0x1234, -1, 32767, -32768];
+    for i in 0..4 {
+        var v = p.data[2 * i] + p.data[2 * i + 1] * 256;
+        if (v >= 32768) {
+            v = v - 65536;
+        }
+        let d = v - want[i];
+        assert(d >= -1 && d <= 1);
+    }
 }
 
 @test

@@ -1,6 +1,6 @@
 // A FLAC decoder (https://xiph.org/flac/format.html): native FLAC streams with any block size,
 // 4 to 32 bits per sample and the four channel assignments. The result is 16-bit PCM for the
-// player: deeper samples are truncated to 16 bits, shallower ones scaled up, and of a stream
+// player: deeper samples are dithered to 16 bits, shallower ones scaled up, and of a stream
 // with more than two channels only the first two (front left and right) are kept.
 //
 // It decodes a frame at a time (`next`), so a track plays while it is decoded, and `seek`
@@ -8,6 +8,7 @@
 // headers carry: no index, nothing to scan when a file is loaded.
 
 import bits;
+import dither;
 
 struct Info {
     rate: int,
@@ -383,16 +384,9 @@ fn frame(b: bytes, h: Head, info: Info, out: [int]) -> Result<int, string> {
     let a = chans[0];
     let c = if (keep == 2 && channels > 1) { chans[1] } else { chans[0] };
     for i in 0..block {
-        if (depth >= 16) {
-            out.push(a[i] >> (depth - 16));
-            if (keep == 2) {
-                out.push(c[i] >> (depth - 16));
-            }
-        } else {
-            out.push(a[i] << (16 - depth));
-            if (keep == 2) {
-                out.push(c[i] << (16 - depth));
-            }
+        out.push(dither.to_16(a[i], depth, dither.place(h.body, i, 0)));
+        if (keep == 2) {
+            out.push(dither.to_16(c[i], depth, dither.place(h.body, i, 1)));
         }
     }
     Result.Ok(bits.octet_pos(r))

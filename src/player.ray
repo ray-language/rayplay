@@ -3,12 +3,15 @@
 // Sound is written to std/audio in 50 ms chunks; `write` parks the fiber while the device
 // is full, so the device sets the pace and commands are picked up between chunks.
 //
-// Position keeping: the device is (re)opened at every play and resume, so `audio.played_ms`
-// counts from that point and `base_ms` remembers where the track was. A seek while playing
-// keeps the device: closing it lets what is queued sound on under the new one (on iOS, a
-// quarter of a second or more of the old position over the new).
+// Position keeping: `audio.played_ms` counts from when the device was opened, and `base_ms`
+// is what to add to it to get the position in the track. Closing the device does not cut what
+// is queued (on iOS, a quarter of a second or more): it would sound on under the next output.
+// So a seek, or a change of track into the same rate and channels, keeps the device and goes on
+// writing; and a device is closed only once its queue has played (a pause, a stop, a track in
+// another format).
 
 import std/audio;
+import std/math;
 import std/time;
 import synth;
 
@@ -94,16 +97,32 @@ fn snapshot(s: State) -> Snapshot {
     }
 }
 
+/// Ends the output: what is playing fades out, and the queue plays before the device closes.
 fn close_output(s: State) -> unit {
     if (s.handle != 0) {
+        if (s.playing && !s.paused) {
+            fade_out(s);
+        }
+        let _d = audio.drain(s.handle);
         close(s.handle);
         s.handle = 0;
     }
 }
 
+/// Writes the next few milliseconds of the current track fading to silence (nothing past its end).
+fn fade_out(s: State) -> unit {
+    let t = s.tracks[s.current];
+    let left = synth.total_frames(t) - s.frame;
+    let frames = math.min(t.rate * FADE_MS / 1000, left);
+    if (frames > 0) {
+        write_counted(s, synth.chunk_ramp(t, s.frame, frames, s.volume_prev, 0), frames);
+        s.frame = s.frame + frames;
+    }
+    s.volume_prev = 0;
+}
+
 /// Opens the device for the current track at `ms` into it.
 fn open_at(s: State, ms: int) -> unit {
-    close_output(s);
     let t = s.tracks[s.current];
     match (audio.open_latency(t.rate, t.channels, LATENCY_MS)) {
         Result.Ok(h) => {
@@ -120,17 +139,30 @@ fn open_at(s: State, ms: int) -> unit {
     s.base_ms = ms;
     s.frame = ms * t.rate / 1000;
     s.written = 0;
+    // The first chunk fades in from silence.
+    s.volume_prev = 0;
+}
+
+/// Goes on at `ms` into the current track in the same output, after what is queued.
+fn continue_at(s: State, ms: int) -> unit {
+    let t = s.tracks[s.current];
+    // The new position starts sounding once everything written so far has played.
+    s.base_ms = ms - s.written * 1000 / t.rate;
+    s.frame = ms * t.rate / 1000;
 }
 
 /// Moves playback to `ms` without reopening the device: the old position fades out and the
 /// new one fades in, each in a few milliseconds, after what is still queued.
 fn seek_playing(s: State, ms: int) -> unit {
+    fade_out(s);
+    continue_at(s, ms);
+    fade_in(s);
+}
+
+/// Writes the next few milliseconds of the current track rising from silence.
+fn fade_in(s: State) -> unit {
     let t = s.tracks[s.current];
     let frames = t.rate * FADE_MS / 1000;
-    write_counted(s, synth.chunk_ramp(t, s.frame, frames, s.volume_prev, 0), frames);
-    // The new position starts sounding once everything written so far has played.
-    s.base_ms = ms - s.written * 1000 / t.rate;
-    s.frame = ms * t.rate / 1000;
     write_counted(s, synth.chunk_ramp(t, s.frame, frames, 0, s.volume), frames);
     s.frame = s.frame + frames;
     s.volume_prev = s.volume;
@@ -143,11 +175,35 @@ fn write_counted(s: State, data: bytes, frames: int) -> unit {
     }
 }
 
+/// Plays track `index` from `ms`. While playing into an output of the same rate and channels,
+/// the output goes on: a track that ended runs into the next without a gap, and one that is
+/// cut fades out first. Otherwise the output is closed (once its queue has played) and a new
+/// one opened.
 fn start(s: State, index: int, ms: int) -> unit {
     if (s.tracks.len() == 0) {
         return;
     }
-    s.current = (index % s.tracks.len() + s.tracks.len()) % s.tracks.len();
+    let i = (index % s.tracks.len() + s.tracks.len()) % s.tracks.len();
+    let from = s.tracks[s.current];
+    let to = s.tracks[i];
+    if (s.playing
+        && !s.paused
+        && s.handle != 0
+        && from.rate == to.rate
+        && from.channels == to.channels) {
+        let ended = s.frame >= synth.total_frames(from);
+        if (!ended) {
+            fade_out(s);
+        }
+        s.current = i;
+        continue_at(s, ms);
+        if (!ended || ms > 0) {
+            fade_in(s);
+        }
+        return;
+    }
+    close_output(s);
+    s.current = i;
     s.playing = true;
     s.paused = false;
     open_at(s, ms);
@@ -161,11 +217,12 @@ fn stop(s: State) -> unit {
     s.frame = 0;
 }
 
+/// Pauses where the sound stops: after a short fade and the queue, which still plays.
 fn pause(s: State) -> unit {
-    let at = position_ms(s);
-    close_output(s);
+    fade_out(s);
     s.paused = true;
-    s.base_ms = at;
+    close_output(s);
+    s.base_ms = s.frame * 1000 / s.tracks[s.current].rate;
 }
 
 fn handle(s: State, cmd: Cmd) -> bool {
@@ -181,22 +238,8 @@ fn handle(s: State, cmd: Cmd) -> bool {
             }
         },
         Cmd.Stop => stop(s),
-        Cmd.Next => {
-            let was = s.playing;
-            stop(s);
-            s.current = (s.current + 1) % s.tracks.len();
-            if (was) {
-                start(s, s.current, 0);
-            }
-        },
-        Cmd.Prev => {
-            let was = s.playing;
-            stop(s);
-            s.current = (s.current + s.tracks.len() - 1) % s.tracks.len();
-            if (was) {
-                start(s, s.current, 0);
-            }
-        },
+        Cmd.Next => step(s, 1),
+        Cmd.Prev => step(s, s.tracks.len() - 1),
         Cmd.Seek(ms) => {
             let t = s.tracks[s.current];
             let clamped = if (ms < 0) {
@@ -237,18 +280,30 @@ fn handle(s: State, cmd: Cmd) -> bool {
     true
 }
 
+/// Moves `by` tracks along the playlist: playing it if a track was playing or paused.
+fn step(s: State, by: int) -> unit {
+    if (s.tracks.len() == 0) {
+        return;
+    }
+    let next = (s.current + by) % s.tracks.len();
+    if (s.playing) {
+        start(s, next, 0);
+    } else {
+        stop(s);
+        s.current = next;
+    }
+}
+
 /// Writes the next chunk of the current track; at the end, moves to the next track.
 fn feed(s: State) -> unit {
     let t = s.tracks[s.current];
-    let frames = t.rate * CHUNK_MS / 1000;
     let total = synth.total_frames(t);
     if (s.frame >= total) {
-        let _d = audio.drain(s.handle);
-        let next = (s.current + 1) % s.tracks.len();
-        stop(s);
-        start(s, next, 0);
+        start(s, s.current + 1, 0);
         return;
     }
+    // The last chunk stops at the end of the track, so the next one follows without a gap.
+    let frames = math.min(t.rate * CHUNK_MS / 1000, total - s.frame);
     let data = synth.chunk_ramp(t, s.frame, frames, s.volume_prev, s.volume);
     s.volume_prev = s.volume;
     match (audio.write(s.handle, data)) {
