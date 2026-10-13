@@ -1,0 +1,1569 @@
+// A Vorbis I decoder (the Xiph.Org specification), as in .ogg files from libvorbis or ffmpeg:
+// mono and stereo, two block sizes, floor 1, residues 0, 1 and 2, and channel coupling. The old
+// LSP floor (floor 0) is not supported. Each packet overlaps the one before it, so `seek`
+// decodes the packet before the one it wants.
+
+import mdct;
+import ogg;
+import std/math;
+
+/// Bits the codebooks' first lookup table takes.
+const PRIMARY: int = 10;
+
+/// floor1's amplitude steps as linear factors: the table of the specification.
+const INVERSE_DB: [float] = [
+    1.0649863e-7,
+    1.1341951e-7,
+    1.2079015e-7,
+    1.2863978e-7,
+    1.3699951e-7,
+    1.4590251e-7,
+    1.5538408e-7,
+    1.6548181e-7,
+    1.7623575e-7,
+    1.8768855e-7,
+    1.9988561e-7,
+    2.128753e-7,
+    2.2670913e-7,
+    2.4144197e-7,
+    2.5713223e-7,
+    2.7384213e-7,
+    2.9163793e-7,
+    3.1059021e-7,
+    3.3077411e-7,
+    3.5226968e-7,
+    3.7516214e-7,
+    3.9954229e-7,
+    4.255068e-7,
+    4.5315863e-7,
+    4.8260743e-7,
+    5.1396998e-7,
+    5.4737065e-7,
+    5.8294187e-7,
+    6.2082472e-7,
+    6.6116941e-7,
+    7.0413592e-7,
+    7.4989464e-7,
+    7.9862701e-7,
+    8.505263e-7,
+    9.0579828e-7,
+    9.6466216e-7,
+    1.0273513e-6,
+    1.0941144e-6,
+    1.1652161e-6,
+    1.2409384e-6,
+    1.3215816e-6,
+    1.4074654e-6,
+    1.4989305e-6,
+    1.5963394e-6,
+    1.7000785e-6,
+    1.8105592e-6,
+    1.9282195e-6,
+    2.0535261e-6,
+    2.1869758e-6,
+    2.3290978e-6,
+    2.4804557e-6,
+    2.6416497e-6,
+    2.813319e-6,
+    2.9961443e-6,
+    3.1908506e-6,
+    3.3982101e-6,
+    3.6190449e-6,
+    3.8542308e-6,
+    4.1047004e-6,
+    4.371447e-6,
+    4.6555282e-6,
+    4.9580707e-6,
+    5.280274e-6,
+    5.623416e-6,
+    5.9888572e-6,
+    6.3780469e-6,
+    6.7925283e-6,
+    7.2339451e-6,
+    7.7040476e-6,
+    8.2047e-6,
+    8.7378876e-6,
+    9.3057248e-6,
+    9.9104632e-6,
+    1.0554501e-5,
+    1.1240392e-5,
+    1.1970856e-5,
+    1.2748789e-5,
+    1.3577278e-5,
+    1.4459606e-5,
+    1.5399272e-5,
+    1.6400004e-5,
+    1.7465768e-5,
+    1.8600792e-5,
+    1.9809576e-5,
+    2.1096914e-5,
+    2.2467911e-5,
+    2.3928002e-5,
+    2.5482978e-5,
+    2.7139006e-5,
+    2.8902651e-5,
+    3.0780908e-5,
+    3.2781225e-5,
+    3.4911534e-5,
+    3.7180282e-5,
+    3.9596466e-5,
+    4.2169667e-5,
+    4.491009e-5,
+    4.7828601e-5,
+    5.0936773e-5,
+    5.4246931e-5,
+    5.7772202e-5,
+    6.1526565e-5,
+    6.5524908e-5,
+    6.9783085e-5,
+    7.4317983e-5,
+    7.9147585e-5,
+    8.429104e-5,
+    8.9768747e-5,
+    9.5602426e-5,
+    0.00010181521,
+    0.00010843174,
+    0.00011547824,
+    0.00012298267,
+    0.00013097477,
+    0.00013948625,
+    0.00014855085,
+    0.00015820453,
+    0.00016848555,
+    0.00017943469,
+    0.00019109536,
+    0.00020351382,
+    0.00021673929,
+    0.00023082423,
+    0.00024582449,
+    0.00026179955,
+    0.00027881276,
+    0.00029693158,
+    0.00031622787,
+    0.00033677814,
+    0.00035866388,
+    0.00038197188,
+    0.00040679456,
+    0.00043323036,
+    0.00046138411,
+    0.00049136745,
+    0.00052329927,
+    0.00055730621,
+    0.00059352311,
+    0.00063209358,
+    0.00067317058,
+    0.000716917,
+    0.0007635063,
+    0.00081312324,
+    0.00086596457,
+    0.00092223983,
+    0.00098217216,
+    0.0010459992,
+    0.0011139742,
+    0.0011863665,
+    0.0012634633,
+    0.0013455702,
+    0.0014330129,
+    0.0015261382,
+    0.0016253153,
+    0.0017309374,
+    0.0018434235,
+    0.0019632195,
+    0.0020908006,
+    0.0022266726,
+    0.0023713743,
+    0.0025254795,
+    0.0026895994,
+    0.0028643847,
+    0.0030505286,
+    0.0032487691,
+    0.0034598925,
+    0.0036847358,
+    0.0039241906,
+    0.0041792066,
+    0.004450795,
+    0.0047400328,
+    0.0050480668,
+    0.0053761186,
+    0.0057254891,
+    0.0060975636,
+    0.0064938176,
+    0.0069158225,
+    0.0073652516,
+    0.0078438871,
+    0.0083536271,
+    0.0088964928,
+    0.009474637,
+    0.010090352,
+    0.01074608,
+    0.011444421,
+    0.012188144,
+    0.012980198,
+    0.013823725,
+    0.014722068,
+    0.015678791,
+    0.016697687,
+    0.017782797,
+    0.018938423,
+    0.020169149,
+    0.021479854,
+    0.022875735,
+    0.02436233,
+    0.025945531,
+    0.027631618,
+    0.029427276,
+    0.031339626,
+    0.033376252,
+    0.035545228,
+    0.037855157,
+    0.040315199,
+    0.042935108,
+    0.045725273,
+    0.048696758,
+    0.051861348,
+    0.055231591,
+    0.05882085,
+    0.062643361,
+    0.066714279,
+    0.071049749,
+    0.075666962,
+    0.080584227,
+    0.085821044,
+    0.091398179,
+    0.097337747,
+    0.1036633,
+    0.11039993,
+    0.11757434,
+    0.12521498,
+    0.13335215,
+    0.14201813,
+    0.15124727,
+    0.16107617,
+    0.1715438,
+    0.18269168,
+    0.19456402,
+    0.20720788,
+    0.22067342,
+    0.23501402,
+    0.25028656,
+    0.26655159,
+    0.28387361,
+    0.30232132,
+    0.32196786,
+    0.34289114,
+    0.36517414,
+    0.38890521,
+    0.41417847,
+    0.44109412,
+    0.4697589,
+    0.50028648,
+    0.53279791,
+    0.56742212,
+    0.6042964,
+    0.64356699,
+    0.68538959,
+    0.72993007,
+    0.77736504,
+    0.8278826,
+    0.88168307,
+    0.9389798,
+    1.0
+];
+
+/// floor1's amplitude range by multiplier.
+const RANGES: [int] = [256, 128, 86, 64];
+
+/// A bit reader over a packet: Vorbis packs its fields from the least significant bit of each
+/// octet up. Past the end it reads zeros; `over` tells.
+struct Reader {
+    b: bytes,
+    pos: int,
+    end: int,
+}
+
+fn reader(b: bytes, at: int, size: int) -> Reader {
+    Reader { b: b, pos: at * 8, end: (at + size) * 8 }
+}
+
+fn octet(r: Reader, i: int) -> int {
+    if (i * 8 < r.end) { r.b[i] } else { 0 }
+}
+
+/// The next `n` bits (0..=32) without consuming them.
+fn peek(r: Reader, n: int) -> int {
+    let i = r.pos >> 3;
+    var w = 0;
+    if ((i + 5) * 8 <= r.end) {
+        let b = r.b;
+        w = b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24) | (b[i + 4] << 32);
+    } else {
+        w = octet(
+            r,
+            i
+        ) | (octet(r, i + 1) << 8) | (octet(r, i + 2) << 16) | (octet(r, i + 3) << 24) | (octet(r, i + 4) << 32);
+    }
+    (w >> (r.pos & 7)) & ((1 << n) - 1)
+}
+
+fn read(r: Reader, n: int) -> int {
+    let v = peek(r, n);
+    r.pos = r.pos + n;
+    v
+}
+
+fn over(r: Reader) -> bool {
+    r.pos > r.end
+}
+
+/// The bits `x` takes: ilog(0) = 0, ilog(1) = 1, ilog(4) = 3.
+fn ilog(x: int) -> int {
+    var n = 0;
+    var v = x;
+    while (v > 0) {
+        n = n + 1;
+        v = v >> 1;
+    }
+    n
+}
+
+fn ints(n: int, v: int) -> [int] {
+    var a: [int] = [];
+    for _ in 0..n {
+        a.push(v);
+    }
+    a
+}
+
+/// One codebook: its entries' codewords and, for vector quantization, their vectors.
+struct Book {
+    dims: int,
+    /// The decoding table: index it with the next PRIMARY bits; an entry >= 0 is entry << 6 |
+    /// codeword length (length 0: no codeword starts so), and one < 0 is -1 - (offset << 6 | bits)
+    /// of a second-level table indexed by the `bits` after those.
+    table: [int],
+    /// `dims` values per entry; empty for a book without them.
+    vq: [float],
+}
+
+/// The codeword of each entry (-1 for unused ones), as the specification assigns them: each entry
+/// takes the lowest free codeword of its length.
+fn codewords(lens: [int]) -> Result<[int], string> {
+    var marker = ints(33, 0);
+    var codes: [int] = [];
+    for l in lens {
+        if (l == 0) {
+            codes.push(-1);
+            continue;
+        }
+        var entry = marker[l];
+        if (l < 32 && (entry >> l) != 0) {
+            return Result.Err("Vorbis: overfull codebook");
+        }
+        codes.push(entry);
+        var j = l;
+        while (j > 0) {
+            if ((marker[j] & 1) == 1) {
+                if (j == 1) {
+                    marker[1] = marker[1] + 1;
+                } else {
+                    marker[j] = marker[j - 1] << 1;
+                }
+                break;
+            }
+            marker[j] = marker[j] + 1;
+            j = j - 1;
+        }
+        for k in l + 1..33 {
+            if ((marker[k] >> 1) != entry) {
+                break;
+            }
+            entry = marker[k];
+            marker[k] = marker[k - 1] << 1;
+        }
+    }
+    Result.Ok(codes)
+}
+
+/// The `n` low bits of `code` in reverse order: codewords are read first bit first, from the
+/// low end of the reader's bits.
+fn reverse(code: int, n: int) -> int {
+    var v = 0;
+    var c = code;
+    for _ in 0..n {
+        v = (v << 1) | (c & 1);
+        c = c >> 1;
+    }
+    v
+}
+
+fn table_of(lens: [int]) -> Result<[int], string> {
+    let codes = codewords(lens)?;
+    let size = 1 << PRIMARY;
+    var table = ints(size, 0);
+    var used = 0;
+    var only = 0;
+    for i in 0..lens.len() {
+        if (lens[i] > 0) {
+            used = used + 1;
+            only = i;
+        }
+    }
+    if (used == 1) {
+        // A single codeword: whatever the bits, it is that entry.
+        for k in 0..size {
+            table[k] = (only << 6) | lens[only];
+        }
+        return Result.Ok(table);
+    }
+    let mask = size - 1;
+    // The longest codeword under each first-level prefix sets its second-level table's size.
+    var longest = ints(size, 0);
+    for i in 0..lens.len() {
+        let n = lens[i];
+        if (n == 0) {
+            continue;
+        }
+        let rc = reverse(codes[i], n);
+        if (n <= PRIMARY) {
+            var k = rc;
+            while (k < size) {
+                table[k] = (i << 6) | n;
+                k = k + (1 << n);
+            }
+        } else if (n - PRIMARY > longest[rc & mask]) {
+            longest[rc & mask] = n - PRIMARY;
+        }
+    }
+    for p in 0..size {
+        let more = longest[p];
+        if (more > 0) {
+            table[p] = -1 - ((table.len() << 6) | more);
+            for _ in 0..1 << more {
+                table.push(0);
+            }
+        }
+    }
+    for i in 0..lens.len() {
+        let n = lens[i];
+        if (n <= PRIMARY) {
+            continue;
+        }
+        let rc = reverse(codes[i], n);
+        let sub = -1 - table[rc & mask];
+        let at = sub >> 6;
+        let more = sub & 63;
+        var k = rc >> PRIMARY;
+        while (k < (1 << more)) {
+            table[at + k] = (i << 6) | n;
+            k = k + (1 << (n - PRIMARY));
+        }
+    }
+    Result.Ok(table)
+}
+
+/// The next entry of `book`, or -1 past the end of the packet (or on a codeword it lacks).
+fn decode(r: Reader, book: Book) -> int {
+    let t = book.table;
+    var e = t[peek(r, PRIMARY)];
+    if (e < 0) {
+        let sub = -1 - e;
+        e = t[(sub >> 6) + (peek(r, PRIMARY + (sub & 63)) >> PRIMARY)];
+    }
+    let n = e & 63;
+    if (n == 0) {
+        return -1;
+    }
+    r.pos = r.pos + n;
+    if (r.pos > r.end) {
+        return -1;
+    }
+    e >> 6
+}
+
+/// The specification's 32-bit float: a 21-bit mantissa, a sign and a 10-bit exponent.
+fn float32(x: int) -> float {
+    let mantissa = x & 0x1FFFFF;
+    let exponent = (x >> 21) & 0x3FF;
+    let m = if ((x & 0x80000000) != 0) { 0 - mantissa } else { mantissa };
+    (m as float) * math.pow(2.0, (exponent - 788) as float)
+}
+
+/// True if base^exp <= limit.
+fn power_at_most(base: int, exp: int, limit: int) -> bool {
+    var v = 1;
+    for _ in 0..exp {
+        v = v * base;
+        if (v > limit) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The largest r with r^dims <= entries: the values per dimension of a lattice codebook.
+fn lookup1_values(entries: int, dims: int) -> int {
+    var r = math.floor(math.pow(entries as float, 1.0 / (dims as float))) as int;
+    while (power_at_most(r + 1, dims, entries)) {
+        r = r + 1;
+    }
+    while (r > 0 && !power_at_most(r, dims, entries)) {
+        r = r - 1;
+    }
+    r
+}
+
+fn read_book(r: Reader) -> Result<Book, string> {
+    if (read(r, 24) != 0x564342) {
+        return Result.Err("Vorbis: bad codebook");
+    }
+    let dims = read(r, 16);
+    let entries = read(r, 24);
+    var lens: [int] = [];
+    if (read(r, 1) == 0) {
+        let sparse = read(r, 1) == 1;
+        for _ in 0..entries {
+            if (!sparse || read(r, 1) == 1) {
+                lens.push(read(r, 5) + 1);
+            } else {
+                lens.push(0);
+            }
+            if (over(r)) {
+                return Result.Err("Vorbis: truncated setup");
+            }
+        }
+    } else {
+        // Ordered: runs of entries with lengths 1, 2, 3...
+        var len = read(r, 5) + 1;
+        while (lens.len() < entries) {
+            let count = read(r, ilog(entries - lens.len()));
+            if (len > 32 || lens.len() + count > entries || over(r)) {
+                return Result.Err("Vorbis: bad codebook");
+            }
+            for _ in 0..count {
+                lens.push(len);
+            }
+            len = len + 1;
+        }
+    }
+    let kind = read(r, 4);
+    var vq: [float] = [];
+    if (kind == 1 || kind == 2) {
+        let min = float32(read(r, 32));
+        let delta = float32(read(r, 32));
+        let value_bits = read(r, 4) + 1;
+        let sequence = read(r, 1) == 1;
+        if (entries * dims > 1 << 20) {
+            // Real codebooks hold a few thousand values; this would only exhaust the memory.
+            return Result.Err("Vorbis: codebook too large");
+        }
+        let count = if (kind == 1) { lookup1_values(entries, dims) } else { entries * dims };
+        if (count <= 0) {
+            return Result.Err("Vorbis: bad codebook");
+        }
+        var mult: [int] = [];
+        for _ in 0..count {
+            mult.push(read(r, value_bits));
+            if (over(r)) {
+                return Result.Err("Vorbis: truncated setup");
+            }
+        }
+        for e in 0..entries {
+            var last = 0.0;
+            var div = 1;
+            for i in 0..dims {
+                let off = if (kind == 1) { (e / div) % count } else { e * dims + i };
+                let v = (mult[off] as float) * delta + min + last;
+                if (sequence) {
+                    last = v;
+                }
+                vq.push(v);
+                div = div * count;
+            }
+        }
+    } else if (kind != 0) {
+        return Result.Err("Vorbis: bad codebook lookup type");
+    }
+    Result.Ok(Book { dims: dims, table: table_of(lens)?, vq: vq })
+}
+
+/// A floor of type 1: a curve through points whose heights each packet codes.
+struct Floor {
+    /// The class of each partition; per class, its dimensions, its subclass bits, its master
+    /// book and the books of its subclasses (-1: none).
+    partitions: [int],
+    dims: [int],
+    subs: [int],
+    masters: [int],
+    books: [[int]],
+    multiplier: int,
+    /// The points' X in the order they are coded, their order by X, and each point's low and
+    /// high neighbors among those coded before it (from the third on).
+    xs: [int],
+    sorted: [int],
+    low: [int],
+    high: [int],
+}
+
+fn read_floor(r: Reader, books: [Book]) -> Result<Floor, string> {
+    let kind = read(r, 16);
+    if (kind == 0) {
+        return Result.Err("Vorbis floor 0 is not supported");
+    }
+    if (kind != 1) {
+        return Result.Err("Vorbis: bad floor type");
+    }
+    var partitions: [int] = [];
+    var classes = 0;
+    for _ in 0..read(r, 5) {
+        let c = read(r, 4);
+        partitions.push(c);
+        if (c + 1 > classes) {
+            classes = c + 1;
+        }
+    }
+    var dims: [int] = [];
+    var subs: [int] = [];
+    var masters: [int] = [];
+    var sub_books: [[int]] = [];
+    for _ in 0..classes {
+        dims.push(read(r, 3) + 1);
+        let s = read(r, 2);
+        subs.push(s);
+        masters.push(if (s > 0) { read(r, 8) } else { -1 });
+        var bs: [int] = [];
+        for _ in 0..1 << s {
+            bs.push(read(r, 8) - 1);
+        }
+        sub_books.push(bs);
+    }
+    let multiplier = read(r, 2) + 1;
+    let range_bits = read(r, 4);
+    var xs = [0, 1 << range_bits];
+    for c in partitions {
+        for _ in 0..dims[c] {
+            xs.push(read(r, range_bits));
+        }
+    }
+    if (over(r) || xs.len() > 65) {
+        return Result.Err("Vorbis: bad floor");
+    }
+    for c in 0..classes {
+        if (masters[c] >= books.len()) {
+            return Result.Err("Vorbis: bad floor");
+        }
+        for b in sub_books[c] {
+            if (b >= books.len()) {
+                return Result.Err("Vorbis: bad floor");
+            }
+        }
+    }
+    let n = xs.len();
+    var sorted: [int] = [];
+    for i in 0..n {
+        var at = sorted.len();
+        while (at > 0 && xs[sorted[at - 1]] > xs[i]) {
+            at = at - 1;
+        }
+        sorted.push(i);
+        var k = sorted.len() - 1;
+        while (k > at) {
+            sorted[k] = sorted[k - 1];
+            k = k - 1;
+        }
+        sorted[at] = i;
+    }
+    var low: [int] = [0, 0];
+    var high: [int] = [0, 0];
+    for i in 2..n {
+        var lo = 0;
+        var hi = 1;
+        for j in 0..i {
+            if (xs[j] < xs[i] && xs[j] > xs[lo]) {
+                lo = j;
+            }
+            if (xs[j] > xs[i] && xs[j] < xs[hi]) {
+                hi = j;
+            }
+        }
+        low.push(lo);
+        high.push(hi);
+    }
+    Result.Ok(
+        Floor {
+            partitions: partitions,
+            dims: dims,
+            subs: subs,
+            masters: masters,
+            books: sub_books,
+            multiplier: multiplier,
+            xs: xs,
+            sorted: sorted,
+            low: low,
+            high: high
+        }
+    )
+}
+
+fn render_point(x0: int, y0: int, x1: int, y1: int, x: int) -> int {
+    let dy = y1 - y0;
+    let ady = if (dy < 0) { 0 - dy } else { dy };
+    let off = ady * (x - x0) / (x1 - x0);
+    if (dy < 0) { y0 - off } else { y0 + off }
+}
+
+fn db(y: int) -> float {
+    INVERSE_DB[if (y < 0) { 0 } else if (y > 255) { 255 } else { y }]
+}
+
+/// The line from (x0, y0) to (x1, y1), x1 excluded, as the specification draws it, into `out`
+/// up to `n2`.
+fn render_line(x0: int, y0: int, x1: int, y1: int, out: [float], n2: int) -> unit {
+    let adx = x1 - x0;
+    if (adx <= 0) {
+        return;
+    }
+    let dy = y1 - y0;
+    let base = dy / adx;
+    let sy = if (dy < 0) { base - 1 } else { base + 1 };
+    let abase = if (base < 0) { 0 - base } else { base };
+    let ady = if (dy < 0) { 0 - dy } else { dy } - abase * adx;
+    let stop = if (x1 < n2) { x1 } else { n2 };
+    var y = y0;
+    var err = 0;
+    if (x0 < n2) {
+        out[x0] = db(y);
+    }
+    for x in x0 + 1..stop {
+        err = err + ady;
+        if (err >= adx) {
+            err = err - adx;
+            y = y + sy;
+        } else {
+            y = y + base;
+        }
+        out[x] = db(y);
+    }
+}
+
+/// Decodes one channel's floor into the `n2` values of `out`; false if the channel is unused
+/// in this packet (or the packet ends first).
+fn floor_curve(r: Reader, f: Floor, books: [Book], n2: int, out: [float]) -> bool {
+    if (read(r, 1) == 0) {
+        return false;
+    }
+    let range = RANGES[f.multiplier - 1];
+    let nb = ilog(range - 1);
+    var y = [read(r, nb), read(r, nb)];
+    for c in f.partitions {
+        let cbits = f.subs[c];
+        let csub = (1 << cbits) - 1;
+        var cval = 0;
+        if (cbits > 0) {
+            cval = decode(r, books[f.masters[c]]);
+            if (cval < 0) {
+                return false;
+            }
+        }
+        let bs = f.books[c];
+        for _ in 0..f.dims[c] {
+            let book = bs[cval & csub];
+            cval = cval >> cbits;
+            if (book >= 0) {
+                let v = decode(r, books[book]);
+                if (v < 0) {
+                    return false;
+                }
+                y.push(v);
+            } else {
+                y.push(0);
+            }
+        }
+    }
+    if (over(r)) {
+        return false;
+    }
+    // Each point's height is coded against the line through its neighbors.
+    let xs = f.xs;
+    let n = xs.len();
+    var fy = [y[0], y[1]];
+    var step = [true, true];
+    for i in 2..n {
+        let lo = f.low[i];
+        let hi = f.high[i];
+        let predicted = render_point(xs[lo], fy[lo], xs[hi], fy[hi], xs[i]);
+        let val = y[i];
+        let highroom = range - predicted;
+        let lowroom = predicted;
+        let room = if (highroom < lowroom) { highroom } else { lowroom } * 2;
+        if (val != 0) {
+            step[lo] = true;
+            step[hi] = true;
+            step.push(true);
+            fy.push(if (val >= room) {
+                if (highroom > lowroom) {
+                    val - lowroom + predicted
+                } else {
+                    predicted - val + highroom - 1
+                }
+            } else if ((val & 1) == 1) {
+                predicted - (val + 1) / 2
+            } else {
+                predicted + val / 2
+            });
+        } else {
+            step.push(false);
+            fy.push(predicted);
+        }
+    }
+    let m = f.multiplier;
+    var lx = 0;
+    var ly = fy[0] * m;
+    var hx = 0;
+    var hy = ly;
+    for k in 1..n {
+        let i = f.sorted[k];
+        if (step[i]) {
+            hy = fy[i] * m;
+            hx = xs[i];
+            render_line(lx, ly, hx, hy, out, n2);
+            lx = hx;
+            ly = hy;
+        }
+    }
+    if (hx < n2) {
+        render_line(hx, hy, n2, hy, out, n2);
+    }
+    true
+}
+
+/// A residue: how the spectrum's fine structure is split into partitions and coded.
+struct Residue {
+    kind: int,
+    begin: int,
+    end: int,
+    size: int,
+    classes: int,
+    class_book: int,
+    /// Per classification, the book of each of the 8 passes (-1: none).
+    books: [[int]],
+}
+
+fn read_residue(r: Reader, books: [Book]) -> Result<Residue, string> {
+    let kind = read(r, 16);
+    if (kind > 2) {
+        return Result.Err("Vorbis: bad residue type");
+    }
+    let begin = read(r, 24);
+    let end = read(r, 24);
+    let size = read(r, 24) + 1;
+    let classes = read(r, 6) + 1;
+    let class_book = read(r, 8);
+    var cascade: [int] = [];
+    for _ in 0..classes {
+        let low = read(r, 3);
+        let high = if (read(r, 1) == 1) { read(r, 5) } else { 0 };
+        cascade.push(high * 8 + low);
+    }
+    var all: [[int]] = [];
+    for c in 0..classes {
+        var bs: [int] = [];
+        for j in 0..8 {
+            if (((cascade[c] >> j) & 1) == 1) {
+                let b = read(r, 8);
+                if (b >= books.len() || books[b].vq.len() == 0) {
+                    return Result.Err("Vorbis: bad residue");
+                }
+                bs.push(b);
+            } else {
+                bs.push(-1);
+            }
+        }
+        all.push(bs);
+    }
+    if (over(r) || class_book >= books.len() || books[class_book].dims == 0) {
+        return Result.Err("Vorbis: bad residue");
+    }
+    Result.Ok(
+        Residue {
+            kind: kind,
+            begin: begin,
+            end: end,
+            size: size,
+            classes: classes,
+            class_book: class_book,
+            books: all
+        }
+    )
+}
+
+/// Decodes one partition of `size` values at `off` with `book` into the residue vectors: of
+/// channel `chans[j]` (types 0 and 1), or of all of `chans` interleaved (type 2). False if the
+/// packet ends.
+fn partition(
+    r: Reader,
+    book: Book,
+    kind: int,
+    v: [[float]],
+    chans: [int],
+    j: int,
+    off: int,
+    size: int,
+    n2: int
+) -> bool {
+    let dims = book.dims;
+    let vq = book.vq;
+    if (kind == 0) {
+        let t = v[chans[j]];
+        let step = size / dims;
+        for i in 0..step {
+            let e = decode(r, book);
+            if (e < 0) {
+                return false;
+            }
+            for d in 0..dims {
+                let at = off + i + d * step;
+                if (at < n2) {
+                    t[at] = t[at] + vq[e * dims + d];
+                }
+            }
+        }
+    } else if (kind == 1) {
+        let t = v[chans[j]];
+        var i = 0;
+        while (i < size) {
+            let e = decode(r, book);
+            if (e < 0) {
+                return false;
+            }
+            for d in 0..dims {
+                let at = off + i;
+                if (at < n2) {
+                    t[at] = t[at] + vq[e * dims + d];
+                }
+                i = i + 1;
+            }
+        }
+    } else {
+        let ch = chans.len();
+        var i = 0;
+        while (i < size) {
+            let e = decode(r, book);
+            if (e < 0) {
+                return false;
+            }
+            for d in 0..dims {
+                let at = off + i;
+                let t = v[chans[at % ch]];
+                let k = at / ch;
+                if (k < n2) {
+                    t[k] = t[k] + vq[e * dims + d];
+                }
+                i = i + 1;
+            }
+        }
+    }
+    true
+}
+
+/// Adds the residue of the channels `chans` to `v`; those with `skip` set are not coded.
+fn residue_decode(
+    r: Reader,
+    res: Residue,
+    books: [Book],
+    v: [[float]],
+    chans: [int],
+    skip: [bool],
+    n2: int
+) -> unit {
+    let ch = chans.len();
+    let size = if (res.kind == 2) { n2 * ch } else { n2 };
+    let begin = if (res.begin < size) { res.begin } else { size };
+    let end = if (res.end < size) { res.end } else { size };
+    let psize = res.size;
+    let parts = (end - begin) / psize;
+    if (parts <= 0) {
+        return;
+    }
+    let cbook = books[res.class_book];
+    let per = cbook.dims;
+    // Type 2 codes its channels as one interleaved vector, unless all of them are skipped.
+    var coded: [bool] = [];
+    if (res.kind == 2) {
+        var any = false;
+        for s in skip {
+            if (!s) {
+                any = true;
+            }
+        }
+        coded.push(any);
+    } else {
+        for s in skip {
+            coded.push(!s);
+        }
+    }
+    let vectors = coded.len();
+    var cls: [[int]] = [];
+    for _ in 0..vectors {
+        cls.push(ints(parts + per, 0));
+    }
+    for pass in 0..8 {
+        var p = 0;
+        while (p < parts) {
+            if (pass == 0) {
+                for j in 0..vectors {
+                    if (!coded[j]) {
+                        continue;
+                    }
+                    var temp = decode(r, cbook);
+                    if (temp < 0) {
+                        return;
+                    }
+                    let c = cls[j];
+                    var i = per - 1;
+                    while (i >= 0) {
+                        c[p + i] = temp % res.classes;
+                        temp = temp / res.classes;
+                        i = i - 1;
+                    }
+                }
+            }
+            var i = 0;
+            while (i < per && p < parts) {
+                for j in 0..vectors {
+                    if (!coded[j]) {
+                        continue;
+                    }
+                    let book = res.books[cls[j][p]][pass];
+                    if (book >= 0
+                        && !partition(
+                            r,
+                            books[book],
+                            res.kind,
+                            v,
+                            chans,
+                            j,
+                            begin + p * psize,
+                            psize,
+                            n2
+                        )) {
+                        return;
+                    }
+                }
+                i = i + 1;
+                p = p + 1;
+            }
+        }
+    }
+}
+
+/// How a mode's channels are coded: their submap (floor and residue) and the coupled pairs.
+struct Mapping {
+    mux: [int],
+    floors: [int],
+    residues: [int],
+    magnitude: [int],
+    angle: [int],
+}
+
+struct Mode {
+    long: bool,
+    mapping: int,
+}
+
+/// A Vorbis track being played.
+pub struct Stream {
+    packets: ogg.Stream,
+    rate: int,
+    channels: int,
+    /// Frames in the track.
+    total: int,
+    short_size: int,
+    long_size: int,
+    books: [Book],
+    floors: [Floor],
+    residues: [Residue],
+    mappings: [Mapping],
+    modes: [Mode],
+    mode_bits: int,
+    short_fft: mdct.Fft,
+    long_fft: mdct.Fft,
+    /// The rising half of the window, for overlaps of a short and a long block.
+    short_slope: [float],
+    long_slope: [float],
+    /// Per packet: its block size (0 if it is no audio packet) and the frame its output starts at,
+    /// counted from the first decoded one; `trim` of those come before the track's start.
+    blocks: [int],
+    starts: [int],
+    trim: int,
+    /// The next packet to decode.
+    next: int,
+    /// Per channel: the floor, the residue (then the spectrum), the windowed IMDCT output and the
+    /// previous packet's.
+    floor: [[float]],
+    spec: [[float]],
+    cur: [[float]],
+    prev: [[float]],
+    have_prev: bool,
+    prev_size: int,
+    /// Where the previous packet's window starts falling.
+    prev_right: int,
+}
+
+/// Checks the "vorbis" signature after a header's type octet.
+fn signature(r: Reader, kind: int) -> bool {
+    var ok = read(r, 8) == kind;
+    for c in [0x76, 0x6F, 0x72, 0x62, 0x69, 0x73] {
+        if (read(r, 8) != c) {
+            ok = false;
+        }
+    }
+    ok
+}
+
+/// The rising half of the Vorbis window over `n` samples.
+fn slope(n: int) -> [float] {
+    var w: [float] = [];
+    for i in 0..n {
+        let s = math.sin(((i as float) + 0.5) / (n as float) * math.PI / 2.0);
+        w.push(math.sin(math.PI / 2.0 * s * s));
+    }
+    w
+}
+
+fn starts_with(b: bytes, at: int, size: int, tag: string) -> bool {
+    let t = tag.to_bytes();
+    size >= t.len() && b.sub_bytes(at, at + t.len()) == t
+}
+
+/// Opens the Vorbis stream of the Ogg file `b`.
+pub fn open(b: bytes) -> Result<Stream, string> {
+    let p = ogg.open(b)?;
+    let (ib, iat, isize) = ogg.packet(p, 0);
+    if (starts_with(ib, iat, isize, "OpusHead")) {
+        return Result.Err("Opus in Ogg is not supported (only Vorbis)");
+    }
+    let id = reader(ib, iat, isize);
+    if (!signature(id, 1)) {
+        return Result.Err("Ogg without Vorbis audio");
+    }
+    if (p.offsets.len() < 3) {
+        return Result.Err("Vorbis without its headers");
+    }
+    let version = read(id, 32);
+    let channels = read(id, 8);
+    let rate = read(id, 32);
+    read(id, 32);
+    read(id, 32);
+    read(id, 32);
+    let short_bits = read(id, 4);
+    let long_bits = read(id, 4);
+    if (version != 0
+        || rate == 0
+        || short_bits < 6
+        || long_bits > 13
+        || short_bits > long_bits
+        || read(id, 1) != 1) {
+        return Result.Err("Vorbis: bad identification header");
+    }
+    if (channels < 1 || channels > 2) {
+        return Result.Err("Vorbis with ${to_string(channels)} channels (only mono and stereo)");
+    }
+    let (sb, sat, ssize) = ogg.packet(p, 2);
+    let r = reader(sb, sat, ssize);
+    if (!signature(r, 5)) {
+        return Result.Err("Vorbis: bad setup header");
+    }
+    var books: [Book] = [];
+    for _ in 0..read(r, 8) + 1 {
+        books.push(read_book(r)?);
+    }
+    for _ in 0..read(r, 6) + 1 {
+        if (read(r, 16) != 0) {
+            return Result.Err("Vorbis: bad time domain transform");
+        }
+    }
+    var floors: [Floor] = [];
+    for _ in 0..read(r, 6) + 1 {
+        floors.push(read_floor(r, books)?);
+    }
+    var residues: [Residue] = [];
+    for _ in 0..read(r, 6) + 1 {
+        residues.push(read_residue(r, books)?);
+    }
+    var mappings: [Mapping] = [];
+    for _ in 0..read(r, 6) + 1 {
+        if (read(r, 16) != 0) {
+            return Result.Err("Vorbis: bad mapping type");
+        }
+        let submaps = if (read(r, 1) == 1) { read(r, 4) + 1 } else { 1 };
+        var magnitude: [int] = [];
+        var angle: [int] = [];
+        if (read(r, 1) == 1) {
+            let bits = ilog(channels - 1);
+            for _ in 0..read(r, 8) + 1 {
+                let m = read(r, bits);
+                let a = read(r, bits);
+                if (m == a || m >= channels || a >= channels) {
+                    return Result.Err("Vorbis: bad channel coupling");
+                }
+                magnitude.push(m);
+                angle.push(a);
+            }
+        }
+        if (read(r, 2) != 0) {
+            return Result.Err("Vorbis: bad mapping");
+        }
+        var mux = ints(channels, 0);
+        if (submaps > 1) {
+            for c in 0..channels {
+                mux[c] = read(r, 4);
+                if (mux[c] >= submaps) {
+                    return Result.Err("Vorbis: bad mapping");
+                }
+            }
+        }
+        var fs: [int] = [];
+        var rs: [int] = [];
+        for _ in 0..submaps {
+            read(r, 8);
+            let f = read(r, 8);
+            let res = read(r, 8);
+            if (f >= floors.len() || res >= residues.len()) {
+                return Result.Err("Vorbis: bad mapping");
+            }
+            fs.push(f);
+            rs.push(res);
+        }
+        mappings.push(
+            Mapping { mux: mux, floors: fs, residues: rs, magnitude: magnitude, angle: angle }
+        );
+    }
+    var modes: [Mode] = [];
+    for _ in 0..read(r, 6) + 1 {
+        let long = read(r, 1) == 1;
+        let window = read(r, 16);
+        let transform = read(r, 16);
+        let mapping = read(r, 8);
+        if (window != 0 || transform != 0 || mapping >= mappings.len()) {
+            return Result.Err("Vorbis: bad mode");
+        }
+        modes.push(Mode { long: long, mapping: mapping });
+    }
+    if (read(r, 1) != 1 || over(r)) {
+        return Result.Err("Vorbis: bad setup header");
+    }
+    let short_size = 1 << short_bits;
+    let long_size = 1 << long_bits;
+    let mode_bits = ilog(modes.len() - 1);
+    // Each audio packet's block size, from its mode, sets where its output starts. The first page
+    // with a granule position says how much of the start to drop, unless it is also the last
+    // page, whose granule position says how much of the end to drop.
+    let n = p.offsets.len();
+    var blocks = ints(n, 0);
+    var starts = ints(n, 0);
+    var at = 0;
+    var last_size = 0;
+    var trim = 0;
+    var first_granule = -1;
+    var end_granule = -1;
+    var last_granule = -1;
+    for k in 3..n {
+        let (pb, pat, psize) = ogg.packet(p, k);
+        if (psize > 0 && (pb[pat] & 1) == 0) {
+            let mode = (pb[pat] >> 1) & ((1 << mode_bits) - 1);
+            if (mode < modes.len()) {
+                blocks[k] = if (modes[mode].long) { long_size } else { short_size };
+            }
+        }
+        starts[k] = at;
+        if (blocks[k] > 0) {
+            if (last_size > 0) {
+                at = at + last_size / 4 + blocks[k] / 4;
+            }
+            last_size = blocks[k];
+        }
+        let g = p.granules[k];
+        if (g >= 0) {
+            if (first_granule < 0) {
+                first_granule = k;
+                trim = if (at > g) { at - g } else { 0 };
+            }
+            end_granule = g;
+            last_granule = k;
+        }
+    }
+    if (p.ended && first_granule == last_granule) {
+        trim = 0;
+    }
+    var total = at - trim;
+    if (end_granule >= 0 && end_granule < total) {
+        total = end_granule;
+    }
+    var floor: [[float]] = [];
+    var spec: [[float]] = [];
+    var cur: [[float]] = [];
+    var prev: [[float]] = [];
+    for _ in 0..channels {
+        floor.push(mdct.zeros(long_size / 2));
+        spec.push(mdct.zeros(long_size / 2));
+        cur.push(mdct.zeros(long_size));
+        prev.push(mdct.zeros(long_size));
+    }
+    Result.Ok(
+        Stream {
+            packets: p,
+            rate: rate,
+            channels: channels,
+            total: if (total > 0) { total } else { 0 },
+            short_size: short_size,
+            long_size: long_size,
+            books: books,
+            floors: floors,
+            residues: residues,
+            mappings: mappings,
+            modes: modes,
+            mode_bits: mode_bits,
+            short_fft: mdct.fft_of(short_size / 2),
+            long_fft: mdct.fft_of(long_size / 2),
+            short_slope: slope(short_size / 2),
+            long_slope: slope(long_size / 2),
+            blocks: blocks,
+            starts: starts,
+            trim: trim,
+            next: 3,
+            floor: floor,
+            spec: spec,
+            cur: cur,
+            prev: prev,
+            have_prev: false,
+            prev_size: 0,
+            prev_right: 0
+        }
+    )
+}
+
+/// A decoded sample rounded and clamped to 16 bits.
+fn to_16(v: float) -> int {
+    let x = v * 32768.0;
+    if (x >= 32767.0) {
+        return 32767;
+    }
+    if (x <= -32768.0) {
+        return -32768;
+    }
+    math.round(x) as int
+}
+
+/// Decodes packet `k`; with the previous packet's output at hand, appends the samples between
+/// the two windows' centers to `out`. False if it is no audio packet.
+fn packet(s: Stream, k: int, out: [int]) -> bool {
+    let (b, at, size) = ogg.packet(s.packets, k);
+    let r = reader(b, at, size);
+    if (read(r, 1) != 0) {
+        return false;
+    }
+    let mi = read(r, s.mode_bits);
+    if (mi >= s.modes.len()) {
+        return false;
+    }
+    let mode = s.modes[mi];
+    let long = mode.long;
+    let n = if (long) { s.long_size } else { s.short_size };
+    let n2 = n / 2;
+    var prev_long = true;
+    var next_long = true;
+    if (long) {
+        prev_long = read(r, 1) == 1;
+        next_long = read(r, 1) == 1;
+    }
+    let map = s.mappings[mode.mapping];
+    let ch = s.channels;
+    var used: [bool] = [];
+    for c in 0..ch {
+        let f = s.floors[map.floors[map.mux[c]]];
+        used.push(floor_curve(r, f, s.books, n2, s.floor[c]));
+    }
+    // A coupled pair is coded whenever either channel is.
+    var coded = [] + used;
+    for i in 0..map.magnitude.len() {
+        let m = map.magnitude[i];
+        let a = map.angle[i];
+        if (coded[m] || coded[a]) {
+            coded[m] = true;
+            coded[a] = true;
+        }
+    }
+    for c in 0..ch {
+        let v = s.spec[c];
+        for i in 0..n2 {
+            v[i] = 0.0;
+        }
+    }
+    for sub in 0..map.residues.len() {
+        var chans: [int] = [];
+        var skip: [bool] = [];
+        for c in 0..ch {
+            if (map.mux[c] == sub) {
+                chans.push(c);
+                skip.push(!coded[c]);
+            }
+        }
+        residue_decode(r, s.residues[map.residues[sub]], s.books, s.spec, chans, skip, n2);
+    }
+    var i = map.magnitude.len() - 1;
+    while (i >= 0) {
+        let mv = s.spec[map.magnitude[i]];
+        let av = s.spec[map.angle[i]];
+        for j in 0..n2 {
+            let m = mv[j];
+            let a = av[j];
+            if (m > 0.0) {
+                if (a > 0.0) {
+                    av[j] = m - a;
+                } else {
+                    av[j] = m;
+                    mv[j] = m + a;
+                }
+            } else if (a > 0.0) {
+                av[j] = m + a;
+            } else {
+                av[j] = m;
+                mv[j] = m - a;
+            }
+        }
+        i = i - 1;
+    }
+    // The window: its slopes are as long as the shorter of the two blocks that overlap there.
+    let half = s.short_size / 4;
+    let left = if (long && !prev_long) { n / 4 - half } else { 0 };
+    let left_n = if (long && !prev_long) { s.short_size / 2 } else { n2 };
+    let left_slope = if (long && prev_long) { s.long_slope } else { s.short_slope };
+    let right = if (long && !next_long) { n * 3 / 4 - half } else { n2 };
+    let right_n = if (long && !next_long) { s.short_size / 2 } else { n2 };
+    let right_slope = if (long && next_long) { s.long_slope } else { s.short_slope };
+    let fft = if (long) { s.long_fft } else { s.short_fft };
+    for c in 0..ch {
+        let y = s.cur[c];
+        if (!used[c]) {
+            for j in 0..n {
+                y[j] = 0.0;
+            }
+            continue;
+        }
+        // The spectrum is the floor times the residue; Vorbis's IMDCT is not scaled by 2/N.
+        let v = s.spec[c];
+        let fl = s.floor[c];
+        let gain = n2 as float;
+        for j in 0..n2 {
+            v[j] = v[j] * fl[j] * gain;
+        }
+        mdct.imdct(fft, v, 0, y);
+        for j in 0..left {
+            y[j] = 0.0;
+        }
+        for j in 0..left_n {
+            y[left + j] = y[left + j] * left_slope[j];
+        }
+        for j in 0..right_n {
+            y[right + j] = y[right + j] * right_slope[right_n - 1 - j];
+        }
+        for j in right + right_n..n {
+            y[j] = 0.0;
+        }
+    }
+    if (s.have_prev) {
+        // From the previous window's center to this one's: the previous window falls where this
+        // one rises.
+        let shift = s.prev_right - left;
+        let from = s.prev_size / 2 - shift;
+        let limit = s.prev_size;
+        for t in from..n2 {
+            let p = t + shift;
+            for c in 0..ch {
+                var v = if (p < limit) { s.prev[c][p] } else { 0.0 };
+                if (t >= 0) {
+                    v = v + s.cur[c][t];
+                }
+                out.push(to_16(v));
+            }
+        }
+    }
+    let done = s.prev;
+    s.prev = s.cur;
+    s.cur = done;
+    s.prev_size = n;
+    s.prev_right = right;
+    s.have_prev = true;
+    true
+}
+
+fn reset(s: Stream) -> unit {
+    s.have_prev = false;
+}
+
+/// Decodes the next packets until one gives samples, appending them to `out`; returns the frame
+/// its first sample is (negative before the track's start), or None at the end. A damaged
+/// packet becomes silence.
+pub fn next(s: Stream, out: [int]) -> Option<int> {
+    let n = s.blocks.len();
+    while (s.next < n) {
+        let k = s.next;
+        s.next = k + 1;
+        if (s.blocks[k] == 0) {
+            continue;
+        }
+        let had = s.have_prev;
+        let before = out.len();
+        if (!packet(s, k, out)) {
+            if (!had) {
+                continue;
+            }
+            while (out.len() > before) {
+                let _drop = out.pop();
+            }
+            for _ in 0..(s.prev_size / 4 + s.blocks[k] / 4) * s.channels {
+                out.push(0);
+            }
+            reset(s);
+        } else if (!had) {
+            continue;
+        }
+        return Option.Some(s.starts[k] - s.trim);
+    }
+    Option.None
+}
+
+/// Makes `next` continue from the packet whose output holds frame `pos`, after decoding (and
+/// dropping) the audio packet before it, whose second half that packet overlaps.
+pub fn seek(s: Stream, pos: int) -> unit {
+    let target = pos + s.trim;
+    let n = s.blocks.len();
+    // The last audio packet starting at or before the target.
+    var lo = 3;
+    var hi = n;
+    while (lo < hi) {
+        let mid = (lo + hi) / 2;
+        if (s.starts[mid] <= target) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    var k = lo - 1;
+    while (k > 3 && s.blocks[k] == 0) {
+        k = k - 1;
+    }
+    if (target >= s.total + s.trim) {
+        k = n;
+    }
+    reset(s);
+    var j = k - 1;
+    while (j >= 3 && s.blocks[j] == 0) {
+        j = j - 1;
+    }
+    if (j >= 3) {
+        var scratch: [int] = [];
+        let _ok = packet(s, j, scratch);
+    }
+    s.next = k;
+}

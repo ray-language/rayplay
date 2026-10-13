@@ -6,6 +6,7 @@
 
 import aac_tables;
 import bits;
+import mdct;
 import mp4;
 import std/math;
 
@@ -89,175 +90,6 @@ fn config_of(c: bytes) -> Result<Config, string> {
     Result.Ok(Config { rate_index: rate_index, rate: RATES[rate_index], channels: channels })
 }
 
-/// The fast transform of one window size: a DCT-IV of `m` coefficients through a complex FFT
-/// of m/2 points, with its twiddles.
-struct Fft {
-    m: int,
-    rev: [int],
-    /// e^(-2πi k/(m/2)) for k < m/4.
-    tw_cos: [float],
-    tw_sin: [float],
-    /// e^(-iπ(4k+1)/(4m)) before the FFT and e^(-iπk/m) after it, for k < m/2.
-    pre_cos: [float],
-    pre_sin: [float],
-    post_cos: [float],
-    post_sin: [float],
-    /// Work buffers of m/2 values.
-    re: [float],
-    im: [float],
-}
-
-fn zeros(n: int) -> [float] {
-    var v: [float] = [];
-    for _ in 0..n {
-        v.push(0.0);
-    }
-    v
-}
-
-fn fft_of(m: int) -> Fft {
-    let n = m / 2;
-    var levels = 0;
-    while ((1 << levels) < n) {
-        levels = levels + 1;
-    }
-    var rev: [int] = [];
-    for i in 0..n {
-        var x = i;
-        var y = 0;
-        for _ in 0..levels {
-            y = (y << 1) | (x & 1);
-            x = x >> 1;
-        }
-        rev.push(y);
-    }
-    var tw_cos: [float] = [];
-    var tw_sin: [float] = [];
-    for k in 0..n / 2 {
-        let a = 2.0 * math.PI * (k as float) / (n as float);
-        tw_cos.push(math.cos(a));
-        tw_sin.push(math.sin(a));
-    }
-    var pre_cos: [float] = [];
-    var pre_sin: [float] = [];
-    var post_cos: [float] = [];
-    var post_sin: [float] = [];
-    for k in 0..n {
-        let a = math.PI * ((4 * k + 1) as float) / ((4 * m) as float);
-        pre_cos.push(math.cos(a));
-        pre_sin.push(math.sin(a));
-        let b = math.PI * (k as float) / (m as float);
-        post_cos.push(math.cos(b));
-        post_sin.push(math.sin(b));
-    }
-    Fft {
-        m: m,
-        rev: rev,
-        tw_cos: tw_cos,
-        tw_sin: tw_sin,
-        pre_cos: pre_cos,
-        pre_sin: pre_sin,
-        post_cos: post_cos,
-        post_sin: post_sin,
-        re: zeros(n),
-        im: zeros(n)
-    }
-}
-
-/// The IMDCT of `f.m` coefficients of `x` from `xo`, scaled by 2/N: 2m samples into `y`.
-fn imdct(f: Fft, x: [float], xo: int, y: [float]) -> unit {
-    let m = f.m;
-    let n = m / 2;
-    let re = f.re;
-    let im = f.im;
-    let rev = f.rev;
-    let pre_cos = f.pre_cos;
-    let pre_sin = f.pre_sin;
-    for k in 0..n {
-        let a = x[xo + 2 * k];
-        let b = x[xo + m - 1 - 2 * k];
-        let c = pre_cos[k];
-        let s = pre_sin[k];
-        let j = rev[k];
-        re[j] = a * c + b * s;
-        im[j] = b * c - a * s;
-    }
-    // The first two stages at once: their twiddles are 1 and -i, so no multiplications.
-    var p = 0;
-    while (p < n) {
-        let a0r = re[p] + re[p + 1];
-        let a0i = im[p] + im[p + 1];
-        let a1r = re[p] - re[p + 1];
-        let a1i = im[p] - im[p + 1];
-        let a2r = re[p + 2] + re[p + 3];
-        let a2i = im[p + 2] + im[p + 3];
-        let a3r = re[p + 2] - re[p + 3];
-        let a3i = im[p + 2] - im[p + 3];
-        re[p] = a0r + a2r;
-        im[p] = a0i + a2i;
-        re[p + 2] = a0r - a2r;
-        im[p + 2] = a0i - a2i;
-        re[p + 1] = a1r + a3i;
-        im[p + 1] = a1i - a3r;
-        re[p + 3] = a1r - a3i;
-        im[p + 3] = a1i + a3r;
-        p = p + 4;
-    }
-    let tw_cos = f.tw_cos;
-    let tw_sin = f.tw_sin;
-    var len = 8;
-    while (len <= n) {
-        let half = len / 2;
-        let step = n / len;
-        for t in 0..half {
-            let wc = tw_cos[t * step];
-            let ws = tw_sin[t * step];
-            var p = t;
-            while (p < n) {
-                let q = p + half;
-                // b · e^(-iθ)
-                let rq = re[q];
-                let iq = im[q];
-                let br = rq * wc + iq * ws;
-                let bi = iq * wc - rq * ws;
-                let rp = re[p];
-                let ip = im[p];
-                re[q] = rp - br;
-                im[q] = ip - bi;
-                re[p] = rp + br;
-                im[p] = ip + bi;
-                p = p + len;
-            }
-        }
-        len = len * 2;
-    }
-    // u[2k] = Re(W) and u[m-1-2k] = -Im(W), folded around the window's halves: y[i] = u[i + n]
-    // for i < n, -u[3n - 1 - i] for i < 3n and -u[i - 3n] after that.
-    let scale = 1.0 / (m as float);
-    let post_cos = f.post_cos;
-    let post_sin = f.post_sin;
-    for k in 0..n / 2 {
-        let c = post_cos[k];
-        let s = post_sin[k];
-        let wr = (re[k] * c + im[k] * s) * scale;
-        let wi = (im[k] * c - re[k] * s) * scale;
-        y[3 * n - 1 - 2 * k] = 0.0 - wr;
-        y[3 * n + 2 * k] = 0.0 - wr;
-        y[n - 1 - 2 * k] = 0.0 - wi;
-        y[n + 2 * k] = wi;
-    }
-    for k in n / 2..n {
-        let c = post_cos[k];
-        let s = post_sin[k];
-        let wr = (re[k] * c + im[k] * s) * scale;
-        let wi = (im[k] * c - re[k] * s) * scale;
-        y[2 * k - n] = wr;
-        y[3 * n - 1 - 2 * k] = 0.0 - wr;
-        y[n + 2 * k] = wi;
-        y[5 * n - 1 - 2 * k] = wi;
-    }
-}
-
 fn bessel_i0(x: float) -> float {
     var sum = 1.0;
     var term = 1.0;
@@ -314,8 +146,8 @@ struct Tables {
     /// Rising window halves by shape (0 sine, 1 KBD).
     long_win: [[float]],
     short_win: [[float]],
-    fft_long: Fft,
-    fft_short: Fft,
+    fft_long: mdct.Fft,
+    fft_short: mdct.Fft,
 }
 
 fn tables(rate_index: int) -> Tables {
@@ -339,8 +171,8 @@ fn tables(rate_index: int) -> Tables {
         gain: gain,
         long_win: [sine(2048), kbd(2048, 4.0)],
         short_win: [sine(256), kbd(256, 6.0)],
-        fft_long: fft_of(1024),
-        fft_short: fft_of(128)
+        fft_long: mdct.fft_of(1024),
+        fft_short: mdct.fft_of(128)
     }
 }
 
@@ -875,7 +707,13 @@ struct Overlap {
 }
 
 fn channel() -> Overlap {
-    Overlap { overlap: zeros(1024), shape: 0, spec: zeros(1024), y: zeros(2048), z: zeros(256) }
+    Overlap {
+        overlap: mdct.zeros(1024),
+        shape: 0,
+        spec: mdct.zeros(1024),
+        y: mdct.zeros(2048),
+        z: mdct.zeros(256)
+    }
 }
 
 /// The filter bank: the IMDCT of the frame, windowed and overlapped with the last one's
@@ -894,7 +732,7 @@ fn synthesize(ch: Overlap, ics: Ics, t: Tables, pcm: [float]) -> unit {
             y[n] = 0.0;
         }
         for w in 0..8 {
-            imdct(t.fft_short, ics.spec, w * 128, z);
+            mdct.imdct(t.fft_short, ics.spec, w * 128, z);
             let left = if (w == 0) { prev_short } else { cur_short };
             let at = 448 + 128 * w;
             for n in 0..128 {
@@ -907,7 +745,7 @@ fn synthesize(ch: Overlap, ics: Ics, t: Tables, pcm: [float]) -> unit {
             ov[n] = y[1024 + n];
         }
     } else {
-        imdct(t.fft_long, ics.spec, 0, y);
+        mdct.imdct(t.fft_long, ics.spec, 0, y);
         if (seq == LONG_STOP) {
             for n in 0..448 {
                 pcm[n] = ov[n];
@@ -1077,7 +915,7 @@ pub fn open(b: bytes, t: mp4.Track) -> Result<Stream, string> {
     var pcm: [[float]] = [];
     for _ in 0..cfg.channels {
         state.push(channel());
-        pcm.push(zeros(1024));
+        pcm.push(mdct.zeros(1024));
     }
     var q: [int] = [];
     for _ in 0..1024 {

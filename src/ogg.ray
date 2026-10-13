@@ -1,0 +1,166 @@
+// The Ogg container (RFC 3533): pages of segments that carry the packets of one or more logical
+// streams. `open` takes the first logical stream of the file and lists its packets, each with the
+// granule position of the page it ends (the codec's position at its end) when it is the last to
+// end there. The pages' checksums are not checked: a damaged packet is the codec's to refuse.
+
+/// The packets of a logical stream.
+pub struct Stream {
+    b: bytes,
+    /// Each packet's start in `b` and size; a packet split across pages is copied whole to
+    /// `spill` and its start is then -1 - its index there.
+    offsets: [int],
+    sizes: [int],
+    spill: [bytes],
+    /// The granule position of the page the packet ends, if it is the last to end there; else -1.
+    granules: [int],
+    /// True if the stream's last page (end of stream) was there: the file is not cut short.
+    ended: bool,
+}
+
+/// True if `b` starts like an Ogg file.
+pub fn sniff(b: bytes) -> bool {
+    b.len() >= 4 && b[0] == 0x4F && b[1] == 0x67 && b[2] == 0x67 && b[3] == 0x53
+}
+
+fn u32_le(b: bytes, at: int) -> int {
+    b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24)
+}
+
+fn is_page(b: bytes, at: int) -> bool {
+    at + 27 <= b.len()
+        && b[at] == 0x4F
+        && b[at + 1] == 0x67
+        && b[at + 2] == 0x67
+        && b[at + 3] == 0x53
+}
+
+/// The next page at or after `at` (resynchronizing past damage), or the end of `b`.
+fn find_page(b: bytes, at: int) -> int {
+    if (is_page(b, at)) {
+        return at;
+    }
+    match (b.index_of_from("OggS".to_bytes(), at)) {
+        Option.Some(i) => i,
+        Option.None => b.len(),
+    }
+}
+
+/// The packet at `offsets[k]`, as a reader would want it.
+pub fn packet(s: Stream, k: int) -> (bytes, int, int) {
+    let at = s.offsets[k];
+    if (at >= 0) {
+        return (s.b, at, s.sizes[k]);
+    }
+    let whole = s.spill[-1 - at];
+    (whole, 0, whole.len())
+}
+
+/// The packets of the first logical stream of `b`, up to its last page.
+pub fn open(b: bytes) -> Result<Stream, string> {
+    if (!sniff(b)) {
+        return Result.Err("not an Ogg file");
+    }
+    var offsets: [int] = [];
+    var sizes: [int] = [];
+    var spill: [bytes] = [];
+    var granules: [int] = [];
+    var serial = -1;
+    // The pieces of a packet that goes on into the next page.
+    var pending: [(int, int)] = [];
+    var at = 0;
+    var done = false;
+    var ended = false;
+    while (!done && at < b.len()) {
+        at = find_page(b, at);
+        if (!is_page(b, at)) {
+            break;
+        }
+        let flags = b[at + 5];
+        let low = u32_le(b, at + 6);
+        let high = u32_le(b, at + 10);
+        // Granule positions fit in 63 bits; -1 (all ones) means no packet ends on the page.
+        let granule = if (high >= 0x80000000) { -1 } else { (high << 32) | low };
+        let page_serial = u32_le(b, at + 14);
+        let count = b[at + 26];
+        let body = at + 27 + count;
+        if (body > b.len()) {
+            break;
+        }
+        if (serial < 0) {
+            serial = page_serial;
+        }
+        if (page_serial != serial) {
+            // Another logical stream (a multiplexed video or a second track): not ours.
+            var skip = 0;
+            for i in 0..count {
+                skip = skip + b[at + 27 + i];
+            }
+            at = body + skip;
+            continue;
+        }
+        if ((flags & 1) == 0 && pending.len() > 0) {
+            // A packet was cut short by a lost page.
+            pending = [];
+        }
+        var pos = body;
+        var run = 0;
+        var last = -1;
+        for i in 0..count {
+            let lace = b[at + 27 + i];
+            run = run + lace;
+            if (lace < 255) {
+                if (pos + run > b.len()) {
+                    done = true;
+                    break;
+                }
+                if (pending.len() == 0) {
+                    offsets.push(pos);
+                    sizes.push(run);
+                } else {
+                    var whole = b.sub_bytes(pos, pos);
+                    for piece in pending {
+                        whole = whole + b.sub_bytes(piece.0, piece.0 + piece.1);
+                    }
+                    whole = whole + b.sub_bytes(pos, pos + run);
+                    offsets.push(-1 - spill.len());
+                    sizes.push(whole.len());
+                    spill.push(whole);
+                    pending = [];
+                }
+                granules.push(-1);
+                last = granules.len() - 1;
+                pos = pos + run;
+                run = 0;
+            }
+        }
+        if (run > 0 && !done) {
+            if (pos + run > b.len()) {
+                break;
+            }
+            pending.push((pos, run));
+            pos = pos + run;
+        }
+        if (last >= 0) {
+            granules[last] = granule;
+        }
+        at = pos;
+        if ((flags & 4) != 0) {
+            // The end of the logical stream: a chained stream after it is not played.
+            done = true;
+            ended = true;
+        }
+    }
+    if (offsets.len() == 0) {
+        return Result.Err("Ogg: no packets");
+    }
+    Result.Ok(
+        Stream {
+            b: b,
+            offsets: offsets,
+            sizes: sizes,
+            spill: spill,
+            granules: granules,
+            ended: ended
+        }
+    )
+}
