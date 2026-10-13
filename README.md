@@ -125,8 +125,9 @@ el emulador Android.
   En iOS/Android no hay diálogo (`ui.pick_file_with` devuelve «file dialogs are not available on
   mobile (v1)», #152), así que la página usa su `<input type=file>` y el archivo cruza el puente
   entero en base64. Va como string plano y no como JSON, porque `json.parse` gasta ~55× un string
-  largo (#150), y se decodifica con `src/b64.ray` en vez de `std/base64` (#151). Un WAV de 56 MB
-  ocupa unos 410 MB y tarda 0,6 s en nativo; en la shell de desarrollo (VM) no cabe.
+  largo (#150), y se decodifica con `src/b64.ray` sobre los octetos de la petición: `std/base64`
+  pide un `string` y recortarlo copia (#161). Un WAV de 56 MB de 24 bits llega a unos 450 MB y
+  tarda 0,4 s en nativo; en la shell de desarrollo (VM) no cabe.
 - Sin cola persistente: la lista vuelve a las tres pistas al relanzar.
 
 ## Hallazgos de dogfood
@@ -154,14 +155,22 @@ Ver también `../findings/` (los números son los de allí) y el README de Ray80
    plano.
 6. **`base64.base64_decode` es lento y caro**: ~15 MB/s y ~14× la entrada en nativo. Un
    decodificador en raylang sobre `bytes` (`src/b64.ray`) es ~17× más rápido. Ver #151.
+   Corregido en 1.27.47, pero `src/b64.ray` se queda: ver el 11.
 7. **No hay diálogos de archivo en móvil** y la doc no lo dice: `ui.pick_file_with` devuelve
    «file dialogs are not available on mobile (v1)». Ver #152. Con 1.27.47, #150, #151 y #152
    están corregidos.
 8. **En nativo, `for i in 0..xs.len()` con `xs[i] = …` en el cuerpo revienta** con «RefCell
    already borrowed»; en la VM funciona. El decodificador FLAC pasaba los tests en la VM y moría
-   en el binario. Rodeo: sacar `xs.len()` a una variable. Ver #156.
+   en el binario. Rodeo: sacar `xs.len()` a una variable. Ver #156. **Corregido en 1.27.49**, y
+   se quitó el rodeo.
 9. **Indexar un `const` array lo reconstruye en cada acceso**: con las tablas de Huffman del MP3
    (2164 entradas), unas 400× más lento que una copia local. Por eso `src/mp3_tables.ray` son
-   funciones que se llaman una vez por archivo. Ver #157.
+   funciones que se llaman una vez por archivo. Ver #157. **Corregido en 1.27.49**.
 10. **No está documentado cómo escribir el valor `unit`**: `Result.Ok(())` es un error de sintaxis;
-    funciona `Result.Ok({ })`. Ver #158.
+    funciona `Result.Ok({ })`. Ver #158. Documentado en 1.27.49.
+11. **`std/base64` no compensa aquí, aunque ya es rápido**: `base64_decode` solo acepta `string`, y
+    sacar el base64 de la petición copia. Para un WAV de 56 MB, `src/b64.ray` tarda 370 ms y
+    ocupa ~450 MB; con `std/base64`, ≥ 510 ms y hasta 550 MB. Si el nombre del archivo lleva un
+    acento, recortar con `substring` dispara el pico a 1 GB, porque cuesta ~6 octetos por carácter.
+    Además, `ray_doc string.index_of` dice «octet index» y devuelve un índice de carácter. Ver
+    #159, #160 y #161.

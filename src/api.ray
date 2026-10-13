@@ -15,7 +15,8 @@
 //                                playlist; for a shell without a native dialog (iOS). A plain
 //                                string because `json.parse` costs ~55× a long string
 //                                (findings #150): a 56 MB WAV inside JSON blows the phone's
-//                                memory limit; decoded with `b64`, not std/base64 (#151).
+//                                memory limit; decoded with `b64` over the request's octets,
+//                                which std/base64 (a `string` in) cannot do (#161).
 
 import std/fs;
 import std/json;

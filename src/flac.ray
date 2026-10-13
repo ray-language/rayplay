@@ -235,10 +235,7 @@ fn fixed_predict(s: [int], order: int) -> unit {
 
 fn lpc_predict(s: [int], coefs: [int], shift: int) -> unit {
     let order = coefs.len();
-    // Bound hoisted: `for i in a..s.len()` while writing `s[i]` panics in native code
-    // ("RefCell already borrowed", findings #156).
-    let n = s.len();
-    for i in order..n {
+    for i in order..s.len() {
         var sum = 0;
         for j in 0..order {
             sum = sum + coefs[j] * s[i - 1 - j];

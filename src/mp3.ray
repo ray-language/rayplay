@@ -13,8 +13,7 @@ import std/math;
 import bits;
 import mp3_tables;
 
-/// The tables, built once per file (a `const` array would be rebuilt on every access, findings
-/// #157).
+/// The tables, built once per decoder.
 struct Tables {
     huffman: [int],
     huffman_index: [int],
@@ -1238,16 +1237,12 @@ fn synth_granule(d: Dec, nch: int) -> unit {
 /// Forgets everything carried from frame to frame (before decoding from somewhere else).
 fn reset(d: Dec) -> unit {
     d.reserv = bytes_of([]);
-    // Bounds hoisted: `for i in 0..xs.len()` while writing `xs[i]` panics in native code
-    // (findings #156).
     let overlap = d.overlap;
-    let n_overlap = overlap.len();
-    for i in 0..n_overlap {
+    for i in 0..overlap.len() {
         overlap[i] = 0.0;
     }
     let qmf = d.qmf;
-    let n_qmf = qmf.len();
-    for i in 0..n_qmf {
+    for i in 0..qmf.len() {
         qmf[i] = 0.0;
     }
 }

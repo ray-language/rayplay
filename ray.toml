@@ -8,7 +8,9 @@ version = "0.1.0"
 # 1.27.26: fixes the audio clicks 1.27.25 had on the iPhone (findings #112).
 # 1.27.46: `std/embed` sees `[native] embed` under `ray dev --device` (findings #109), so the
 # page is always served with `mount_embed_at`.
-raylang = "1.27.46"
+# 1.27.49: std/base64 decodes a song-sized upload in one cheap pass (findings #151, M380), and
+# native `for i in 0..xs.len()` loops that write `xs[i]` no longer panic (#156).
+raylang = "1.27.49"
 
 # The page (www/) is plain HTML served by the process itself over ray://app; no Vite, no
 # local server. `ui.mount_embed_at("", "www")` puts www/index.html at ray://app/index.html.

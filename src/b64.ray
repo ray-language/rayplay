@@ -1,6 +1,8 @@
-// A base64 decoder for the WAV the page sends: std/base64 decodes ~15 MB/s and holds ~14× its
-// input (findings #151), which a phone cannot afford for a file of tens of MB. This one reads
-// octets with `b[i]` and flushes its output to `bytes` every 768 KB.
+// A base64 decoder for the file the page sends. It reads the request's octets in place (`b[i]`)
+// and flushes its output to `bytes` every 768 KB. std/base64 is fast since 1.27.47 (#151), but
+// it takes a `string`: cutting the base64 out of the request costs a copy, or ~6 octets per
+// character with `substring` once the name has an accent (#160). For a 56 MB WAV this stays the
+// cheaper route: 370 ms and ~450 MB against ≥ 510 ms and 430–550 MB (findings #161).
 
 const FLUSH: int = 786432;
 
