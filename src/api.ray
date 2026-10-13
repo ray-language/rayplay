@@ -86,7 +86,7 @@ pub fn track_name(path: string) -> string {
 /// `Ok(false)` if the user cancelled.
 fn pick(cmds: Channel<player.Cmd>) -> Result<bool, string> {
     var o = ui.file_options();
-    o.title = "Load a song (MP3, AAC, FLAC, ALAC, WAV or AIFF)";
+    o.title = "Load a song (MP3, AAC, Ogg, FLAC, ALAC, WAV or AIFF)";
     o.filters = [ui.filter("Audio", codec.extensions())];
     // A dialog failure is told apart so the page can fall back to its own file input.
     let chosen = ui.pick_file_with(o).map_err(fn(e: string) -> string { "dialog: " + e })?;
