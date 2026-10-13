@@ -41,6 +41,8 @@ fn bad_requests_fail_cleanly() {
     assert_eq(json.get_string(r4, "error"), Option.Some("not a WAV, FLAC or MP3 file"));
     let r5 = json.parse(api.handle(cmds, "add:x")).unwrap();
     assert_eq(json.get_string(r5, "error"), Option.Some("add: missing the file after the name"));
+    let r6 = json.parse(api.handle(cmds, "add:x\nab!d")).unwrap();
+    assert(json.get_string(r6, "error").is_some());
     send(cmds, player.Cmd.Quit);
 }
 
