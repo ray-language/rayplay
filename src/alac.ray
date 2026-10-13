@@ -1,0 +1,364 @@
+// An ALAC decoder (Apple Lossless, as in .m4a files; Apple's open-source reference, 2011): mono
+// and stereo, 16 to 32 bits, compressed and verbatim packets. Each packet is independent — an
+// adaptive Rice code for the residual, an adaptive LPC predictor, mid/side-like decorrelation
+// and, for deep samples, low octets stored apart — so `seek` just picks the packet. The result
+// is 16-bit PCM for the player: deeper samples are truncated.
+
+import bits;
+import mp4;
+
+/// ALACSpecificConfig, the 24 octets in the `alac` box.
+struct Config {
+    frame_length: int,
+    depth: int,
+    /// Rice tuning: history multiplier, initial history and the limit on k.
+    pb: int,
+    mb: int,
+    kb: int,
+    channels: int,
+}
+
+fn be32(b: bytes, at: int) -> int {
+    (b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]
+}
+
+fn config_of(c: bytes) -> Config {
+    Config { frame_length: be32(c, 0), depth: c[5], pb: c[6], mb: c[7], kb: c[8], channels: c[9] }
+}
+
+/// The low `n` bits of `v` as a two's-complement value.
+fn sign_extend(v: int, n: int) -> int {
+    let m = v & ((1 << n) - 1);
+    if ((m >> (n - 1)) == 1) { m - (1 << n) } else { m }
+}
+
+fn sign_of(v: int) -> int {
+    if (v > 0) { 1 } else if (v < 0) { -1 } else { 0 }
+}
+
+/// floor(log2(v)) for v ≥ 1, and 0 for 0.
+fn log2(v: int) -> int {
+    var n = 0;
+    var x = v >> 1;
+    while (x > 0) {
+        n = n + 1;
+        x = x >> 1;
+    }
+    n
+}
+
+/// One Rice-coded value: up to 8 ones in unary (a ninth means an escape: `bps` raw bits), then k
+/// bits in Apple's variant (the low part is k-1 bits when it would be 0 or 1).
+fn scalar(r: bits.Bits, k: int, bps: int) -> int {
+    let w = bits.peek(r, 9);
+    var x = 0;
+    var bit = 256;
+    while (x < 9 && (w & bit) != 0) {
+        x = x + 1;
+        bit = bit >> 1;
+    }
+    bits.skip(r, if (x < 9) { x + 1 } else { 9 });
+    if (x > 8) {
+        return bits.get_long(r, bps);
+    }
+    if (k != 1) {
+        let extra = bits.peek(r, k);
+        x = (x << k) - x;
+        if (extra > 1) {
+            x = x + extra - 1;
+            bits.skip(r, k);
+        } else {
+            bits.skip(r, k - 1);
+        }
+    }
+    x
+}
+
+/// The residual of one channel: `n` values with an adaptive Rice parameter, and runs of zeros
+/// when the history gets small.
+fn rice(r: bits.Bits, cfg: Config, n: int, bps: int, mult: int) -> [int] {
+    var out: [int] = [];
+    var history = cfg.mb;
+    var sign_modifier = 0;
+    while (out.len() < n) {
+        var k = log2((history >> 9) + 3);
+        if (k > cfg.kb) {
+            k = cfg.kb;
+        }
+        let x = scalar(r, k, bps) + sign_modifier;
+        sign_modifier = 0;
+        out.push((x >> 1) ^ (0 - (x & 1)));
+        if (x > 0xFFFF) {
+            history = 0xFFFF;
+        } else {
+            history = history + x * mult - ((history * mult) >> 9);
+        }
+        if (history < 128 && out.len() < n) {
+            var kz = 7 - log2(history) + ((history + 16) >> 6);
+            if (kz > cfg.kb) {
+                kz = cfg.kb;
+            }
+            var zeros = scalar(r, kz, 16);
+            if (zeros > 0) {
+                if (zeros > n - out.len()) {
+                    zeros = n - out.len();
+                }
+                for _ in 0..zeros {
+                    out.push(0);
+                }
+            }
+            if (zeros <= 0xFFFF) {
+                sign_modifier = 1;
+            }
+            history = 0;
+        }
+    }
+    out
+}
+
+/// Undoes the adaptive FIR predictor in place: `order` coefficients (most recent sample last),
+/// adapted by the sign of each error; order 31 is plain first-order prediction.
+fn predict(s: [int], coefs: [int], order: int, quant: int, bps: int) -> unit {
+    let n = s.len();
+    if (n <= 1 || order == 0) {
+        return;
+    }
+    if (order == 31) {
+        for i in 1..n {
+            s[i] = sign_extend(s[i - 1] + s[i], bps);
+        }
+        return;
+    }
+    var i = 1;
+    while (i <= order && i < n) {
+        s[i] = sign_extend(s[i - 1] + s[i], bps);
+        i = i + 1;
+    }
+    let round = if (quant > 0) { 1 << (quant - 1) } else { 0 };
+    while (i < n) {
+        let base = i - order;
+        let d = s[base - 1];
+        var val = 0;
+        for j in 0..order {
+            val = val + (s[base + j] - d) * coefs[j];
+        }
+        // The reference sums in 32 bits, and encoders rely on its wrap-around.
+        val = sign_extend(val, 32);
+        var err = s[i];
+        s[i] = sign_extend(((val + round) >> quant) + d + err, bps);
+        let sign = sign_of(err);
+        if (sign != 0) {
+            var j = 0;
+            while (j < order && err * sign > 0) {
+                let diff = d - s[base + j];
+                let sg = sign_of(diff) * sign;
+                coefs[j] = coefs[j] - sg;
+                err = err - ((diff * sg) >> quant) * (j + 1);
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// One element (a mono or stereo group) of a packet: the channels' samples, as decoded.
+fn element(r: bits.Bits, cfg: Config, channels: int) -> Result<[[int]], string> {
+    bits.skip(r, 4 + 12);
+    let has_size = bits.get(r, 1) == 1;
+    let shift = bits.get(r, 2) * 8;
+    let verbatim = bits.get(r, 1) == 1;
+    let n = if (has_size) { bits.get_long(r, 32) } else { cfg.frame_length };
+    if (n < 1 || n > cfg.frame_length) {
+        return Result.Err("ALAC: bad packet length");
+    }
+    var chans: [[int]] = [];
+    if (verbatim) {
+        for _ in 0..channels {
+            chans.push([]);
+        }
+        for _ in 0..n {
+            for c in 0..channels {
+                chans[c].push(bits.get_signed(r, cfg.depth));
+            }
+        }
+        return Result.Ok(chans);
+    }
+    let bps = cfg.depth - shift + channels - 1;
+    let mix_shift = bits.get(r, 8);
+    let mix_weight = bits.get(r, 8);
+    var modes: [int] = [];
+    var quants: [int] = [];
+    var mults: [int] = [];
+    var all_coefs: [[int]] = [];
+    for _ in 0..channels {
+        modes.push(bits.get(r, 4));
+        quants.push(bits.get(r, 4));
+        mults.push(bits.get(r, 3));
+        let order = bits.get(r, 5);
+        // Stored most recent first; `predict` wants them the other way round.
+        var coefs: [int] = [];
+        for _ in 0..order {
+            coefs.push(0);
+        }
+        for j in 0..order {
+            coefs[order - 1 - j] = bits.get_signed(r, 16);
+        }
+        all_coefs.push(coefs);
+    }
+    var low: [[int]] = [];
+    if (shift > 0) {
+        for _ in 0..channels {
+            low.push([]);
+        }
+        for _ in 0..n {
+            for c in 0..channels {
+                low[c].push(bits.get(r, shift));
+            }
+        }
+    }
+    for c in 0..channels {
+        let s = rice(r, cfg, n, bps, mults[c] * cfg.pb / 4);
+        if (modes[c] == 15) {
+            predict(s, [], 31, 0, bps);
+        } else if (modes[c] != 0) {
+            return Result.Err("ALAC: unknown prediction mode ${to_string(modes[c])}");
+        }
+        let coefs = all_coefs[c];
+        predict(s, coefs, coefs.len(), quants[c], bps);
+        chans.push(s);
+    }
+    if (bits.over(r)) {
+        return Result.Err("ALAC: truncated packet");
+    }
+    if (channels == 2 && mix_weight != 0) {
+        let a = chans[0];
+        let b = chans[1];
+        for i in 0..n {
+            let x = a[i] - ((b[i] * mix_weight) >> mix_shift);
+            let y = b[i] + x;
+            a[i] = y;
+            b[i] = x;
+        }
+    }
+    if (shift > 0) {
+        for c in 0..channels {
+            let s = chans[c];
+            let lo = low[c];
+            for i in 0..n {
+                s[i] = (s[i] << shift) | lo[i];
+            }
+        }
+    }
+    Result.Ok(chans)
+}
+
+/// Decodes one packet, appending its interleaved 16-bit samples to `out`.
+fn packet(b: bytes, at: int, size: int, cfg: Config, out: [int]) -> Result<unit, string> {
+    let r = bits.over_range(b, at, at + size);
+    var chans: [[int]] = [];
+    while (chans.len() < cfg.channels && r.pos + 3 <= r.end) {
+        let kind = bits.get(r, 3);
+        if (kind == 7) {
+            break;
+        }
+        // Single channel, channel pair, LFE; fill and data elements carry no audio.
+        if (kind == 0 || kind == 3) {
+            for ch in element(r, cfg, 1)? {
+                chans.push(ch);
+            }
+        } else if (kind == 1) {
+            for ch in element(r, cfg, 2)? {
+                chans.push(ch);
+            }
+        } else {
+            return Result.Err("ALAC: unsupported element ${to_string(kind)}");
+        }
+    }
+    if (chans.len() < cfg.channels) {
+        return Result.Err("ALAC: packet without all its channels");
+    }
+    let down = cfg.depth - 16;
+    let n = chans[0].len();
+    for i in 0..n {
+        for c in 0..cfg.channels {
+            let v = chans[c][i];
+            out.push(if (down > 0) { v >> down } else { v << (0 - down) });
+        }
+    }
+    Result.Ok({ })
+}
+
+/// An ALAC track being played.
+pub struct Stream {
+    b: bytes,
+    cfg: Config,
+    track: mp4.Track,
+    /// The next packet to decode.
+    next: int,
+    rate: int,
+    channels: int,
+    total: int,
+}
+
+/// Opens the ALAC track `t` of the MP4 file `b`.
+pub fn open(b: bytes, t: mp4.Track) -> Result<Stream, string> {
+    let cfg = config_of(t.config);
+    if (cfg.channels < 1 || cfg.channels > 2) {
+        return Result.Err("ALAC with ${to_string(cfg.channels)} channels (only mono and stereo)");
+    }
+    if (cfg.depth != 16 && cfg.depth != 20 && cfg.depth != 24 && cfg.depth != 32) {
+        return Result.Err("ALAC: unsupported ${to_string(cfg.depth)}-bit samples");
+    }
+    if (cfg.frame_length < 1 || t.rate < 1) {
+        return Result.Err("ALAC: bad configuration");
+    }
+    Result.Ok(
+        Stream {
+            b: b,
+            cfg: cfg,
+            track: t,
+            next: 0,
+            rate: t.rate,
+            channels: cfg.channels,
+            total: t.total
+        }
+    )
+}
+
+/// Decodes the next packet, appending its samples to `out`; returns the frame its first sample
+/// is, or None at the end. A damaged packet becomes silence of its length.
+pub fn next(s: Stream, out: [int]) -> Option<int> {
+    let t = s.track;
+    let k = s.next;
+    if (k >= t.offsets.len()) {
+        return Option.None;
+    }
+    s.next = k + 1;
+    let before = out.len();
+    if let Result.Err(_) = packet(s.b, t.offsets[k], t.sizes[k], s.cfg, out) {
+        let end = if (k + 1 < t.starts.len()) { t.starts[k + 1] } else { t.total };
+        while (out.len() > before) {
+            let _drop = out.pop();
+        }
+        for _ in 0..(end - t.starts[k]) * s.channels {
+            out.push(0);
+        }
+    }
+    Option.Some(t.starts[k])
+}
+
+/// Makes `next` continue from the packet that holds frame `pos` (packets are independent).
+pub fn seek(s: Stream, pos: int) -> unit {
+    let starts = s.track.starts;
+    var lo = 0;
+    var hi = starts.len();
+    while (hi - lo > 1) {
+        let mid = (lo + hi) / 2;
+        if (starts[mid] <= pos) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    s.next = lo;
+}

@@ -1,0 +1,253 @@
+// The MP4 / M4A container (ISO base media file format, as iTunes and afconvert write it): finds
+// the first sound track and turns its sample tables into where each packet is in the file and
+// which frame it starts at. It does not decode anything; `alac` does, packet by packet.
+
+/// The first sound track of a file.
+pub struct Track {
+    /// The sample entry's format: "alac", "mp4a" (AAC)…
+    format: string,
+    rate: int,
+    channels: int,
+    /// The decoder's own configuration (for ALAC, the 24-octet ALACSpecificConfig).
+    config: bytes,
+    /// Each packet's offset and size in the file, and the frame it starts at (in samples at
+    /// `rate`, from the time-to-sample table).
+    offsets: [int],
+    sizes: [int],
+    starts: [int],
+    /// Frames in the track.
+    total: int,
+}
+
+fn be16(b: bytes, at: int) -> int {
+    (b[at] << 8) | b[at + 1]
+}
+
+fn be32(b: bytes, at: int) -> int {
+    (b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]
+}
+
+fn tag(b: bytes, at: int) -> string {
+    from_utf8(b.sub_bytes(at, at + 4)).unwrap_or("")
+}
+
+/// The body (`from`, `to`) of the first `kind` box among the boxes in `from..to`.
+fn child(b: bytes, from: int, to: int, kind: string) -> Option<(int, int)> {
+    var at = from;
+    while (at + 8 <= to) {
+        var size = be32(b, at);
+        var head = 8;
+        if (size == 1) {
+            if (at + 16 > to) {
+                return Option.None;
+            }
+            size = (be32(b, at + 8) << 32) | be32(b, at + 12);
+            head = 16;
+        } else if (size == 0) {
+            size = to - at;
+        }
+        if (size < head || at + size > to) {
+            return Option.None;
+        }
+        if (tag(b, at + 4) == kind) {
+            return Option.Some((at + head, at + size));
+        }
+        at = at + size;
+    }
+    Option.None
+}
+
+fn path(b: bytes, from: int, to: int, kinds: [string]) -> Option<(int, int)> {
+    var range = (from, to);
+    for k in kinds {
+        match (child(b, range.0, range.1, k)) {
+            Option.Some(r) => {
+                range = r;
+            },
+            Option.None => return Option.None,
+        }
+    }
+    Option.Some(range)
+}
+
+/// True when `b` looks like an MP4: an `ftyp` box first.
+pub fn sniff(b: bytes) -> bool {
+    b.len() >= 12 && tag(b, 4) == "ftyp"
+}
+
+/// The `trak` boxes inside `moov`, in order.
+fn tracks(b: bytes, moov: (int, int)) -> [(int, int)] {
+    var out: [(int, int)] = [];
+    var at = moov.0;
+    while (true) {
+        match (child(b, at, moov.1, "trak")) {
+            Option.Some(t) => {
+                out.push(t);
+                at = t.1;
+            },
+            Option.None => return out,
+        }
+    }
+    out
+}
+
+/// Opens the first sound track of an MP4 file.
+pub fn open(b: bytes) -> Result<Track, string> {
+    if (!sniff(b)) {
+        return Result.Err("not an MP4 file");
+    }
+    let moov = match (child(b, 0, b.len(), "moov")) {
+        Option.Some(m) => m,
+        Option.None => return Result.Err("MP4 without a moov box"),
+    };
+    for trak in tracks(b, moov) {
+        if let Option.Some(hdlr) = path(b, trak.0, trak.1, ["mdia", "hdlr"]) {
+            if (hdlr.0 + 12 <= hdlr.1 && tag(b, hdlr.0 + 8) == "soun") {
+                return sound_track(b, trak);
+            }
+        }
+    }
+    Result.Err("MP4 without a sound track")
+}
+
+fn sound_track(b: bytes, trak: (int, int)) -> Result<Track, string> {
+    let stbl = match (path(b, trak.0, trak.1, ["mdia", "minf", "stbl"])) {
+        Option.Some(s) => s,
+        Option.None => return Result.Err("MP4: sound track without a sample table"),
+    };
+    let stsd = match (child(b, stbl.0, stbl.1, "stsd")) {
+        Option.Some(s) => s,
+        Option.None => return Result.Err("MP4: no sample description"),
+    };
+    // The first sample entry: size, format, 6 reserved, data reference, then the audio fields.
+    let entry = stsd.0 + 8;
+    if (entry + 36 > stsd.1) {
+        return Result.Err("MP4: short sample description");
+    }
+    let entry_end = entry + be32(b, entry);
+    let format = tag(b, entry + 4);
+    let version = be16(b, entry + 16);
+    var channels = be16(b, entry + 24);
+    var rate = be16(b, entry + 32);
+    // QuickTime sound entries of version 1 and 2 carry 16 and 36 more octets before the boxes.
+    let boxes = entry + 36 + if (version == 1) { 16 } else if (version == 2) { 36 } else { 0 };
+    var config = bytes_of([]);
+    if (format == "alac") {
+        match (child(b, boxes, entry_end, "alac")) {
+            Option.Some(c) => {
+                if (c.0 + 28 > c.1) {
+                    return Result.Err("ALAC: short configuration");
+                }
+                // Version and flags, then ALACSpecificConfig.
+                config = b.sub_bytes(c.0 + 4, c.0 + 28);
+                channels = config[9];
+                rate = be32(config, 20);
+            },
+            Option.None => return Result.Err("ALAC without its configuration box"),
+        }
+    }
+    let starts = time_to_sample(b, stbl)?;
+    let (offsets, sizes) = sample_offsets(b, stbl)?;
+    if (offsets.len() == 0 || offsets.len() + 1 != starts.len()) {
+        return Result.Err("MP4: sample tables that do not agree");
+    }
+    let total = starts[starts.len() - 1];
+    let _end = starts.pop();
+    Result.Ok(
+        Track {
+            format: format,
+            rate: rate,
+            channels: channels,
+            config: config,
+            offsets: offsets,
+            sizes: sizes,
+            starts: starts,
+            total: total
+        }
+    )
+}
+
+/// The frame each sample starts at, plus where the last one ends (from `stts`).
+fn time_to_sample(b: bytes, stbl: (int, int)) -> Result<[int], string> {
+    let stts = match (child(b, stbl.0, stbl.1, "stts")) {
+        Option.Some(s) => s,
+        Option.None => return Result.Err("MP4: no time-to-sample table"),
+    };
+    let n = be32(b, stts.0 + 4);
+    if (stts.0 + 8 + 8 * n > stts.1) {
+        return Result.Err("MP4: short time-to-sample table");
+    }
+    var starts: [int] = [0];
+    var t = 0;
+    for e in 0..n {
+        let count = be32(b, stts.0 + 8 + 8 * e);
+        let delta = be32(b, stts.0 + 12 + 8 * e);
+        for _ in 0..count {
+            t = t + delta;
+            starts.push(t);
+        }
+    }
+    Result.Ok(starts)
+}
+
+/// Each sample's offset and size, from the chunk offsets (`stco`/`co64`), the sample-to-chunk
+/// runs (`stsc`) and the sizes (`stsz`).
+fn sample_offsets(b: bytes, stbl: (int, int)) -> Result<([int], [int]), string> {
+    let stsz = match (child(b, stbl.0, stbl.1, "stsz")) {
+        Option.Some(s) => s,
+        Option.None => return Result.Err("MP4: no sample sizes"),
+    };
+    let fixed = be32(b, stsz.0 + 4);
+    let count = be32(b, stsz.0 + 8);
+    if (fixed == 0 && stsz.0 + 12 + 4 * count > stsz.1) {
+        return Result.Err("MP4: short sample size table");
+    }
+    var chunks: [int] = [];
+    if let Option.Some(stco) = child(b, stbl.0, stbl.1, "stco") {
+        let n = be32(b, stco.0 + 4);
+        for i in 0..n {
+            chunks.push(be32(b, stco.0 + 8 + 4 * i));
+        }
+    } else if let Option.Some(co64) = child(b, stbl.0, stbl.1, "co64") {
+        let n = be32(b, co64.0 + 4);
+        for i in 0..n {
+            let at = co64.0 + 8 + 8 * i;
+            chunks.push((be32(b, at) << 32) | be32(b, at + 4));
+        }
+    } else {
+        return Result.Err("MP4: no chunk offsets");
+    }
+    let stsc = match (child(b, stbl.0, stbl.1, "stsc")) {
+        Option.Some(s) => s,
+        Option.None => return Result.Err("MP4: no sample-to-chunk table"),
+    };
+    let runs = be32(b, stsc.0 + 4);
+    var offsets: [int] = [];
+    var sizes: [int] = [];
+    var sample = 0;
+    for r in 0..runs {
+        let first = be32(b, stsc.0 + 8 + 12 * r) - 1;
+        let per_chunk = be32(b, stsc.0 + 12 + 12 * r);
+        let last = if (r + 1 < runs) { be32(b, stsc.0 + 20 + 12 * r) - 1 } else { chunks.len() };
+        for c in first..last {
+            if (c >= chunks.len()) {
+                return Result.Err("MP4: a chunk past the offset table");
+            }
+            var at = chunks[c];
+            for _ in 0..per_chunk {
+                if (sample >= count) {
+                    return Result.Ok((offsets, sizes));
+                }
+                let size = if (fixed != 0) { fixed } else { be32(b, stsz.0 + 12 + 4 * sample) };
+                if (at + size > b.len()) {
+                    return Result.Err("MP4: a sample past the end of the file");
+                }
+                offsets.push(at);
+                sizes.push(size);
+                at = at + size;
+                sample = sample + 1;
+            }
+        }
+    }
+    Result.Ok((offsets, sizes))
+}

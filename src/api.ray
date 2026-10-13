@@ -7,11 +7,10 @@
 //   toggle                     → play / pause / resume the current track
 //   stop · next · prev
 //   seek {ms} · volume {value}
-//   pick                       → the native file dialog; the chosen file (WAV, AIFF, FLAC, MP3) is
-//                                read from disk and appended to the playlist (FLAC and MP3
-//                                are decoded as they play)
+//   pick                       → the native file dialog; the chosen song (any format `codec`
+//                                reads) is read from disk and appended to the playlist
 //                                (cancelling changes nothing)
-//   "add:<name>\n<base64>"     → a WAV, AIFF, FLAC or MP3 from the page's file input, added to the
+//   "add:<name>\n<base64>"     → a song from the page's file input, appended to the
 //                                playlist; for a shell without a native dialog (iOS). A plain
 //                                string because `json.parse` costs ~55× a long string
 //                                (findings #150): a 56 MB WAV inside JSON blows the phone's
@@ -87,7 +86,7 @@ pub fn track_name(path: string) -> string {
 /// `Ok(false)` if the user cancelled.
 fn pick(cmds: Channel<player.Cmd>) -> Result<bool, string> {
     var o = ui.file_options();
-    o.title = "Load a song (MP3, FLAC, WAV or AIFF)";
+    o.title = "Load a song (MP3, FLAC, ALAC, WAV or AIFF)";
     o.filters = [ui.filter("Audio", codec.extensions())];
     // A dialog failure is told apart so the page can fall back to its own file input.
     let chosen = ui.pick_file_with(o).map_err(fn(e: string) -> string { "dialog: " + e })?;

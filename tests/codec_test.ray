@@ -198,3 +198,34 @@ fn damaged_and_compressed_aiffs_are_refused() {
     let e = codec.decode(ulaw);
     assert(e.is_err());
 }
+
+@test
+fn alac_in_m4a_decodes_exactly() {
+    // Made by Apple's afconvert: 16-bit stereo, 24-bit mono (truncated to 16 bits), and white
+    // noise, which the encoder can only store with escapes.
+    let p = codec.decode(fixture("tiny.m4a")).unwrap();
+    assert_eq(p.rate, 44100);
+    assert_eq(p.channels, 2);
+    assert_eq(max_diff(p.data, fixture("tiny.flac.raw")), 0);
+    let deep = codec.decode(fixture("tiny24.m4a")).unwrap();
+    assert_eq(deep.channels, 1);
+    assert_eq(max_diff(deep.data, fixture("tiny24.flac.raw")), 0);
+    let noise = codec.decode(fixture("tiny-noise.m4a")).unwrap();
+    assert_eq(max_diff(noise.data, fixture("tiny-noise.m4a.raw")), 0);
+    // Packets are independent: a read after any seek is exact.
+    assert_eq(stream("tiny.m4a").total, 13230);
+    reads_like_the_whole_decode("tiny.m4a", [9000, 0, 4095, 4096, 12900]);
+    reads_like_the_whole_decode("tiny24.m4a", [5000, 10]);
+}
+
+@test
+fn aac_and_damaged_m4as_are_refused() {
+    let aac = codec.decode(fixture("tiny-aac.m4a"));
+    match (aac) {
+        Result.Err(e) => assert_eq(e, "AAC in MP4 is not supported yet (only ALAC)"),
+        Result.Ok(_) => panic("AAC decoded"),
+    }
+    // The ftyp box and nothing else.
+    let m4a = fixture("tiny.m4a");
+    assert(codec.decode(m4a.sub_bytes(0, 40)).is_err());
+}
