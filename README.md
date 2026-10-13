@@ -58,6 +58,7 @@ con `std/audio`, y la página es solo la interfaz.
 │  vorbis.ray   Vorbis I (floor 1, residuos 0–2, acoplamiento)        │
 │  mdct.ray     la IMDCT de AAC y Vorbis (DCT-IV por una FFT)         │
 │  bits.ray     lector de bits big-endian sobre bytes                 │
+│  dither.ray   de 24/32 bits a 16: dither TPDF según la posición     │
 │  b64.ray      base64 → bytes rápido (std/base64 no aguantaba 56 MB) │
 └────────────────────────────────────────────────────────────────────┘
 ```
@@ -78,7 +79,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 43 tests: MP3, AAC, Vorbis, FLAC, ALAC, WAV, AIFF, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
+make test            # 45 tests: MP3, AAC, Vorbis, FLAC, ALAC, WAV, AIFF, dither, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -129,7 +130,8 @@ el emulador Android.
   ni frames de 960); de HE-AAC v1/v2 solo el núcleo LC, sin la banda alta de SBR (suena apagado,
   a media frecuencia). Vorbis mono o estéreo en Ogg, sin el floor 0 (LSP) y solo la primera pista
   de un Ogg encadenado; Opus no está escrito. Lo que pase de 16
-  bits se trunca (sin dither); de un FLAC de más de dos canales se quedan los dos primeros. El
+  bits se reduce a 16 con dither triangular (TPDF) y redondeo, porque `std/audio` solo acepta
+  s16le (hallazgo #167); de un FLAC de más de dos canales se quedan los dos primeros. El
   reproductor no remuestrea: abre el dispositivo a la frecuencia de la pista.
 - En la shell de desarrollo (VM), decodificar va justo: en el Mac, 5 s de audio en 1,4–1,6 s
   (MP3), 1 s (AAC) y 0,6 s (FLAC), unas 3,5–5× el tiempo real; un seek, 30–80 ms. En un teléfono puede no dar

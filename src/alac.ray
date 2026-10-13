@@ -2,9 +2,10 @@
 // and stereo, 16 to 32 bits, compressed and verbatim packets. Each packet is independent — an
 // adaptive Rice code for the residual, an adaptive LPC predictor, mid/side-like decorrelation
 // and, for deep samples, low octets stored apart — so `seek` just picks the packet. The result
-// is 16-bit PCM for the player: deeper samples are truncated.
+// is 16-bit PCM for the player: deeper samples are dithered.
 
 import bits;
+import dither;
 import mp4;
 
 /// ALACSpecificConfig, the 24 octets in the `alac` box.
@@ -277,12 +278,10 @@ fn packet(b: bytes, at: int, size: int, cfg: Config, out: [int]) -> Result<unit,
     if (chans.len() < cfg.channels) {
         return Result.Err("ALAC: packet without all its channels");
     }
-    let down = cfg.depth - 16;
     let n = chans[0].len();
     for i in 0..n {
         for c in 0..cfg.channels {
-            let v = chans[c][i];
-            out.push(if (down > 0) { v >> down } else { v << (0 - down) });
+            out.push(dither.to_16(chans[c][i], cfg.depth, dither.place(at, i, c)));
         }
     }
     Result.Ok({ })

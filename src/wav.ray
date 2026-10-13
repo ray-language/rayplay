@@ -2,6 +2,8 @@
 // `Raw`, uncompressed PCM left where it is in a loaded file, and a RIFF/WAVE reader and writer.
 // WAVs of 16 or 24 bits are read; everything is little-endian; `b[i]` is the octet at `i`.
 
+import dither;
+
 /// Interleaved s16le samples with their format.
 pub struct Pcm {
     rate: int,
@@ -62,19 +64,27 @@ pub struct Raw {
     big_endian: bool,
 }
 
-/// Sample `i` (interleaved) as a signed 16-bit value: its two most significant octets, so deeper
-/// samples are truncated and 8-bit ones (signed, as in AIFF) scaled up.
+/// Sample `i` (interleaved) as a signed 16-bit value: deeper samples are dithered and 8-bit ones
+/// (signed, as in AIFF) scaled up.
 pub fn sample(r: Raw, i: int) -> int {
     let step = r.depth / 8;
     let at = r.from + i * step;
     let b = r.b;
-    var v = 0;
-    if (r.big_endian) {
-        v = if (step == 1) { b[at] << 8 } else { (b[at] << 8) | b[at + 1] };
-    } else {
-        v = (b[at + step - 1] << 8) | b[at + step - 2];
+    if (step <= 2) {
+        var v = 0;
+        if (r.big_endian) {
+            v = if (step == 1) { b[at] << 8 } else { (b[at] << 8) | b[at + 1] };
+        } else {
+            v = (b[at + 1] << 8) | b[at];
+        }
+        return if (v >= 32768) { v - 65536 } else { v };
     }
-    if (v >= 32768) { v - 65536 } else { v }
+    var v = 0;
+    for k in 0..step {
+        v = (v << 8) | if (r.big_endian) { b[at + k] } else { b[at + step - 1 - k] };
+    }
+    let top = 1 << (r.depth - 1);
+    dither.to_16(if (v >= top) { v - 2 * top } else { v }, r.depth, i)
 }
 
 /// The whole of `r` as s16le (tests, tools): a 16-bit little-endian WAV is shared, not copied.
@@ -160,7 +170,7 @@ pub fn open(b: bytes) -> Result<Raw, string> {
     Result.Err("WAV without a data chunk")
 }
 
-/// Parses a WAV file into 16-bit PCM (24-bit samples truncated).
+/// Parses a WAV file into 16-bit PCM (24-bit samples dithered).
 pub fn parse(b: bytes) -> Result<Pcm, string> {
     Result.Ok(to_pcm(open(b)?))
 }

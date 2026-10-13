@@ -2,7 +2,7 @@
 // chunks (`FORM` … `AIFF`/`AIFC`, then `COMM` and `SSND`). Samples of 8, 16, 24 or 32 bits,
 // mono or stereo; AIFF-C only uncompressed (`NONE`, `twos`) or little-endian 16-bit (`sowt`).
 // `open` only reads the header and leaves the samples in the file (`wav.Raw`), converted to
-// 16 bits a chunk at a time as they play: deeper samples truncated, 8-bit ones scaled up.
+// 16 bits a chunk at a time as they play: deeper samples dithered, 8-bit ones scaled up.
 
 import wav;
 
