@@ -106,10 +106,7 @@ fn id3v2_tags_are_skipped() {
 }
 
 fn stream(name: string) -> codec.Stream {
-    match (codec.open(fixture(name)).unwrap()) {
-        codec.Source.Stream(s) => s,
-        codec.Source.Pcm(_) => panic("${name} opened as PCM"),
-    }
+    codec.open(fixture(name)).unwrap()
 }
 
 /// The samples of `s` from frame `from` on, as `read` serves them after `codec.decode`'s.
@@ -141,11 +138,8 @@ fn flac_and_mp3_open_as_streams_of_the_right_length() {
     assert_eq(f.rate, 44100);
     let m = stream("tiny.mp3");
     assert_eq(m.total, 13230);
-    // A WAV needs no decoding: it stays PCM.
-    match (codec.open(fixture("tiny.wav")).unwrap()) {
-        codec.Source.Pcm(p) => assert_eq(wav.frames(p), 2),
-        codec.Source.Stream(_) => panic("a WAV opened as a stream"),
-    }
+    assert_eq(stream("tiny.wav").total, 2);
+    assert_eq(stream("tiny.aiff").total, 13230);
 }
 
 @test
@@ -186,11 +180,10 @@ fn aiff_and_aiff_c_read_exactly() {
         max_diff(codec.decode(fixture("tiny32.aiff")).unwrap().data, fixture("tiny32.aiff.raw")),
         0
     );
-    // It needs no decoding while playing: it stays PCM.
-    match (codec.open(fixture("tiny.aiff")).unwrap()) {
-        codec.Source.Pcm(_) => { },
-        codec.Source.Stream(_) => panic("an AIFF opened as a stream"),
-    }
+    // Played from the file as it is: any window read on its own is the same.
+    reads_like_the_whole_decode("tiny.aiff", [9000, 0, 13000]);
+    reads_like_the_whole_decode("tiny24.aiff", [100, 12000]);
+    reads_like_the_whole_decode("tiny8.aiff", [0, 300]);
 }
 
 @test
