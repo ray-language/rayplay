@@ -218,14 +218,50 @@ fn alac_in_m4a_decodes_exactly() {
     reads_like_the_whole_decode("tiny24.m4a", [5000, 10]);
 }
 
+/// True when two s16le buffers have the same length and differ by at most one anywhere.
+fn within_one(a: bytes, b: bytes) -> bool {
+    let d = max_diff(a, b);
+    d >= 0 && d <= 1
+}
+
 @test
-fn aac_and_damaged_m4as_are_refused() {
-    let aac = codec.decode(fixture("tiny-aac.m4a"));
-    match (aac) {
-        Result.Err(e) => assert_eq(e, "AAC in MP4 is not supported yet (only ALAC)"),
-        Result.Ok(_) => panic("AAC decoded"),
-    }
+fn aac_in_m4a_decodes_like_the_reference_decoders() {
+    // afconvert's AAC-LC against Apple's own decoder, gapless (the iTunSMPB tag says how much
+    // priming to drop and how long the song is); ffmpeg's at 40 kb/s, with PNS, intensity and
+    // M/S stereo, TNS and short windows, against ffmpeg's float output (the noise generator is
+    // the same). Both rounded to 16 bits: off by one at most.
+    let p = codec.decode(fixture("tiny-aac.m4a")).unwrap();
+    assert_eq(p.rate, 44100);
+    assert_eq(p.channels, 2);
+    assert(within_one(p.data, fixture("tiny-aac.m4a.raw")));
+    let ff = codec.decode(fixture("tiny-aac-ff.m4a")).unwrap();
+    assert(within_one(ff.data, fixture("tiny-aac-ff.m4a.raw")));
+    // A seek decodes the packet before the one it wants, whose second half that one overlaps.
+    assert_eq(stream("tiny-aac.m4a").total, 13230);
+    reads_like_the_whole_decode("tiny-aac.m4a", [9000, 0, 1023, 1024, 12900]);
+}
+
+@test
+fn he_aac_plays_its_aac_lc_core() {
+    // HE-AAC (SBR) from afconvert: the core is AAC-LC at half the rate.
+    let p = codec.decode(fixture("tiny-he.m4a")).unwrap();
+    assert_eq(p.rate, 22050);
+    assert_eq(p.channels, 2);
+    assert_eq(p.data.len(), 6615 * 4);
+}
+
+@test
+fn damaged_m4as_are_refused() {
     // The ftyp box and nothing else.
     let m4a = fixture("tiny.m4a");
     assert(codec.decode(m4a.sub_bytes(0, 40)).is_err());
+    // An AAC whose configuration says AAC Main (object type 1): the first octet of the
+    // AudioSpecificConfig, 0x12 for LC, turned into 0x0A.
+    let aac = fixture("tiny-aac.m4a");
+    let at = aac.index_of(bytes_of([0x05, 0x80, 0x80, 0x80, 0x02, 0x12])).unwrap() + 5;
+    let main = aac.sub_bytes(0, at) + bytes_of([0x0A]) + aac.sub_bytes(at + 1, aac.len());
+    match (codec.decode(main)) {
+        Result.Err(e) => assert_eq(e, "AAC object type 1 is not supported (only LC)"),
+        Result.Ok(_) => panic("AAC Main decoded"),
+    }
 }

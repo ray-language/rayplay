@@ -10,15 +10,18 @@ con `std/audio`, y la página es solo la interfaz.
 
 - Tres pistas **procedurales** (un estudio pentatónico, un dron, un pulso de bajo), calculadas
   trozo a trozo: la app no lleva archivos de audio y ninguna pista ocupa memoria entera.
-- **Cargar una canción en MP3, FLAC, ALAC (.m4a), WAV o AIFF** y añadirla a la lista (diálogo nativo en el
+- **Cargar una canción en MP3, AAC o ALAC (.m4a), FLAC, WAV o AIFF** y añadirla a la lista (diálogo nativo en el
   escritorio, selector del webview en el móvil). Los decodificadores están escritos en **raylang
-  puro** (`src/mp3.ray`, `src/flac.ray`, `src/alac.ray` con `src/mp4.ray`, `src/wav.ray`, `src/aiff.ray`) y la reproduce a su frecuencia y canales.
+  puro** (`src/mp3.ray`, `src/aac.ray` y `src/alac.ray` con `src/mp4.ray`, `src/flac.ray`, `src/wav.ray`, `src/aiff.ray`) y la reproduce a su frecuencia y canales.
   El formato se reconoce por el contenido, no por el nombre.
-- **MP3, FLAC y ALAC se decodifican mientras suenan** (`codec.Stream`): al cargar solo se leen las
+- **MP3, AAC, FLAC y ALAC se decodifican mientras suenan** (`codec.Stream`): al cargar solo se leen las
   cabeceras, así que la canción empieza al momento y ocupa lo que pesa el archivo. El seek salta
   a cualquier punto: en FLAC, bisecando el archivo por los números de muestra de las cabeceras de
   frame; en MP3, con un índice de frames y decodificando antes los 8 frames previos (reservorio de
-  bits). Tras un salto, las muestras son idénticas a decodificar desde el principio.
+  bits); en AAC y ALAC, por la tabla de paquetes del MP4 (AAC decodifica antes el paquete previo,
+  porque cada uno solapa la mitad del anterior). Tras un salto, las muestras son idénticas a
+  decodificar desde el principio (salvo el ruido de las bandas PNS de AAC, que es otro igual de
+  válido).
 - Play/pausa, stop, anterior/siguiente (con vuelta), **seek** tocando la barra, volumen, y al
   acabar una pista sigue con la siguiente. Un cambio de volumen se aplica como una rampa a lo
   largo del siguiente trozo de 50 ms (`synth.chunk_ramp`), no como un escalón que suena a clic.
@@ -41,13 +44,14 @@ con `std/audio`, y la página es solo la interfaz.
 │               lista; comandos por canal; 50 ms por chunk            │
 │  synth.ray    las pistas: procedurales o archivo cargado → s16le    │
 │  codec.ray    reconoce el formato (salta ID3v2); Stream sirve       │
-│               cualquier ventana (seek): MP3/FLAC/ALAC decodificados │
+│               cualquier ventana (seek): MP3/AAC/FLAC/ALAC decodif.  │
 │               por frames, WAV/AIFF leídos tal cual                  │
 │  mp3.ray      MPEG-1/2/2.5 Layer III (port de minimp3)              │
 │  flac.ray     FLAC nativo, 4–32 bits, cualquier tamaño de bloque    │
 │  wav.ray      PCM de 16 bits (Pcm, Sink) y RIFF/WAVE (16 y 24 bits) │
 │  aiff.ray     AIFF y AIFF-C (8–32 bits, big-endian y `sowt`)        │
-│  mp4.ray      contenedor MP4/M4A: pista de sonido y sus tablas      │
+│  mp4.ray      contenedor MP4/M4A: pista de sonido, tablas, gapless  │
+│  aac.ray      AAC-LC (M/S, intensidad, PNS, TNS; de HE-AAC, el LC)  │
 │  alac.ray     Apple Lossless (16–32 bits, paquetes independientes)  │
 │  bits.ray     lector de bits big-endian sobre bytes                 │
 │  b64.ray      base64 → bytes rápido (std/base64 no aguantaba 56 MB) │
@@ -70,7 +74,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 39 tests: MP3, FLAC, ALAC, WAV, AIFF, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
+make test            # 41 tests: MP3, AAC, FLAC, ALAC, WAV, AIFF, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -105,7 +109,7 @@ el emulador Android.
 | Qué | Verificado |
 |---|---|
 | Backend | `make test`: 39 tests, VM y nativo (`make test-native`) |
-| Decodificadores | ALAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono y estéreo, 44,1/48/96 kHz, ruido blanco con escapes, silencio con rachas de ceros; codificado por `afconvert` de Apple y por ffmpeg); 5 min en 1,5 s en nativo y ~3,7× tiempo real en la VM. AIFF idéntico bit a bit a ffmpeg (8, 16, 24 y 32 bits; mono y estéreo; AIFF-C `NONE` y `sowt`; archivos de `afconvert` de Apple). FLAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono, nivel 12, el codificador de Apple). MP3 idéntico a minimp3 compilado en C salvo ±1 en el 0,1 % de las muestras (floats de 64 frente a 32 bits): CBR, VBR, mono, joint y simple stereo, MPEG-2 22 kHz, MPEG-2.5 8 kHz, con ID3v2/ID3v1 y el recorte gapless de LAME. Una pista de 5 min en nativo (Mac), entera en streaming: FLAC 1,2 s y 68 MB de pico (el archivo pesa 30), MP3 1,2 s y 16 MB (antes, decodificándola entera al cargar: 287 y 256 MB). Abrir y servir el primer trozo, ~1 ms. Tras 40 saltos aleatorios por archivo, las muestras coinciden exactamente con la decodificación completa |
+| Decodificadores | AAC-LC a ±1 de la salida en float de ffmpeg redondeada y del decodificador de Apple (`afconvert`), con la misma longitud gapless (`iTunSMPB` o `elst`): archivos de `afconvert` y del codificador de ffmpeg, mono y estéreo, de 8 a 96 kHz y de 16 a 256 kb/s, ventanas cortas, M/S, intensidad, TNS y PNS (el mismo generador de ruido que ffmpeg, así que también coincide). De un HE-AAC suena el núcleo AAC-LC, a media frecuencia y alineado con el original. 5 min en 3,3 s y 27 MB de pico en nativo (el archivo pesa 9,5), ~3,7× tiempo real en la VM. ALAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono y estéreo, 44,1/48/96 kHz, ruido blanco con escapes, silencio con rachas de ceros; codificado por `afconvert` de Apple y por ffmpeg); 5 min en 1,5 s en nativo y ~3,7× tiempo real en la VM. AIFF idéntico bit a bit a ffmpeg (8, 16, 24 y 32 bits; mono y estéreo; AIFF-C `NONE` y `sowt`; archivos de `afconvert` de Apple). FLAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono, nivel 12, el codificador de Apple). MP3 idéntico a minimp3 compilado en C salvo ±1 en el 0,1 % de las muestras (floats de 64 frente a 32 bits): CBR, VBR, mono, joint y simple stereo, MPEG-2 22 kHz, MPEG-2.5 8 kHz, con ID3v2/ID3v1 y el recorte gapless de LAME. Una pista de 5 min en nativo (Mac), entera en streaming: FLAC 1,2 s y 68 MB de pico (el archivo pesa 30), MP3 1,2 s y 16 MB (antes, decodificándola entera al cargar: 287 y 256 MB). Abrir y servir el primer trozo, ~1 ms. Tras 40 saltos aleatorios por archivo, las muestras coinciden exactamente con la decodificación completa |
 | Programa completo | `ray run` headless: monta `www/` y abre `ray://app/index.html` |
 | iOS | simulador iPhone 16 Pro (`ray bundle --ios --ios-target sim`, shell 1.27.19 con sesión `playback` y `UIBackgroundModes = audio`): arranca, la página llega por `ray://app`, el puente responde y el display muestra el `lifecycle` del shell; `audio.open` abre el dispositivo dentro del shell (comprobado con una mini app) |
 | Android | emulador arm64 (`ray bundle --android`, shell 1.27.19 con *foreground service* `mediaPlayback`): Play por `adb`, Home durante 10 s, vuelta: la posición pasó de 0:05 a 0:17 y el display dice «played in the background: 0:09». **El audio sigue en segundo plano** |
@@ -117,8 +121,10 @@ el emulador Android.
 
 - MP3 (Layer III; ni Layer I/II ni *free format*), FLAC nativo (no Ogg FLAC), WAV PCM de 16 o 24
   bits y AIFF/AIFF-C PCM de 8 a 32 bits (no comprimido: ni µ-law, ni A-law, ni float). ALAC mono o
-  estéreo de 16 a 32 bits. Ni OGG/Vorbis ni AAC (un .m4a con AAC se rechaza con «AAC in MP4 is not
-  supported yet»): la stdlib no trae decodificadores y estos no están escritos. Lo que pase de 16
+  estéreo de 16 a 32 bits. AAC-LC mono o estéreo en MP4/M4A (no ADTS suelto, ni Main, SSR o LTP,
+  ni frames de 960); de HE-AAC v1/v2 solo el núcleo LC, sin la banda alta de SBR (suena apagado,
+  a media frecuencia). Ni Ogg Vorbis ni Opus: la stdlib no trae decodificadores y estos no están
+  escritos. Lo que pase de 16
   bits se trunca (sin dither); de un FLAC de más de dos canales se quedan los dos primeros. El
   reproductor no remuestrea: abre el dispositivo a la frecuencia de la pista.
 - En la shell de desarrollo (VM), decodificar va justo: en el Mac, 5 s de audio en 1,4–1,6 s

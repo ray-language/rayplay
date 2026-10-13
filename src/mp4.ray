@@ -17,6 +17,12 @@ pub struct Track {
     starts: [int],
     /// Frames in the track.
     total: int,
+    /// The media's time scale (units per second of `skip` and `length`).
+    timescale: int,
+    /// From the edit list: how much of the decoded media to drop at the start (an encoder's
+    /// priming) and how much to play after that (0 when the file does not say).
+    skip: int,
+    length: int,
 }
 
 fn be16(b: bytes, at: int) -> int {
@@ -103,14 +109,138 @@ pub fn open(b: bytes) -> Result<Track, string> {
     for trak in tracks(b, moov) {
         if let Option.Some(hdlr) = path(b, trak.0, trak.1, ["mdia", "hdlr"]) {
             if (hdlr.0 + 12 <= hdlr.1 && tag(b, hdlr.0 + 8) == "soun") {
-                return sound_track(b, trak);
+                return sound_track(b, moov, trak);
             }
         }
     }
     Result.Err("MP4 without a sound track")
 }
 
-fn sound_track(b: bytes, trak: (int, int)) -> Result<Track, string> {
+/// The time scale of a `mvhd` or `mdhd` box (version 0 or 1).
+fn timescale_of(b: bytes, box: (int, int)) -> int {
+    let at = box.0 + if (b[box.0] == 1) { 20 } else { 12 };
+    if (at + 4 <= box.1) { be32(b, at) } else { 0 }
+}
+
+/// The first edit that plays media: (media time, duration in the movie's time scale).
+fn first_edit(b: bytes, trak: (int, int)) -> (int, int) {
+    let elst = match (path(b, trak.0, trak.1, ["edts", "elst"])) {
+        Option.Some(e) => e,
+        Option.None => return (0, 0),
+    };
+    let wide = b[elst.0] == 1;
+    let n = be32(b, elst.0 + 4);
+    let size = if (wide) { 20 } else { 12 };
+    for i in 0..n {
+        let at = elst.0 + 8 + size * i;
+        if (at + size > elst.1) {
+            break;
+        }
+        let duration = if (wide) { (be32(b, at) << 32) | be32(b, at + 4) } else { be32(b, at) };
+        let media = if (wide) {
+            (be32(b, at + 8) << 32) | be32(b, at + 12)
+        } else {
+            be32(b, at + 4)
+        };
+        // An empty edit (media time -1) only delays the start.
+        let empty = if (wide) { media == -1 } else { media == 0xFFFFFFFF };
+        if (!empty) {
+            return (media, duration);
+        }
+    }
+    (0, 0)
+}
+
+/// iTunes' gapless information, when there is no edit list: the `iTunSMPB` tag in the movie's
+/// metadata, a text of hexadecimal fields (0, the encoder delay, the padding, the length).
+fn itunes_gapless(b: bytes, moov: (int, int)) -> (int, int) {
+    let name = "iTunSMPB".to_bytes();
+    let at = match (b.index_of_from(name, moov.0)) {
+        Option.Some(i) if i < moov.1 => i,
+        _ => return (0, 0),
+    };
+    // The `data` box that follows: size, "data", type, locale, then the text.
+    let data = at + 8;
+    if (data + 16 > moov.1 || tag(b, data + 4) != "data") {
+        return (0, 0);
+    }
+    let end = data + be32(b, data);
+    if (end > moov.1) {
+        return (0, 0);
+    }
+    let text = from_utf8(b.sub_bytes(data + 16, end)).unwrap_or("");
+    var fields: [int] = [];
+    for f in text.split(" ") {
+        if (f.len() > 0) {
+            fields.push(hex(f));
+        }
+    }
+    if (fields.len() < 4 || fields[1] < 0 || fields[3] < 0) {
+        (0, 0)
+    } else {
+        (fields[1], fields[3])
+    }
+}
+
+/// A hexadecimal number, or -1.
+fn hex(s: string) -> int {
+    var v = 0;
+    for c in s.chars() {
+        let d = "0123456789ABCDEF".index_of(to_string(c).to_upper());
+        match (d) {
+            Option.Some(x) => v = v * 16 + x,
+            Option.None => return -1,
+        }
+    }
+    v
+}
+
+/// The decoder configuration in an `esds` box: the DecoderSpecificInfo inside the
+/// DecoderConfigDescriptor inside the ES_Descriptor (for AAC, the AudioSpecificConfig).
+fn esds_config(b: bytes, esds: (int, int)) -> Option<bytes> {
+    // Version and flags, then descriptors: a tag octet and a size of 7 bits per octet.
+    var at = esds.0 + 4;
+    var end = esds.1;
+    while (at + 2 <= end) {
+        let tag = b[at];
+        var size = 0;
+        var i = at + 1;
+        var more = true;
+        while (more && i < end && i < at + 5) {
+            size = (size << 7) | (b[i] & 0x7F);
+            more = (b[i] & 0x80) != 0;
+            i = i + 1;
+        }
+        let body_end = if (i + size < end) { i + size } else { end };
+        if (tag == 3) {
+            // ES_Descriptor: ES_ID, flags, and what the flags add.
+            let flags = b[i + 2];
+            var inner = i + 3;
+            if ((flags & 0x80) != 0) {
+                inner = inner + 2;
+            }
+            if ((flags & 0x40) != 0) {
+                inner = inner + 1 + b[inner];
+            }
+            if ((flags & 0x20) != 0) {
+                inner = inner + 2;
+            }
+            at = inner;
+            end = body_end;
+        } else if (tag == 4) {
+            // DecoderConfigDescriptor: object type, stream type, buffer size and bitrates.
+            at = i + 13;
+            end = body_end;
+        } else if (tag == 5) {
+            return Option.Some(b.sub_bytes(i, body_end));
+        } else {
+            at = body_end;
+        }
+    }
+    Option.None
+}
+
+fn sound_track(b: bytes, moov: (int, int), trak: (int, int)) -> Result<Track, string> {
     let stbl = match (path(b, trak.0, trak.1, ["mdia", "minf", "stbl"])) {
         Option.Some(s) => s,
         Option.None => return Result.Err("MP4: sound track without a sample table"),
@@ -145,6 +275,12 @@ fn sound_track(b: bytes, trak: (int, int)) -> Result<Track, string> {
             },
             Option.None => return Result.Err("ALAC without its configuration box"),
         }
+    } else if (format == "mp4a") {
+        if let Option.Some(e) = child(b, boxes, entry_end, "esds") {
+            if let Option.Some(c) = esds_config(b, e) {
+                config = c;
+            }
+        }
     }
     let starts = time_to_sample(b, stbl)?;
     let (offsets, sizes) = sample_offsets(b, stbl)?;
@@ -153,6 +289,22 @@ fn sound_track(b: bytes, trak: (int, int)) -> Result<Track, string> {
     }
     let total = starts[starts.len() - 1];
     let _end = starts.pop();
+    let movie_scale = match (child(b, moov.0, moov.1, "mvhd")) {
+        Option.Some(m) => timescale_of(b, m),
+        Option.None => 0,
+    };
+    let media_scale = match (path(b, trak.0, trak.1, ["mdia", "mdhd"])) {
+        Option.Some(m) => timescale_of(b, m),
+        Option.None => 0,
+    };
+    let edit = first_edit(b, trak);
+    var skip = edit.0;
+    var length = if (movie_scale > 0) { edit.1 * media_scale / movie_scale } else { 0 };
+    if (skip == 0 && length == 0) {
+        let gapless = itunes_gapless(b, moov);
+        skip = gapless.0;
+        length = gapless.1;
+    }
     Result.Ok(
         Track {
             format: format,
@@ -162,7 +314,10 @@ fn sound_track(b: bytes, trak: (int, int)) -> Result<Track, string> {
             offsets: offsets,
             sizes: sizes,
             starts: starts,
-            total: total
+            total: total,
+            timescale: media_scale,
+            skip: skip,
+            length: length
         }
     )
 }
