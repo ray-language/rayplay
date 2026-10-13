@@ -102,6 +102,17 @@ struct Fft {
     pre_sin: [float],
     post_cos: [float],
     post_sin: [float],
+    /// Work buffers of m/2 values.
+    re: [float],
+    im: [float],
+}
+
+fn zeros(n: int) -> [float] {
+    var v: [float] = [];
+    for _ in 0..n {
+        v.push(0.0);
+    }
+    v
 }
 
 fn fft_of(m: int) -> Fft {
@@ -147,7 +158,9 @@ fn fft_of(m: int) -> Fft {
         pre_cos: pre_cos,
         pre_sin: pre_sin,
         post_cos: post_cos,
-        post_sin: post_sin
+        post_sin: post_sin,
+        re: zeros(n),
+        im: zeros(n)
     }
 }
 
@@ -155,70 +168,96 @@ fn fft_of(m: int) -> Fft {
 fn imdct(f: Fft, x: [float], xo: int, y: [float]) -> unit {
     let m = f.m;
     let n = m / 2;
-    var re: [float] = [];
-    var im: [float] = [];
-    for _ in 0..n {
-        re.push(0.0);
-        im.push(0.0);
-    }
+    let re = f.re;
+    let im = f.im;
+    let rev = f.rev;
+    let pre_cos = f.pre_cos;
+    let pre_sin = f.pre_sin;
     for k in 0..n {
         let a = x[xo + 2 * k];
         let b = x[xo + m - 1 - 2 * k];
-        let c = f.pre_cos[k];
-        let s = f.pre_sin[k];
-        let j = f.rev[k];
+        let c = pre_cos[k];
+        let s = pre_sin[k];
+        let j = rev[k];
         re[j] = a * c + b * s;
         im[j] = b * c - a * s;
     }
-    var len = 2;
+    // The first two stages at once: their twiddles are 1 and -i, so no multiplications.
+    var p = 0;
+    while (p < n) {
+        let a0r = re[p] + re[p + 1];
+        let a0i = im[p] + im[p + 1];
+        let a1r = re[p] - re[p + 1];
+        let a1i = im[p] - im[p + 1];
+        let a2r = re[p + 2] + re[p + 3];
+        let a2i = im[p + 2] + im[p + 3];
+        let a3r = re[p + 2] - re[p + 3];
+        let a3i = im[p + 2] - im[p + 3];
+        re[p] = a0r + a2r;
+        im[p] = a0i + a2i;
+        re[p + 2] = a0r - a2r;
+        im[p + 2] = a0i - a2i;
+        re[p + 1] = a1r + a3i;
+        im[p + 1] = a1i - a3r;
+        re[p + 3] = a1r - a3i;
+        im[p + 3] = a1i + a3r;
+        p = p + 4;
+    }
+    let tw_cos = f.tw_cos;
+    let tw_sin = f.tw_sin;
+    var len = 8;
     while (len <= n) {
         let half = len / 2;
         let step = n / len;
-        var start = 0;
-        while (start < n) {
-            for t in 0..half {
-                let wc = f.tw_cos[t * step];
-                let ws = f.tw_sin[t * step];
-                let p = start + t;
+        for t in 0..half {
+            let wc = tw_cos[t * step];
+            let ws = tw_sin[t * step];
+            var p = t;
+            while (p < n) {
                 let q = p + half;
                 // b · e^(-iθ)
-                let br = re[q] * wc + im[q] * ws;
-                let bi = im[q] * wc - re[q] * ws;
-                re[q] = re[p] - br;
-                im[q] = im[p] - bi;
-                re[p] = re[p] + br;
-                im[p] = im[p] + bi;
+                let rq = re[q];
+                let iq = im[q];
+                let br = rq * wc + iq * ws;
+                let bi = iq * wc - rq * ws;
+                let rp = re[p];
+                let ip = im[p];
+                re[q] = rp - br;
+                im[q] = ip - bi;
+                re[p] = rp + br;
+                im[p] = ip + bi;
+                p = p + len;
             }
-            start = start + len;
         }
         len = len * 2;
     }
-    // u[2k] = Re(W), u[m-1-2k] = -Im(W); y is u folded around the window's halves.
+    // u[2k] = Re(W) and u[m-1-2k] = -Im(W), folded around the window's halves: y[i] = u[i + n]
+    // for i < n, -u[3n - 1 - i] for i < 3n and -u[i - 3n] after that.
     let scale = 1.0 / (m as float);
-    let h = m / 2;
-    for k in 0..n {
-        let c = f.post_cos[k];
-        let s = f.post_sin[k];
+    let post_cos = f.post_cos;
+    let post_sin = f.post_sin;
+    for k in 0..n / 2 {
+        let c = post_cos[k];
+        let s = post_sin[k];
         let wr = (re[k] * c + im[k] * s) * scale;
         let wi = (im[k] * c - re[k] * s) * scale;
-        put_u(y, m, h, 2 * k, wr);
-        put_u(y, m, h, m - 1 - 2 * k, 0.0 - wi);
+        y[3 * n - 1 - 2 * k] = 0.0 - wr;
+        y[3 * n + 2 * k] = 0.0 - wr;
+        y[n - 1 - 2 * k] = 0.0 - wi;
+        y[n + 2 * k] = wi;
+    }
+    for k in n / 2..n {
+        let c = post_cos[k];
+        let s = post_sin[k];
+        let wr = (re[k] * c + im[k] * s) * scale;
+        let wi = (im[k] * c - re[k] * s) * scale;
+        y[2 * k - n] = wr;
+        y[3 * n - 1 - 2 * k] = 0.0 - wr;
+        y[n + 2 * k] = wi;
+        y[5 * n - 1 - 2 * k] = wi;
     }
 }
 
-/// Places DCT-IV output u[i] in the IMDCT output: y[n] = u[n + m/2] for n < m/2,
-/// -u[3m/2 - 1 - n] for n < 3m/2 and -u[n - 3m/2] after that.
-fn put_u(y: [float], m: int, h: int, i: int, v: float) -> unit {
-    if (i >= h) {
-        y[i - h] = v;
-        y[m + h - 1 - i] = 0.0 - v;
-    } else {
-        y[m + h - 1 - i] = 0.0 - v;
-        y[i + 3 * h] = 0.0 - v;
-    }
-}
-
-/// The modified Bessel function I0, by its series.
 fn bessel_i0(x: float) -> float {
     var sum = 1.0;
     var term = 1.0;
@@ -523,9 +562,10 @@ fn read_spectrum(r: bits.Bits, ics: Ics, t: Tables, q: [int]) -> Result<unit, st
                 while (k < hi) {
                     let v = huff(r, t.spectral, base);
                     if (cb <= 4) {
-                        var vals = [v / 27, (v / 9) % 3, (v / 3) % 3, v % 3];
+                        var d = 27;
                         for i in 0..4 {
-                            var x = vals[i];
+                            var x = (v / d) % 3;
+                            d = d / 3;
                             if (cb <= 2) {
                                 x = x - 1;
                             } else if (x != 0 && bits.get(r, 1) == 1) {
@@ -595,7 +635,14 @@ fn escape(r: bits.Bits) -> Result<int, string> {
 }
 
 /// Reads one individual channel stream; `common` is the shared ics_info of a pair, if any.
-fn read_ics(r: bits.Bits, t: Tables, common: Option<Ics>) -> Result<Ics, string> {
+/// `q` and `spec` are work buffers of 1024 values; `spec` becomes the stream's spectrum.
+fn read_ics(
+    r: bits.Bits,
+    t: Tables,
+    common: Option<Ics>,
+    q: [int],
+    spec: [float]
+) -> Result<Ics, string> {
     let global_gain = bits.get(r, 8);
     let ics = match (common) {
         Option.Some(info) => ics_of(info),
@@ -625,10 +672,6 @@ fn read_ics(r: bits.Bits, t: Tables, common: Option<Ics>) -> Result<Ics, string>
     if (bits.get(r, 1) == 1) {
         return Result.Err("AAC: gain control (SSR profile) is not supported");
     }
-    var q: [int] = [];
-    for _ in 0..1024 {
-        q.push(0);
-    }
     read_spectrum(r, ics, t, q)?;
     for p in pulses {
         if (p.0 >= 1024) {
@@ -636,35 +679,45 @@ fn read_ics(r: bits.Bits, t: Tables, common: Option<Ics>) -> Result<Ics, string>
         }
         q[p.0] = if (q[p.0] > 0) { q[p.0] + p.1 } else { q[p.0] - p.1 };
     }
-    dequantize(ics, t, q);
+    dequantize(ics, t, q, spec);
     Result.Ok(ics)
 }
 
-fn dequantize(ics: Ics, t: Tables, q: [int]) -> unit {
-    var spec: [float] = [];
-    for _ in 0..1024 {
-        spec.push(0.0);
-    }
+/// The spectrum of the quantized values `q` into `spec`, whole: bands without values (zero,
+/// noise and intensity ones, and those past max_sfb) become 0.
+fn dequantize(ics: Ics, t: Tables, q: [int], spec: [float]) -> unit {
     let swb = ics.swb;
     let max = ics.max_sfb;
+    let pow43 = t.pow43;
+    let width = 1024 / ics.windows;
     var win = 0;
     for g in 0..ics.groups.len() {
-        for sfb in 0..max {
-            let cb = ics.band[g * max + sfb];
-            if (cb == ZERO_HCB || cb >= NOISE_HCB) {
-                continue;
-            }
-            let gain = t.gain[ics.sf[g * max + sfb]];
-            for w in 0..ics.groups[g] {
-                let off = (win + w) * 128;
-                for k in off + swb[sfb]..off + swb[sfb + 1] {
-                    let v = q[k];
-                    if (v > 0) {
-                        spec[k] = t.pow43[v] * gain;
-                    } else if (v < 0) {
-                        spec[k] = 0.0 - t.pow43[0 - v] * gain;
+        for w in 0..ics.groups[g] {
+            let off = (win + w) * 128;
+            for sfb in 0..max {
+                let lo = off + swb[sfb];
+                let hi = off + swb[sfb + 1];
+                let cb = ics.band[g * max + sfb];
+                if (cb == ZERO_HCB || cb >= NOISE_HCB) {
+                    for k in lo..hi {
+                        spec[k] = 0.0;
                     }
+                    continue;
                 }
+                let gain = t.gain[ics.sf[g * max + sfb]];
+                for k in lo..hi {
+                    let v = q[k];
+                    spec[k] = if (v > 0) {
+                        pow43[v] * gain
+                    } else if (v < 0) {
+                        0.0 - pow43[0 - v] * gain
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            for k in off + swb[max]..off + width {
+                spec[k] = 0.0;
             }
         }
         win = win + ics.groups[g];
@@ -794,42 +847,35 @@ fn tns(ics: Ics, t: Tables) -> unit {
             let base = w * 128;
             let inc = if (f.down) { -1 } else { 1 };
             var at = base + if (f.down) { end - 1 } else { start };
-            var state: [float] = [];
-            for _ in 0..f.order {
-                state.push(0.0);
-            }
-            for _ in 0..size {
-                var y = ics.spec[at];
-                for j in 0..f.order {
-                    y = y - lpc[j + 1] * state[j];
+            // The filter's past outputs are the values already written behind `at`.
+            let spec = ics.spec;
+            for i in 0..size {
+                var y = spec[at];
+                var back = at;
+                let past = if (i < f.order) { i } else { f.order };
+                for j in 1..past + 1 {
+                    back = back - inc;
+                    y = y - lpc[j] * spec[back];
                 }
-                var j = f.order - 1;
-                while (j > 0) {
-                    state[j] = state[j - 1];
-                    j = j - 1;
-                }
-                if (f.order > 0) {
-                    state[0] = y;
-                }
-                ics.spec[at] = y;
+                spec[at] = y;
                 at = at + inc;
             }
         }
     }
 }
 
-/// One channel's overlap state across frames.
+/// One channel's overlap state across frames, and its work buffers.
 struct Overlap {
     overlap: [float],
     shape: int,
+    /// The dequantized spectrum, the IMDCT output (2048) and a short window's (256).
+    spec: [float],
+    y: [float],
+    z: [float],
 }
 
 fn channel() -> Overlap {
-    var o: [float] = [];
-    for _ in 0..1024 {
-        o.push(0.0);
-    }
-    Overlap { overlap: o, shape: 0 }
+    Overlap { overlap: zeros(1024), shape: 0, spec: zeros(1024), y: zeros(2048), z: zeros(256) }
 }
 
 /// The filter bank: the IMDCT of the frame, windowed and overlapped with the last one's
@@ -840,15 +886,12 @@ fn synthesize(ch: Overlap, ics: Ics, t: Tables, pcm: [float]) -> unit {
     let prev_short = t.short_win[ch.shape];
     let cur_short = t.short_win[ics.shape];
     let ov = ch.overlap;
-    var y: [float] = [];
-    for _ in 0..2048 {
-        y.push(0.0);
-    }
+    let y = ch.y;
     let seq = ics.sequence;
     if (seq == EIGHT_SHORT) {
-        var z: [float] = [];
-        for _ in 0..256 {
-            z.push(0.0);
+        let z = ch.z;
+        for n in 0..2048 {
+            y[n] = 0.0;
         }
         for w in 0..8 {
             imdct(t.fft_short, ics.spec, w * 128, z);
@@ -865,21 +908,35 @@ fn synthesize(ch: Overlap, ics: Ics, t: Tables, pcm: [float]) -> unit {
         }
     } else {
         imdct(t.fft_long, ics.spec, 0, y);
-        for n in 0..1024 {
-            let w = if (seq == LONG_STOP) {
-                if (n < 448) { 0.0 } else if (n < 576) { prev_short[n - 448] } else { 1.0 }
-            } else {
-                prev_long[n]
-            };
-            pcm[n] = ov[n] + y[n] * w;
+        if (seq == LONG_STOP) {
+            for n in 0..448 {
+                pcm[n] = ov[n];
+            }
+            for n in 448..576 {
+                pcm[n] = ov[n] + y[n] * prev_short[n - 448];
+            }
+            for n in 576..1024 {
+                pcm[n] = ov[n] + y[n];
+            }
+        } else {
+            for n in 0..1024 {
+                pcm[n] = ov[n] + y[n] * prev_long[n];
+            }
         }
-        for n in 0..1024 {
-            let w = if (seq == LONG_START) {
-                if (n < 448) { 1.0 } else if (n < 576) { cur_short[127 - (n - 448)] } else { 0.0 }
-            } else {
-                cur_long[1023 - n]
-            };
-            ov[n] = y[1024 + n] * w;
+        if (seq == LONG_START) {
+            for n in 0..448 {
+                ov[n] = y[1024 + n];
+            }
+            for n in 448..576 {
+                ov[n] = y[1024 + n] * cur_short[575 - n];
+            }
+            for n in 576..1024 {
+                ov[n] = 0.0;
+            }
+        } else {
+            for n in 0..1024 {
+                ov[n] = y[1024 + n] * cur_long[1023 - n];
+            }
         }
     }
     ch.shape = ics.shape;
@@ -909,7 +966,7 @@ fn frame(s: Stream, at: int, size: int, out: [int]) -> Result<unit, string> {
         if (id == 0 || id == 3) {
             // A single channel (or LFE).
             bits.skip(r, 4);
-            let ics = read_ics(r, t, Option.None)?;
+            let ics = read_ics(r, t, Option.None, s.q, s.state[streams.len()].spec)?;
             noise(ics, s.seed, Option.None, []);
             streams.push(ics);
         } else if (id == 1) {
@@ -925,8 +982,12 @@ fn frame(s: Stream, at: int, size: int, out: [int]) -> Result<unit, string> {
                 }
                 info = Option.Some(i);
             }
-            let a = read_ics(r, t, info)?;
-            let b = read_ics(r, t, info)?;
+            let c = streams.len();
+            if (c + 2 > s.channels) {
+                return Result.Err("AAC: more channels than configured");
+            }
+            let a = read_ics(r, t, info, s.q, s.state[c].spec)?;
+            let b = read_ics(r, t, info, s.q, s.state[c + 1].spec)?;
             noise(a, s.seed, Option.None, []);
             noise(b, s.seed, Option.Some(a), ms);
             if (common) {
@@ -960,20 +1021,23 @@ fn frame(s: Stream, at: int, size: int, out: [int]) -> Result<unit, string> {
         }
     }
     let n = s.channels;
-    var pcm: [[float]] = [];
+    let pcm = s.pcm;
     for c in 0..n {
         let ics = streams[c];
         tns(ics, t);
-        var p: [float] = [];
-        for _ in 0..1024 {
-            p.push(0.0);
-        }
-        synthesize(s.state[c], ics, t, p);
-        pcm.push(p);
+        synthesize(s.state[c], ics, t, pcm[c]);
     }
-    for i in 0..1024 {
-        for c in 0..n {
-            out.push(to_16(pcm[c][i]));
+    if (n == 1) {
+        let p = pcm[0];
+        for i in 0..1024 {
+            out.push(to_16(p[i]));
+        }
+    } else {
+        let left = pcm[0];
+        let right = pcm[1];
+        for i in 0..1024 {
+            out.push(to_16(left[i]));
+            out.push(to_16(right[i]));
         }
     }
     Result.Ok({ })
@@ -985,6 +1049,9 @@ pub struct Stream {
     t: Tables,
     track: mp4.Track,
     state: [Overlap],
+    /// Work buffers: quantized values, and each channel's output.
+    q: [int],
+    pcm: [[float]],
     /// The noise generator's state (one element, to share it): it runs on across the song, as
     /// ffmpeg's does from the same seed, so PNS bands match its output. After a seek they get
     /// other noise, as good.
@@ -1007,8 +1074,14 @@ pub fn open(b: bytes, t: mp4.Track) -> Result<Stream, string> {
     let decoded = t.offsets.len() * 1024 - skip;
     let length = t.length * cfg.rate / scale;
     var state: [Overlap] = [];
+    var pcm: [[float]] = [];
     for _ in 0..cfg.channels {
         state.push(channel());
+        pcm.push(zeros(1024));
+    }
+    var q: [int] = [];
+    for _ in 0..1024 {
+        q.push(0);
     }
     Result.Ok(
         Stream {
@@ -1016,6 +1089,8 @@ pub fn open(b: bytes, t: mp4.Track) -> Result<Stream, string> {
             t: tables(cfg.rate_index),
             track: t,
             state: state,
+            q: q,
+            pcm: pcm,
             seed: [0x1F2E3D4C],
             next: 0,
             rate: cfg.rate,

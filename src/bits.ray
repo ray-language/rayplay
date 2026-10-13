@@ -26,6 +26,11 @@ pub fn peek(r: Bits, n: int) -> int {
         return 0;
     }
     let i = r.pos >> 3;
+    if ((i + 4) * 8 <= r.end) {
+        let b = r.b;
+        let w = (b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3];
+        return ((w << (r.pos & 7)) & 0xFFFFFFFF) >> (32 - n);
+    }
     let hi = (octet(r, i) << 8) | octet(r, i + 1);
     let lo = (octet(r, i + 2) << 8) | octet(r, i + 3);
     let w = (hi << 16) | lo;
