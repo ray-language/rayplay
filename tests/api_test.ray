@@ -40,7 +40,7 @@ fn bad_requests_fail_cleanly() {
     let r4 = json.parse(api.handle(cmds, "add:x\nAQID")).unwrap();
     assert_eq(
         json.get_string(r4, "error"),
-        Option.Some("not a WAV, AIFF, FLAC, MP3, Ogg Vorbis, AAC or ALAC file")
+        Option.Some("not a WAV, AIFF, FLAC, MP3, Ogg Vorbis, Opus, AAC or ALAC file")
     );
     let r5 = json.parse(api.handle(cmds, "add:x")).unwrap();
     assert_eq(json.get_string(r5, "error"), Option.Some("add: missing the file after the name"));
@@ -75,6 +75,7 @@ fn track_names_drop_the_folder_and_the_extension() {
     assert_eq(api.track_name("Loop.AIFF"), "Loop");
     assert_eq(api.track_name("Lossless.m4a"), "Lossless");
     assert_eq(api.track_name("Free.ogg"), "Free");
+    assert_eq(api.track_name("Talk.OPUS"), "Talk");
     assert_eq(api.track_name("notes.txt"), "notes.txt");
     assert_eq(api.track_name("take"), "take");
 }

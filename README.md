@@ -10,19 +10,23 @@ con `std/audio`, y la página es solo la interfaz.
 
 - Tres pistas **procedurales** (un estudio pentatónico, un dron, un pulso de bajo), calculadas
   trozo a trozo: la app no lleva archivos de audio y ninguna pista ocupa memoria entera.
-- **Cargar una canción en MP3, AAC o ALAC (.m4a), Ogg Vorbis, FLAC, WAV o AIFF** y añadirla a la lista (diálogo nativo en el
+- **Cargar una canción en MP3, AAC o ALAC (.m4a), Ogg Vorbis, Opus, FLAC, WAV o AIFF** y añadirla a la lista (diálogo nativo en el
   escritorio, selector del webview en el móvil). Los decodificadores están escritos en **raylang
-  puro** (`src/mp3.ray`, `src/aac.ray` y `src/alac.ray` con `src/mp4.ray`, `src/vorbis.ray` con `src/ogg.ray`, `src/flac.ray`, `src/wav.ray`, `src/aiff.ray`) y la reproduce a su frecuencia y canales.
+  puro** (`src/mp3.ray`, `src/aac.ray` y `src/alac.ray` con `src/mp4.ray`, `src/vorbis.ray` y `src/opus.ray` (con `src/celt.ray` y `src/silk.ray`) sobre `src/ogg.ray`, `src/flac.ray`, `src/wav.ray`, `src/aiff.ray`) y la reproduce a su frecuencia y canales.
   El formato se reconoce por el contenido, no por el nombre.
-- **MP3, AAC, Vorbis, FLAC y ALAC se decodifican mientras suenan** (`codec.Stream`): al cargar solo se leen las
+- **MP3, AAC, Vorbis, Opus, FLAC y ALAC se decodifican mientras suenan** (`codec.Stream`): al cargar solo se leen las
   cabeceras, así que la canción empieza al momento y ocupa lo que pesa el archivo. El seek salta
   a cualquier punto: en FLAC, bisecando el archivo por los números de muestra de las cabeceras de
   frame; en MP3, con un índice de frames y decodificando antes los 8 frames previos (reservorio de
   bits); en AAC y ALAC, por la tabla de paquetes del MP4, y en Vorbis, por la lista de paquetes
   del Ogg con la posición de cada uno sacada de su tamaño de bloque (AAC y Vorbis decodifican antes
-  el paquete previo, porque cada uno solapa la mitad del anterior). Tras un salto, las muestras son idénticas a
+  el paquete previo, porque cada uno solapa la mitad del anterior); en Opus, por la misma lista con
+  la duración de cada paquete sacada de su TOC, y como cada trama depende de las anteriores
+  (predicción de energías, filtros, solapes), reiniciando el decodificador y decodificando antes
+  medio segundo si todo es CELT o dos si hay SILK. Tras un salto, las muestras son idénticas a
   decodificar desde el principio (salvo el ruido de las bandas PNS de AAC, que es otro igual de
-  válido).
+  válido; en Opus, a ±1 en CELT, y en un archivo estéreo con FEC y largos tramos solo de canal
+  medio el SILK todavía no ha convergido a los dos segundos).
 - Play/pausa, stop, anterior/siguiente (con vuelta), **seek** tocando la barra, volumen, y al
   acabar una pista sigue con la siguiente. Un cambio de volumen se aplica como una rampa a lo
   largo del siguiente trozo de 50 ms (`synth.chunk_ramp`), no como un escalón que suena a clic.
@@ -45,7 +49,8 @@ con `std/audio`, y la página es solo la interfaz.
 │               lista; comandos por canal; 50 ms por chunk            │
 │  synth.ray    las pistas: procedurales o archivo cargado → s16le    │
 │  codec.ray    reconoce el formato (salta ID3v2); Stream sirve       │
-│               cualquier ventana (seek): MP3/AAC/Vorbis/FLAC/ALAC    │
+│               cualquier ventana (seek): MP3/AAC/Vorbis/Opus/FLAC/   │
+│               ALAC                                                  │
 │               decodif. por frames, WAV/AIFF leídos tal cual         │
 │  mp3.ray      MPEG-1/2/2.5 Layer III (port de minimp3)              │
 │  flac.ray     FLAC nativo, 4–32 bits, cualquier tamaño de bloque    │
@@ -56,6 +61,11 @@ con `std/audio`, y la página es solo la interfaz.
 │  alac.ray     Apple Lossless (16–32 bits, paquetes independientes)  │
 │  ogg.ray      contenedor Ogg: paquetes de la primera pista, granule │
 │  vorbis.ray   Vorbis I (floor 1, residuos 0–2, acoplamiento)        │
+│  opus.ray     Ogg Opus: paquetes, modos, tramas redundantes         │
+│  celt.ray     CELT (port del decodificador float de libopus)        │
+│  silk.ray     SILK (port del de punto fijo: bit a bit) y remuestreo │
+│  rangedec.ray decodificador de rango de Opus                        │
+│  *_tables.ray tablas de CELT y SILK sacadas de libopus              │
 │  mdct.ray     la IMDCT de AAC y Vorbis (DCT-IV por una FFT)         │
 │  bits.ray     lector de bits big-endian sobre bytes                 │
 │  dither.ray   de 24/32 bits a 16: dither TPDF según la posición     │
@@ -79,7 +89,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 48 tests: MP3, AAC, Vorbis, FLAC, ALAC, WAV, AIFF, dither, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
+make test            # 50 tests: MP3, AAC, Vorbis, Opus, FLAC, ALAC, WAV, AIFF, dither, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -113,14 +123,14 @@ el emulador Android.
 
 | Qué | Verificado |
 |---|---|
-| Backend | `make test`: 39 tests, VM y nativo (`make test-native`) |
-| Decodificadores | Vorbis a ±1 del decodificador de libvorbis y de la salida en float de ffmpeg redondeada, con la misma longitud (el granule de la última página recorta el final): archivos del codificador de libvorbis de calidad −0,1 a 1, mono y estéreo, de 8 a 96 kHz, con transitorios (bloques cortos) y ruido blanco; los del codificador experimental de ffmpeg coinciden con libvorbis (el decodificador de ffmpeg da otro canal derecho en ellos). 5 min en 1,2 s y 17 MB de pico en nativo (el archivo pesa 3,7), ~4,6× tiempo real en la VM; 900 archivos con bytes corrompidos al azar se rechazan o suenan sin un fallo. AAC-LC a ±1 de la salida en float de ffmpeg redondeada y del decodificador de Apple (`afconvert`), con la misma longitud gapless (`iTunSMPB` o `elst`): archivos de `afconvert` y del codificador de ffmpeg, mono y estéreo, de 8 a 96 kHz y de 16 a 256 kb/s, ventanas cortas, M/S, intensidad, TNS y PNS (el mismo generador de ruido que ffmpeg, así que también coincide). De un HE-AAC suena el núcleo AAC-LC, a media frecuencia y alineado con el original. 5 min en 1,1 s y 27 MB de pico en nativo (el archivo pesa 9,5), ~5× tiempo real en la VM. ALAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono y estéreo, 44,1/48/96 kHz, ruido blanco con escapes, silencio con rachas de ceros; codificado por `afconvert` de Apple y por ffmpeg); 5 min en 1,5 s en nativo y ~3,7× tiempo real en la VM. AIFF idéntico bit a bit a ffmpeg (8, 16, 24 y 32 bits; mono y estéreo; AIFF-C `NONE` y `sowt`; archivos de `afconvert` de Apple). FLAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono, nivel 12, el codificador de Apple). MP3 idéntico a minimp3 compilado en C salvo ±1 en el 0,1 % de las muestras (floats de 64 frente a 32 bits): CBR, VBR, mono, joint y simple stereo, MPEG-2 22 kHz, MPEG-2.5 8 kHz, con ID3v2/ID3v1 y el recorte gapless de LAME. Una pista de 5 min en nativo (Mac), entera en streaming: FLAC 0,6 s y 68 MB de pico (el archivo pesa 30), MP3 1,0 s y 16 MB (antes, decodificándola entera al cargar: 287 y 256 MB). Abrir y servir el primer trozo, ~1 ms. Tras 40 saltos aleatorios por archivo, las muestras coinciden exactamente con la decodificación completa |
+| Backend | `make test`: 45 tests, VM y nativo (`make test-native`) |
+| Decodificadores | Opus a ±1 de libopus 1.5.2 en float (`op_read_float` de opusfile redondeado a 16 bits) y con la misma longitud (pre-skip y granule final), en 36 archivos del codificador libopus (vía ffmpeg): CELT de 12 a 510 kb/s, CBR, VBR y VBR restringido, tramas de 2,5 a 60 ms (40 y 60 ms empaquetadas), mono y estéreo, ruido y tonos; SILK de 6 a 24 kb/s en banda estrecha, media y ancha, tramas de 10 a 60 ms, con FEC (LBRR) y estéreo (mid/side); híbrido, y archivos que cambian entre SILK, híbrido y CELT con las tramas redundantes de cada cambio. SILK sale idéntico bit a bit (es de punto fijo; también al libopus en punto fijo). El decodificador nativo de ffmpeg se aparta de libopus (hasta 86 en CELT y SNR de 22 dB en SILK, que remuestrea a su manera). 5 min en 1,8 s (CELT a 128 kb/s) y 1,9 s (SILK, híbrido y CELT a 32 kb/s) y ~21 MB de pico en nativo, leído como lo hace el reproductor (el archivo pesa 6 MB); en la VM, SILK mono ~6× tiempo real, CELT estéreo ~2,6× e híbrido estéreo ~2,3×; 1500 archivos con bytes corrompidos (cabeceras, paquetes, TOC, cortes) se rechazan o suenan sin un fallo, también tras saltos. Vorbis a ±1 del decodificador de libvorbis y de la salida en float de ffmpeg redondeada, con la misma longitud (el granule de la última página recorta el final): archivos del codificador de libvorbis de calidad −0,1 a 1, mono y estéreo, de 8 a 96 kHz, con transitorios (bloques cortos) y ruido blanco; los del codificador experimental de ffmpeg coinciden con libvorbis (el decodificador de ffmpeg da otro canal derecho en ellos). 5 min en 1,2 s y 17 MB de pico en nativo (el archivo pesa 3,7), ~4,6× tiempo real en la VM; 900 archivos con bytes corrompidos al azar se rechazan o suenan sin un fallo. AAC-LC a ±1 de la salida en float de ffmpeg redondeada y del decodificador de Apple (`afconvert`), con la misma longitud gapless (`iTunSMPB` o `elst`): archivos de `afconvert` y del codificador de ffmpeg, mono y estéreo, de 8 a 96 kHz y de 16 a 256 kb/s, ventanas cortas, M/S, intensidad, TNS y PNS (el mismo generador de ruido que ffmpeg, así que también coincide). De un HE-AAC suena el núcleo AAC-LC, a media frecuencia y alineado con el original. 5 min en 1,1 s y 27 MB de pico en nativo (el archivo pesa 9,5), ~5× tiempo real en la VM. ALAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono y estéreo, 44,1/48/96 kHz, ruido blanco con escapes, silencio con rachas de ceros; codificado por `afconvert` de Apple y por ffmpeg); 5 min en 1,5 s en nativo y ~3,7× tiempo real en la VM. AIFF idéntico bit a bit a ffmpeg (8, 16, 24 y 32 bits; mono y estéreo; AIFF-C `NONE` y `sowt`; archivos de `afconvert` de Apple). FLAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono, nivel 12, el codificador de Apple). MP3 idéntico a minimp3 compilado en C salvo ±1 en el 0,1 % de las muestras (floats de 64 frente a 32 bits): CBR, VBR, mono, joint y simple stereo, MPEG-2 22 kHz, MPEG-2.5 8 kHz, con ID3v2/ID3v1 y el recorte gapless de LAME. Una pista de 5 min en nativo (Mac), entera en streaming: FLAC 0,6 s y 68 MB de pico (el archivo pesa 30), MP3 1,0 s y 16 MB (antes, decodificándola entera al cargar: 287 y 256 MB). Abrir y servir el primer trozo, ~1 ms. Tras 40 saltos aleatorios por archivo, las muestras coinciden exactamente con la decodificación completa |
 | Programa completo | `ray run` headless: monta `www/` y abre `ray://app/index.html` |
 | iOS | simulador iPhone 16 Pro (`ray bundle --ios --ios-target sim`, shell 1.27.19 con sesión `playback` y `UIBackgroundModes = audio`): arranca, la página llega por `ray://app`, el puente responde y el display muestra el `lifecycle` del shell; `audio.open` abre el dispositivo dentro del shell (comprobado con una mini app) |
 | Android | emulador arm64 (`ray bundle --android`, shell 1.27.19 con *foreground service* `mediaPlayback`): Play por `adb`, Home durante 10 s, vuelta: la posición pasó de 0:05 a 0:17 y el display dice «played in the background: 0:09». **El audio sigue en segundo plano** |
 | Desarrollo en vivo | `ray dev --device` + `ray dev-client` en el escritorio (1.27.25, headless): recibe los 12 archivos, monta `www/` y abre `ray://app/index.html`. Las shells `--dev` de iOS y Android se generan con `background_audio`; en un **iPhone real**, la shell de desarrollo arranca la app y suena (con los chasquidos del hallazgo 4) |
 | Segundo plano en iPhone real | **verificado** (29 sep 2026): Play, cambio de app, vuelta: el audio sigue y el display muestra lo reproducido en segundo plano |
-| MP3, FLAC, AIFF, ALAC, AAC y Ogg Vorbis en iPhone real, hasta 24/192 | **verificado** (12 oct 2026, iPhone 12, app nativa): MP3 y FLAC de 24 bits y 5 min cargados con el `<input type=file>` suenan limpios, también en segundo plano; con la decodificación en streaming empiezan al momento y el seek funciona en ambos sentidos. Con raylang 1.27.49, lo mismo; y un AIFF de 24 bits de `afconvert` (13 oct 2026). Un ALAC de 16 bits (.m4a de `afconvert`) suena bien, con los WAV y AIFF ya leídos directamente del archivo (13 oct 2026). Un AAC-LC de 6 s a 128 kb/s y otro de 5 min a 256 kb/s (.m4a de `afconvert`) suenan bien y el seek funciona (13 oct 2026); lo mismo con el decodificador acelerado. Un Ogg Vorbis de 6 s (q0.4) y otro de 5 min (de libvorbis) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). FLAC y ALAC de 24 bits a 96 y 192 kHz (un groove sintético de 33 s, bit a bit iguales a ffmpeg al pasar a 16 bits) suenan bien; con música rítmica, cada salto dejaba oír medio segundo de la posición vieja encima de la nueva al cerrar y reabrir la salida, y ahora el salto sigue en la misma salida con fundidos de 10 ms: los saltos suenan naturales y la traza de audio no da cortes (13 oct 2026). Next, el paso solo de una pista a la siguiente, pausa y reanudación ya no se solapan: con la misma frecuencia y canales la salida sigue (sin hueco entre pistas) y si no, se cierra cuando ha sonado su cola (13 oct 2026). Con el dither de 24 a 16 bits, los FLAC y ALAC de 24 bits suenan como antes (13 oct 2026) |
+| MP3, FLAC, AIFF, ALAC, AAC, Ogg Vorbis y Opus en iPhone real, hasta 24/192 | **verificado** (12 oct 2026, iPhone 12, app nativa): MP3 y FLAC de 24 bits y 5 min cargados con el `<input type=file>` suenan limpios, también en segundo plano; con la decodificación en streaming empiezan al momento y el seek funciona en ambos sentidos. Con raylang 1.27.49, lo mismo; y un AIFF de 24 bits de `afconvert` (13 oct 2026). Un ALAC de 16 bits (.m4a de `afconvert`) suena bien, con los WAV y AIFF ya leídos directamente del archivo (13 oct 2026). Un AAC-LC de 6 s a 128 kb/s y otro de 5 min a 256 kb/s (.m4a de `afconvert`) suenan bien y el seek funciona (13 oct 2026); lo mismo con el decodificador acelerado. Un Ogg Vorbis de 6 s (q0.4) y otro de 5 min (de libvorbis) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). FLAC y ALAC de 24 bits a 96 y 192 kHz (un groove sintético de 33 s, bit a bit iguales a ffmpeg al pasar a 16 bits) suenan bien; con música rítmica, cada salto dejaba oír medio segundo de la posición vieja encima de la nueva al cerrar y reabrir la salida, y ahora el salto sigue en la misma salida con fundidos de 10 ms: los saltos suenan naturales y la traza de audio no da cortes (13 oct 2026). Next, el paso solo de una pista a la siguiente, pausa y reanudación ya no se solapan: con la misma frecuencia y canales la salida sigue (sin hueco entre pistas) y si no, se cierra cuando ha sonado su cola (13 oct 2026). Con el dither de 24 a 16 bits, los FLAC y ALAC de 24 bits suenan como antes (13 oct 2026). Tres Opus de libopus (el groove a 128 y 24 kb/s, y entero a 96 kb/s) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026) |
 
 ## Limitaciones
 
@@ -129,12 +139,16 @@ el emulador Android.
   estéreo de 16 a 32 bits. AAC-LC mono o estéreo en MP4/M4A (no ADTS suelto, ni Main, SSR o LTP,
   ni frames de 960); de HE-AAC v1/v2 solo el núcleo LC, sin la banda alta de SBR (suena apagado,
   a media frecuencia). Vorbis mono o estéreo en Ogg, sin el floor 0 (LSP) y solo la primera pista
-  de un Ogg encadenado; Opus no está escrito. Lo que pase de 16
+  de un Ogg encadenado. Opus mono o estéreo en Ogg (familia de canales 0, o 1 con un solo stream),
+  solo la primera pista de un Ogg encadenado y sin ocultación de pérdidas: un paquete dañado suena
+  como silencio, igual que los de DTX (sin carga, donde libopus pondría ruido de confort), y un
+  cambio de modo sin su trama redundante (solo pasa tras perder paquetes) no se funde. Lo que pase de 16
   bits se reduce a 16 con dither triangular (TPDF) y redondeo, porque `std/audio` solo acepta
   s16le (hallazgo #167); de un FLAC de más de dos canales se quedan los dos primeros. El
   reproductor no remuestrea: abre el dispositivo a la frecuencia de la pista.
 - En la shell de desarrollo (VM), decodificar va justo: en el Mac, 5 s de audio en 1,4–1,6 s
-  (MP3), 1 s (AAC) y 0,6 s (FLAC), unas 3,5–5× el tiempo real; un seek, 30–80 ms. En un teléfono puede no dar
+  (MP3), 1 s (AAC) y 0,6 s (FLAC), unas 3,5–5× el tiempo real; un seek, 30–80 ms. Opus va más
+  justo: 5 s de CELT estéreo en ~1,9 s, y un seek decodifica antes medio segundo (CELT) o dos (SILK). En un teléfono puede no dar
   abasto; para probar con música de verdad, la app nativa.
 - Un WAV o un AIFF tampoco se convierte al cargar: se guarda el archivo tal cual y cada trozo
   de 50 ms se pasa a 16 bits al reproducirlo (`wav.Raw`). Un AIFF de 5 min se abre en 12 ms y

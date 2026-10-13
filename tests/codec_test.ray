@@ -303,10 +303,69 @@ fn damaged_oggs_are_refused() {
     let half = codec.decode(ogg.sub_bytes(0, ogg.len() / 2)).unwrap();
     assert(wav.frames(half) > 0);
     assert(wav.frames(half) < 17640);
-    // An Opus stream starts with "OpusHead" where Vorbis has "\x01vorbis".
+    // "OpusHead" where Vorbis has "\x01vorbis" sends it to the Opus decoder, which finds no
+    // channels in what follows.
     let opus = ogg.sub_bytes(0, 28) + "OpusHead".to_bytes() + ogg.sub_bytes(36, ogg.len());
     match (codec.decode(opus)) {
-        Result.Err(e) => assert_eq(e, "Opus in Ogg is not supported (only Vorbis)"),
-        Result.Ok(_) => panic("Opus decoded"),
+        Result.Err(e) => assert_eq(e, "Opus with 0 channels (only mono and stereo)"),
+        Result.Ok(_) => panic("a broken Opus header decoded"),
+    }
+}
+
+@test
+fn ogg_opus_decodes_like_libopus() {
+    // libopus's encoder (through ffmpeg): CELT stereo at 64 kb/s, SILK mono at 12 kb/s, hybrid
+    // stereo at 32 kb/s, and a mono clip that switches between hybrid and CELT (with the
+    // redundant CELT frames that smooth each switch); against libopus's own floating-point
+    // decoder, rounded to 16 bits. SILK is fixed-point: bit-exact.
+    let p = codec.decode(fixture("tiny.opus")).unwrap();
+    assert_eq(p.rate, 48000);
+    assert_eq(p.channels, 2);
+    assert(within_one(p.data, fixture("tiny.opus.raw")));
+    let silk = codec.decode(fixture("tiny-silk.opus")).unwrap();
+    assert_eq(silk.channels, 1);
+    assert_eq(max_diff(silk.data, fixture("tiny-silk.opus.raw")), 0);
+    let hybrid = codec.decode(fixture("tiny-hybrid.opus")).unwrap();
+    assert_eq(hybrid.channels, 2);
+    assert(within_one(hybrid.data, fixture("tiny-hybrid.opus.raw")));
+    assert(
+        within_one(
+            codec.decode(fixture("tiny-switch.opus")).unwrap().data,
+            fixture("tiny-switch.opus.raw")
+        )
+    );
+    // The pre-skip is dropped and the last page's granule position cuts the end.
+    assert_eq(stream("tiny.opus").total, 19200);
+    assert_eq(stream("tiny-switch.opus").total, 57600);
+    // A seek resets the decoder and decodes the packets before the target again.
+    reads_like_the_whole_decode("tiny.opus", [9000, 0, 959, 960, 18500]);
+    reads_like_the_whole_decode("tiny-silk.opus", [20000, 5]);
+    reads_like_the_whole_decode("tiny-switch.opus", [40000, 100, 30000]);
+}
+
+@test
+fn damaged_and_unsupported_opus_files_are_refused() {
+    let opus = fixture("tiny.opus");
+    // The identification header's page (27 + 1 + 19 octets) and nothing else.
+    match (codec.decode(opus.sub_bytes(0, 47))) {
+        Result.Err(e) => assert_eq(e, "Opus without its headers"),
+        Result.Ok(_) => panic("a header decoded"),
+    }
+    // Cut in half: the packets that are there still play.
+    let half = codec.decode(opus.sub_bytes(0, opus.len() / 2)).unwrap();
+    assert(wav.frames(half) > 0);
+    assert(wav.frames(half) < 19200);
+    // Damaged packets become silence; the track keeps its length.
+    var bad = opus;
+    var at = 400;
+    while (at < bad.len()) {
+        bad = bad.sub_bytes(0, at) + bytes_of([bad[at] ^ 0x5A]) + bad.sub_bytes(at + 1, bad.len());
+        at = at + 97;
+    }
+    assert_eq(wav.frames(codec.decode(bad).unwrap()), 19200);
+    // 5.1 (a channel mapping of four streams) is refused.
+    match (codec.decode(fixture("six.opus"))) {
+        Result.Err(e) => assert_eq(e, "Opus with 6 channels (only mono and stereo)"),
+        Result.Ok(_) => panic("5.1 decoded"),
     }
 }

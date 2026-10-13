@@ -1,10 +1,10 @@
 // Turns an audio file into 16-bit PCM for the player, whatever its format: WAV, AIFF, FLAC, MP3,
-// Ogg Vorbis, or AAC or ALAC (in an .m4a), recognized by their content (not the file name). An ID3v2 tag in front
-// is skipped.
+// Ogg Vorbis, Ogg Opus, or AAC or ALAC (in an .m4a), recognized by their content (not the file
+// name). An ID3v2 tag in front is skipped.
 //
 // Every file stays as it came and is turned into PCM while it plays: a `Stream` holds the file
 // and serves any window of the track with `read`. A WAV or AIFF is PCM already, so a window is
-// read straight from the file (`wav.Raw`). FLAC, MP3, Vorbis, AAC and ALAC go through their decoder, with the few
+// read straight from the file (`wav.Raw`). FLAC, MP3, Vorbis, Opus, AAC and ALAC go through their decoder, with the few
 // thousand samples decoded ahead in a buffer, seeking when a window is not the next one. So a
 // song starts at once and costs its file size.
 
@@ -15,12 +15,13 @@ import flac;
 import mp3;
 import mp4;
 import ogg;
+import opus;
 import vorbis;
 import wav;
 
 /// The extensions the file dialogs and the page offer.
 pub fn extensions() -> [string] {
-    ["wav", "aiff", "aif", "aifc", "flac", "mp3", "m4a", "ogg", "oga"]
+    ["wav", "aiff", "aif", "aifc", "flac", "mp3", "m4a", "ogg", "oga", "opus"]
 }
 
 fn starts(b: bytes, at: int, tag: string) -> bool {
@@ -46,6 +47,7 @@ enum Decoder {
     Alac(alac.Stream),
     Flac(flac.Stream),
     Mp3(mp3.Stream),
+    Opus(opus.Stream),
     Vorbis(vorbis.Stream),
 }
 
@@ -69,13 +71,18 @@ fn raw_stream(r: wav.Raw) -> Stream {
     stream_of(Decoder.Raw(r), r.rate, r.channels, r.frames)
 }
 
-/// Recognizes `b` as WAV, AIFF, FLAC, MP3, Ogg Vorbis, AAC or ALAC and gets it ready to play.
+/// Recognizes `b` as WAV, AIFF, FLAC, MP3, Ogg Vorbis, Ogg Opus, AAC or ALAC and gets it ready to
+/// play.
 pub fn open(b: bytes) -> Result<Stream, string> {
     if (starts(b, 0, "RIFF")) {
         return Result.Ok(raw_stream(wav.open(b)?));
     }
     if (starts(b, 0, "FORM")) {
         return Result.Ok(raw_stream(aiff.open(b)?));
+    }
+    if (ogg.sniff(b) && opus.sniff(b)) {
+        let o = opus.open(b)?;
+        return Result.Ok(stream_of(Decoder.Opus(o), o.rate, o.channels, o.total));
     }
     if (ogg.sniff(b)) {
         let v = vorbis.open(b)?;
@@ -103,7 +110,11 @@ pub fn open(b: bytes) -> Result<Stream, string> {
     match (mp3.open(b, at)) {
         Result.Ok(m) => Result.Ok(stream_of(Decoder.Mp3(m), m.rate, m.channels, m.total)),
         Result.Err(e) => Result.Err(
-            if (looks_mp3) { e } else { "not a WAV, AIFF, FLAC, MP3, Ogg Vorbis, AAC or ALAC file" }
+            if (looks_mp3) {
+                e
+            } else {
+                "not a WAV, AIFF, FLAC, MP3, Ogg Vorbis, Opus, AAC or ALAC file"
+            }
         ),
     }
 }
@@ -115,6 +126,7 @@ fn decode_next(s: Stream, out: [int]) -> Option<int> {
         Decoder.Mp3(m) => mp3.next(m, out),
         Decoder.Aac(a) => aac.next(a, out),
         Decoder.Alac(a) => alac.next(a, out),
+        Decoder.Opus(o) => opus.next(o, out),
         Decoder.Vorbis(v) => vorbis.next(v, out),
         Decoder.Raw(_) => Option.None,
     }
@@ -126,6 +138,7 @@ fn seek(s: Stream, pos: int) -> unit {
         Decoder.Mp3(m) => mp3.seek(m, pos),
         Decoder.Aac(a) => aac.seek(a, pos),
         Decoder.Alac(a) => alac.seek(a, pos),
+        Decoder.Opus(o) => opus.seek(o, pos),
         Decoder.Vorbis(v) => vorbis.seek(v, pos),
         Decoder.Raw(_) => { },
     }
@@ -210,7 +223,8 @@ fn read_raw(r: wav.Raw, from: int, frames: int) -> [int] {
     out
 }
 
-/// Decodes `b` whole, as WAV, AIFF, FLAC, MP3, Ogg Vorbis, AAC or ALAC (tests and tools; the player streams).
+/// Decodes `b` whole, as WAV, AIFF, FLAC, MP3, Ogg Vorbis, Ogg Opus, AAC or ALAC (tests and tools;
+/// the player streams).
 pub fn decode(b: bytes) -> Result<wav.Pcm, string> {
     let s = open(b)?;
     if let Decoder.Raw(r) = s.dec {
