@@ -1,8 +1,9 @@
-// 16-bit PCM, the one format the player plays (`Pcm`, and the `Sink` the decoders write it to),
-// `Raw`, uncompressed PCM left where it is in a loaded file, and a RIFF/WAVE reader and writer.
-// WAVs of 16 or 24 bits are read; everything is little-endian; `b[i]` is the octet at `i`.
+// 16-bit PCM in memory (`Pcm`, and the `Sink` it is collected in: tests and tools), `Raw`,
+// uncompressed PCM left where it is in a loaded file and read as 24 bits for the player, and a
+// RIFF/WAVE reader and writer. WAVs of 16 or 24 bits are read; everything is little-endian;
+// `b[i]` is the octet at `i`.
 
-import dither;
+import pcm24;
 
 /// Interleaved s16le samples with their format.
 pub struct Pcm {
@@ -42,6 +43,11 @@ pub fn put(s: Sink, v: int) -> unit {
     }
 }
 
+/// A 24-bit sample rounded to 16 bits (`put` clamps the top).
+pub fn round_16(v: int) -> int {
+    (v + 128) >> 8
+}
+
 pub fn finish(s: Sink) -> bytes {
     s.done = s.done + bytes_of(s.octets);
     s.octets = [];
@@ -49,7 +55,7 @@ pub fn finish(s: Sink) -> bytes {
 }
 
 /// Integer PCM still inside the file it came in (a WAV or an AIFF): where the samples start and
-/// how they are stored. Nothing is converted on load; `sample` reads any one of them as 16 bits.
+/// how they are stored. Nothing is converted on load; `sample` reads any one of them as 24 bits.
 pub struct Raw {
     b: bytes,
     /// The octet the first sample starts at.
@@ -64,8 +70,8 @@ pub struct Raw {
     big_endian: bool,
 }
 
-/// Sample `i` (interleaved) as a signed 16-bit value: deeper samples are dithered and 8-bit ones
-/// (signed, as in AIFF) scaled up.
+/// Sample `i` (interleaved) as a signed 24-bit value: shallower samples (8-bit ones are signed,
+/// as in AIFF) are scaled up and 32-bit ones rounded.
 pub fn sample(r: Raw, i: int) -> int {
     let step = r.depth / 8;
     let at = r.from + i * step;
@@ -77,17 +83,18 @@ pub fn sample(r: Raw, i: int) -> int {
         } else {
             v = (b[at + 1] << 8) | b[at];
         }
-        return if (v >= 32768) { v - 65536 } else { v };
+        return if (v >= 32768) { v - 65536 } else { v } << 8;
     }
     var v = 0;
     for k in 0..step {
         v = (v << 8) | if (r.big_endian) { b[at + k] } else { b[at + step - 1 - k] };
     }
     let top = 1 << (r.depth - 1);
-    dither.to_16(if (v >= top) { v - 2 * top } else { v }, r.depth, i)
+    pcm24.of(if (v >= top) { v - 2 * top } else { v }, r.depth)
 }
 
-/// The whole of `r` as s16le (tests, tools): a 16-bit little-endian WAV is shared, not copied.
+/// The whole of `r` as s16le (tests, tools), deeper samples rounded: a 16-bit little-endian WAV
+/// is shared, not copied.
 pub fn to_pcm(r: Raw) -> Pcm {
     let n = r.frames * r.channels;
     if (r.depth == 16 && !r.big_endian) {
@@ -99,7 +106,7 @@ pub fn to_pcm(r: Raw) -> Pcm {
     }
     let s = sink();
     for i in 0..n {
-        put(s, sample(r, i));
+        put(s, round_16(sample(r, i)));
     }
     Pcm { rate: r.rate, channels: r.channels, data: finish(s) }
 }

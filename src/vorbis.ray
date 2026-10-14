@@ -5,6 +5,7 @@
 
 import mdct;
 import ogg;
+import pcm24;
 import std/math;
 
 /// Bits the codebooks' first lookup table takes.
@@ -1339,16 +1340,9 @@ pub fn open(b: bytes) -> Result<Stream, string> {
     )
 }
 
-/// A decoded sample rounded and clamped to 16 bits.
-fn to_16(v: float) -> int {
-    let x = v * 32768.0;
-    if (x >= 32767.0) {
-        return 32767;
-    }
-    if (x <= -32768.0) {
-        return -32768;
-    }
-    math.round(x) as int
+/// A decoded sample rounded and clamped to 24 bits.
+fn to_24(v: float) -> int {
+    pcm24.round(v * 8388608.0)
 }
 
 /// Decodes packet `k`; with the previous packet's output at hand, appends the samples between
@@ -1481,7 +1475,7 @@ fn packet(s: Stream, k: int, out: [int]) -> bool {
                 if (t >= 0) {
                     v = v + s.cur[c][t];
                 }
-                out.push(to_16(v));
+                out.push(to_24(v));
             }
         }
     }

@@ -47,7 +47,7 @@ con `std/audio`, y la página es solo la interfaz.
 │               seek, volume, pick, add                               │
 │  player.ray   ACTOR: una fibra con el dispositivo (std/audio) y la  │
 │               lista; comandos por canal; 50 ms por chunk            │
-│  synth.ray    las pistas: procedurales o archivo cargado → s16le    │
+│  synth.ray    las pistas: procedurales o archivo cargado → s24le    │
 │  codec.ray    reconoce el formato (salta ID3v2); Stream sirve       │
 │               cualquier ventana (seek): MP3/AAC/Vorbis/Opus/FLAC/   │
 │               ALAC                                                  │
@@ -55,6 +55,7 @@ con `std/audio`, y la página es solo la interfaz.
 │  mp3.ray      MPEG-1/2/2.5 Layer III (port de minimp3)              │
 │  flac.ray     FLAC nativo, 4–32 bits, cualquier tamaño de bloque    │
 │  wav.ray      PCM de 16 bits (Pcm, Sink) y RIFF/WAVE (16 y 24 bits) │
+│  pcm24.ray    las muestras del reproductor: enteros de 24 bits      │
 │  aiff.ray     AIFF y AIFF-C (8–32 bits, big-endian y `sowt`)        │
 │  mp4.ray      contenedor MP4/M4A: pista de sonido, tablas, gapless  │
 │  aac.ray      AAC-LC (M/S, intensidad, PNS, TNS; de HE-AAC, el LC)  │
@@ -68,15 +69,18 @@ con `std/audio`, y la página es solo la interfaz.
 │  *_tables.ray tablas de CELT y SILK sacadas de libopus              │
 │  mdct.ray     la IMDCT de AAC y Vorbis (DCT-IV por una FFT)         │
 │  bits.ray     lector de bits big-endian sobre bytes                 │
-│  dither.ray   de 24/32 bits a 16: dither TPDF según la posición     │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-- **El audio es del programa**: `audio.open_latency(rate, channels, 120)` + `audio.write` de
-  50 ms por vuelta; `write` aparca la fibra cuando el dispositivo está lleno, así que el
+- **El audio es del programa**: `audio.open_format(rate, channels, "s24le", 120)` (raylang
+  1.27.53) + `audio.write` de 50 ms por vuelta; todo se reproduce en 24 bits, así que un FLAC,
+  ALAC, WAV o AIFF de 24 bits llega al dispositivo tal cual; `write` aparca la fibra cuando el dispositivo está lleno, así que el
   dispositivo marca el paso y los comandos se atienden entre chunk y chunk (`try_recv`).
-- **Posición**: el dispositivo se reabre en cada play, seek y reanudación; `audio.played_ms`
-  cuenta desde ahí y `base_ms` recuerda dónde iba la pista. La pausa cierra el dispositivo.
+- **Posición**: `audio.played_ms` cuenta desde que se abrió el dispositivo y `base_ms` es lo que
+  hay que sumarle para saber dónde va la pista. Un seek, una pausa, un stop o una pista elegida
+  descartan lo que queda en cola con `audio.flush` (1.27.53), que corta con un fundido breve, y
+  lo nuevo suena enseguida; con la misma frecuencia y canales, la salida sigue abierta. Una pista
+  que termina pasa a la siguiente sin hueco. La pausa cierra el dispositivo.
 - **Segundo plano**: `[ios] background_audio = true` y `[android] background_audio = true` en
   `ray.toml` (raylang 1.27.19, M324): sesión `playback` + `UIBackgroundModes = audio` en iOS,
   *foreground service* `mediaPlayback` en Android. La página deja de pedir el estado cuando no
@@ -88,7 +92,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 46 tests: MP3, AAC, Vorbis, Opus, FLAC, ALAC, WAV, AIFF, dither, pistas, el actor (audio nulo, diálogo headless), protocolo
+make test            # 45 tests: MP3, AAC, Vorbis, Opus, FLAC, ALAC (24 bits exactos), WAV, AIFF, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -141,16 +145,16 @@ el emulador Android.
   de un Ogg encadenado. Opus mono o estéreo en Ogg (familia de canales 0, o 1 con un solo stream),
   solo la primera pista de un Ogg encadenado y sin ocultación de pérdidas: un paquete dañado suena
   como silencio, igual que los de DTX (sin carga, donde libopus pondría ruido de confort), y un
-  cambio de modo sin su trama redundante (solo pasa tras perder paquetes) no se funde. Lo que pase de 16
-  bits se reduce a 16 con dither triangular (TPDF) y redondeo, porque `std/audio` solo acepta
-  s16le (hallazgo #167); de un FLAC de más de dos canales se quedan los dos primeros. El
+  cambio de modo sin su trama redundante (solo pasa tras perder paquetes) no se funde. Hasta 24 bits todo
+  suena tal cual; lo que pasa de 24 (WAV, AIFF, FLAC o ALAC de 32 bits) se redondea a 24, muy
+  por debajo del ruido de cualquier conversor; de un FLAC de más de dos canales se quedan los dos primeros. El
   reproductor no remuestrea: abre el dispositivo a la frecuencia de la pista.
 - En la shell de desarrollo (VM), decodificar va justo: en el Mac, 5 s de audio en 1,4–1,6 s
   (MP3), 1 s (AAC) y 0,6 s (FLAC), unas 3,5–5× el tiempo real; un seek, 30–80 ms. Opus va más
   justo: 5 s de CELT estéreo en ~1,9 s, y un seek decodifica antes medio segundo (CELT) o dos (SILK). En un teléfono puede no dar
   abasto; para probar con música de verdad, la app nativa.
 - Un WAV o un AIFF tampoco se convierte al cargar: se guarda el archivo tal cual y cada trozo
-  de 50 ms se pasa a 16 bits al reproducirlo (`wav.Raw`). Un AIFF de 5 min se abre en 12 ms y
+  de 50 ms se pasa a 24 bits al reproducirlo (`wav.Raw`). Un AIFF de 5 min se abre en 12 ms y
   ocupa lo que pesa (antes, convertido entero: 213 ms y 325 MB de pico).
 - Cargar un archivo: en el escritorio, el programa abre el diálogo nativo y lo lee del disco.
   En iOS/Android no hay diálogo (`ui.pick_file_with` devuelve «file dialogs are not available on
@@ -208,3 +212,10 @@ Ver también `../findings/` (los números son los de allí) y el README de Ray80
     petición sin copiarlo, en unos 100 ms frente a 230 de `src/b64.ray` y con ~100 MB menos (78
     MB de base64), así que `src/b64.ray` se quitó; `substring` ya no gasta memoria con acentos, y
     `ray_doc` dice «character index».
+12. **`std/audio` solo aceptaba muestras de 16 bits, y `close` no podía descartar la cola**: un
+    archivo de 24 bits había que reducirlo con dither (`src/dither.ray`), y cada seek o pausa
+    dejaba sonar lo que quedaba en cola (en iOS, un cuarto de segundo o más), así que el
+    reproductor hacía sus propios fundidos detrás de ella. Ver #166 y #167. **Corregidos en
+    1.27.53**: `audio.open_format` acepta s24le (y s32le y f32le), y `audio.flush` descarta la
+    cola sin cerrar la salida. Se quitó el dither, y en el Mac un salto con latencia de 120 ms
+    suena unos 70 ms antes (290 ms con 500 ms de latencia).

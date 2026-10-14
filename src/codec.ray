@@ -1,4 +1,4 @@
-// Turns an audio file into 16-bit PCM for the player, whatever its format: WAV, AIFF, FLAC, MP3,
+// Turns an audio file into 24-bit PCM for the player, whatever its format: WAV, AIFF, FLAC, MP3,
 // Ogg Vorbis, Ogg Opus, or AAC or ALAC (in an .m4a), recognized by their content (not the file
 // name). An ID3v2 tag in front is skipped.
 //
@@ -58,7 +58,7 @@ pub struct Stream {
     channels: int,
     /// Frames (samples per channel) in the track.
     total: int,
-    /// Decoded samples (interleaved, signed 16-bit) and the frame the first one is.
+    /// Decoded samples (interleaved, signed 24-bit) and the frame the first one is.
     buf: [int],
     buf_from: int,
 }
@@ -146,7 +146,7 @@ fn seek(s: Stream, pos: int) -> unit {
     s.buf_from = pos;
 }
 
-/// `frames` frames of the track from frame `from`, as interleaved signed 16-bit samples;
+/// `frames` frames of the track from frame `from`, as interleaved signed 24-bit samples;
 /// silence past the end. Reading on from where the last read ended only decodes what is new;
 /// anything else (a seek, a restart) repositions the decoder first.
 pub fn read(s: Stream, from: int, frames: int) -> [int] {
@@ -223,8 +223,8 @@ fn read_raw(r: wav.Raw, from: int, frames: int) -> [int] {
     out
 }
 
-/// Decodes `b` whole, as WAV, AIFF, FLAC, MP3, Ogg Vorbis, Ogg Opus, AAC or ALAC (tests and tools;
-/// the player streams).
+/// Decodes `b` whole, as WAV, AIFF, FLAC, MP3, Ogg Vorbis, Ogg Opus, AAC or ALAC, rounded to 16
+/// bits (tests and tools; the player streams 24 bits).
 pub fn decode(b: bytes) -> Result<wav.Pcm, string> {
     let s = open(b)?;
     if let Decoder.Raw(r) = s.dec {
@@ -236,7 +236,7 @@ pub fn decode(b: bytes) -> Result<wav.Pcm, string> {
     while (at < s.total) {
         let n = if (at + step < s.total) { step } else { s.total - at };
         for v in read(s, at, n) {
-            wav.put(sink, v);
+            wav.put(sink, wav.round_16(v));
         }
         at = at + n;
     }

@@ -4,17 +4,17 @@ import synth;
 import wav;
 
 @test
-fn a_chunk_has_frames_times_channels_times_two_bytes() {
+fn a_chunk_has_frames_times_channels_times_three_bytes() {
     let t = synth.builtin()[0];
     let c = synth.chunk(t, 0, 441, 80);
-    assert_eq(c.len(), 441 * 2 * 2);
+    assert_eq(c.len(), 441 * 2 * 3);
 }
 
 @test
 fn past_the_end_a_chunk_is_silence() {
     let t = synth.builtin()[2];
     let c = synth.chunk(t, synth.total_frames(t), 10, 100);
-    assert_eq(c.len(), 40);
+    assert_eq(c.len(), 60);
     for i in 0..c.len() {
         assert_eq(c[i], 0);
     }
@@ -35,21 +35,23 @@ fn volume_zero_is_silence_and_full_volume_is_not() {
 
 @test
 fn a_loaded_wav_plays_its_own_samples_scaled() {
-    // One stereo frame at +16384 / -16384, at full volume comes back unchanged.
+    // One 16-bit stereo frame at +16384 / -16384 comes back at full volume as the same values
+    // in 24 bits, and at half volume halved.
     let p = wav.Pcm { rate: 8000, channels: 2, data: bytes_of([0, 64, 0, 192]) };
     let t = synth.loaded("t", codec.open(wav.encode(p)).unwrap());
     assert_eq(t.duration_ms, 0);
     let c = synth.chunk(t, 0, 1, 100);
-    assert_eq(c[0], 0);
-    assert_eq(c[1], 64);
-    assert_eq(c[2], 0);
-    assert_eq(c[3], 192);
+    assert(c == bytes_of([0, 0, 64, 0, 0, 192]));
+    let half = synth.chunk(t, 0, 1, 50);
+    assert(half == bytes_of([0, 0, 32, 0, 0, 224]));
 }
 
+/// The left sample of `frame` in an s24le stereo chunk.
 fn left(c: bytes, frame: int) -> int {
-    var v = c[frame * 4] + c[frame * 4 + 1] * 256;
-    if (v >= 32768) {
-        v = v - 65536;
+    let at = frame * 6;
+    var v = c[at] | (c[at + 1] << 8) | (c[at + 2] << 16);
+    if (v >= 8388608) {
+        v = v - 16777216;
     }
     v
 }
@@ -78,13 +80,20 @@ fn a_loaded_flac_is_a_streamed_track() {
     let t = synth.loaded("t", codec.open(b).unwrap());
     assert_eq(synth.total_frames(t), 13230);
     assert_eq(t.duration_ms, 300);
-    // At full volume it plays the decoded samples unchanged.
+    // At full volume it plays the decoded samples unchanged: each 16-bit sample, low octet
+    // first, behind a zero octet.
     let whole = codec.decode(b).unwrap();
-    assert(synth.chunk(t, 2000, 441, 100) == whole.data.sub_bytes(2000 * 4, 2441 * 4));
+    let c = synth.chunk(t, 2000, 441, 100);
+    assert_eq(c.len(), 441 * 6);
+    for i in 0..441 * 2 {
+        assert_eq(c[3 * i], 0);
+        assert_eq(c[3 * i + 1], whole.data[2000 * 4 + 2 * i]);
+        assert_eq(c[3 * i + 2], whole.data[2000 * 4 + 2 * i + 1]);
+    }
     // Past the end, silence.
     let tail = synth.chunk(t, 13200, 100, 100);
-    assert_eq(tail.len(), 400);
-    for i in 120..400 {
+    assert_eq(tail.len(), 600);
+    for i in 180..600 {
         assert_eq(tail[i], 0);
     }
 }

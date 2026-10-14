@@ -12,6 +12,7 @@
 
 import celt;
 import ogg;
+import pcm24;
 import rangedec as rd;
 import silk;
 import std/math;
@@ -581,16 +582,9 @@ pub fn open(b: bytes) -> Result<Stream, string> {
     )
 }
 
-/// A decoded sample, with the output gain, rounded and clamped to 16 bits.
-fn to_16(v: float) -> int {
-    let x = v * 32768.0;
-    if (x >= 32767.0) {
-        return 32767;
-    }
-    if (x <= -32768.0) {
-        return -32768;
-    }
-    math.round(x) as int
+/// A decoded sample, with the output gain, rounded and clamped to 24 bits.
+fn to_24(v: float) -> int {
+    pcm24.round(v * 8388608.0)
 }
 
 /// Decodes packet `k` into `s.pcm`; its samples, or -1 if damaged (the decoder is then reset).
@@ -625,7 +619,7 @@ pub fn next(s: Stream, out: [int]) -> Option<int> {
             let pcm = s.pcm;
             let g = s.gain;
             for i in 0..len * ch {
-                out.push(to_16(pcm[i] * g));
+                out.push(to_24(pcm[i] * g));
             }
         }
         return Option.Some(s.starts[k] - s.preskip);

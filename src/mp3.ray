@@ -12,6 +12,7 @@
 import std/math;
 import bits;
 import mp3_tables;
+import pcm24;
 
 /// The tables, built once per decoder.
 struct Tables {
@@ -1078,16 +1079,9 @@ fn dct_ii(d: Dec, off: int, n: int) -> unit {
     }
 }
 
-/// A synthesized sample to 16 bits, rounded as minimp3 does (away from zero, clamped).
+/// A synthesized sample (in 16-bit units) to 24 bits, rounded and clamped.
 fn scale_pcm(sample: float) -> int {
-    if (sample >= 32766.5) {
-        return 32767;
-    }
-    if (sample <= -32767.5) {
-        return -32768;
-    }
-    let s = (sample + 0.5) as int;
-    if (s < 0) { s - 1 } else { s }
+    pcm24.round(sample * 256.0)
 }
 
 fn synth_pair(pcm: [int], p: int, nch: int, z: [float], zo: int) -> unit {

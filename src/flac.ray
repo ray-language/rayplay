@@ -8,7 +8,7 @@
 // headers carry: no index, nothing to scan when a file is loaded.
 
 import bits;
-import dither;
+import pcm24;
 
 struct Info {
     rate: int,
@@ -384,9 +384,9 @@ fn frame(b: bytes, h: Head, info: Info, out: [int]) -> Result<int, string> {
     let a = chans[0];
     let c = if (keep == 2 && channels > 1) { chans[1] } else { chans[0] };
     for i in 0..block {
-        out.push(dither.to_16(a[i], depth, dither.place(h.body, i, 0)));
+        out.push(pcm24.of(a[i], depth));
         if (keep == 2) {
-            out.push(dither.to_16(c[i], depth, dither.place(h.body, i, 1)));
+            out.push(pcm24.of(c[i], depth));
         }
     }
     Result.Ok(bits.octet_pos(r))

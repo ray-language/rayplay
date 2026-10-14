@@ -45,10 +45,33 @@ fn a_16_bit_stereo_flac_decodes_exactly() {
 }
 
 @test
-fn a_24_bit_mono_flac_decodes_to_16_bits_with_dither() {
+fn a_24_bit_mono_flac_keeps_its_24_bits() {
     let p = codec.decode(fixture("tiny24.flac")).unwrap();
     assert_eq(p.channels, 1);
-    assert(within_dither(p.data, fixture("tiny24.flac.raw")));
+    // Rounded to 16 bits against a reference that truncates: off by one at most.
+    assert(within_one(p.data, fixture("tiny24.flac.raw")));
+    assert(reads_24_bits_exactly("tiny24.flac"));
+}
+
+/// True when `read` serves every sample of `name` exactly as in tiny24.s24, ffmpeg's s24le
+/// decode of the 24-bit fixtures (the same samples in FLAC, ALAC and AIFF).
+fn reads_24_bits_exactly(name: string) -> bool {
+    let want = fixture("tiny24.s24");
+    let s = stream(name);
+    let got = codec.read(s, 0, s.total);
+    if (got.len() * 3 != want.len()) {
+        return false;
+    }
+    for i in 0..got.len() {
+        var w = want[3 * i] | (want[3 * i + 1] << 8) | (want[3 * i + 2] << 16);
+        if (w >= 8388608) {
+            w = w - 16777216;
+        }
+        if (got[i] != w) {
+            return false;
+        }
+    }
+    true
 }
 
 @test
@@ -126,7 +149,8 @@ fn reads_like_the_whole_decode(name: string, starts: [int]) {
                     want = want - 65536;
                 }
             }
-            assert_eq(got[i], want);
+            let v = wav.round_16(got[i]);
+            assert_eq(if (v > 32767) { 32767 } else { v }, want);
         }
     }
 }
@@ -167,20 +191,18 @@ fn aiff_and_aiff_c_read_exactly() {
         max_diff(codec.decode(fixture("tiny-sowt.aifc")).unwrap().data, fixture("tiny.flac.raw")),
         0
     );
-    // 24-bit mono, dithered to 16 bits like a 24-bit FLAC (the reference truncates).
+    // 24-bit mono, the samples of tiny24.flac.
     let deep = codec.decode(fixture("tiny24.aiff")).unwrap();
     assert_eq(deep.channels, 1);
-    assert(within_dither(deep.data, fixture("tiny24.flac.raw")));
+    assert(within_one(deep.data, fixture("tiny24.flac.raw")));
+    assert(reads_24_bits_exactly("tiny24.aiff"));
     // 8- and 32-bit (references from ffmpeg).
     assert_eq(
         max_diff(codec.decode(fixture("tiny8.aiff")).unwrap().data, fixture("tiny8.aiff.raw")),
         0
     );
     assert(
-        within_dither(
-            codec.decode(fixture("tiny32.aiff")).unwrap().data,
-            fixture("tiny32.aiff.raw")
-        )
+        within_one(codec.decode(fixture("tiny32.aiff")).unwrap().data, fixture("tiny32.aiff.raw"))
     );
     // Played from the file as it is: any window read on its own is the same.
     reads_like_the_whole_decode("tiny.aiff", [9000, 0, 13000]);
@@ -203,28 +225,22 @@ fn damaged_and_compressed_aiffs_are_refused() {
 
 @test
 fn alac_in_m4a_decodes_exactly() {
-    // Made by Apple's afconvert: 16-bit stereo, 24-bit mono (dithered to 16 bits), and white
-    // noise, which the encoder can only store with escapes.
+    // Made by Apple's afconvert: 16-bit stereo, 24-bit mono (the samples of tiny24.flac), and
+    // white noise, which the encoder can only store with escapes.
     let p = codec.decode(fixture("tiny.m4a")).unwrap();
     assert_eq(p.rate, 44100);
     assert_eq(p.channels, 2);
     assert_eq(max_diff(p.data, fixture("tiny.flac.raw")), 0);
     let deep = codec.decode(fixture("tiny24.m4a")).unwrap();
     assert_eq(deep.channels, 1);
-    assert(within_dither(deep.data, fixture("tiny24.flac.raw")));
+    assert(within_one(deep.data, fixture("tiny24.flac.raw")));
+    assert(reads_24_bits_exactly("tiny24.m4a"));
     let noise = codec.decode(fixture("tiny-noise.m4a")).unwrap();
     assert_eq(max_diff(noise.data, fixture("tiny-noise.m4a.raw")), 0);
     // Packets are independent: a read after any seek is exact.
     assert_eq(stream("tiny.m4a").total, 13230);
     reads_like_the_whole_decode("tiny.m4a", [9000, 0, 4095, 4096, 12900]);
     reads_like_the_whole_decode("tiny24.m4a", [5000, 10]);
-}
-
-/// True when deep samples dithered to 16 bits (`a`) match a reference that truncates them
-/// (`b`): rounding adds up to one step, and the noise one more either way.
-fn within_dither(a: bytes, b: bytes) -> bool {
-    let d = max_diff(a, b);
-    d >= 0 && d <= 2
 }
 
 /// True when two s16le buffers have the same length and differ by at most one anywhere.

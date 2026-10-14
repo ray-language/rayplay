@@ -8,6 +8,7 @@ import aac_tables;
 import bits;
 import mdct;
 import mp4;
+import pcm24;
 import std/math;
 
 const ONLY_LONG: int = 0;
@@ -780,15 +781,9 @@ fn synthesize(ch: Overlap, ics: Ics, t: Tables, pcm: [float]) -> unit {
     ch.shape = ics.shape;
 }
 
-/// A decoded sample (in 16-bit units) rounded and clamped to 16 bits.
-fn to_16(v: float) -> int {
-    if (v >= 32767.0) {
-        return 32767;
-    }
-    if (v <= -32768.0) {
-        return -32768;
-    }
-    math.round(v) as int
+/// A decoded sample (in 16-bit units) rounded and clamped to 24 bits.
+fn to_24(v: float) -> int {
+    pcm24.round(v * 256.0)
 }
 
 /// Decodes one raw data block, appending its 1024 interleaved samples per channel to `out`.
@@ -868,14 +863,14 @@ fn frame(s: Stream, at: int, size: int, out: [int]) -> Result<unit, string> {
     if (n == 1) {
         let p = pcm[0];
         for i in 0..1024 {
-            out.push(to_16(p[i]));
+            out.push(to_24(p[i]));
         }
     } else {
         let left = pcm[0];
         let right = pcm[1];
         for i in 0..1024 {
-            out.push(to_16(left[i]));
-            out.push(to_16(right[i]));
+            out.push(to_24(left[i]));
+            out.push(to_24(right[i]));
         }
     }
     Result.Ok({ })
