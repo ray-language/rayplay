@@ -13,6 +13,9 @@
 // or a change of track into the same rate and channels keeps the device and goes on writing; a
 // track that ends runs into the next one without a gap, or, in another format, closes the
 // device once its queue has played.
+//
+// At 44.1 and 48 kHz `flush` cuts with no fade and clicks (rayplay finding #171). There a cut
+// writes its own fade-out after the queue instead, and is heard once the queue has played.
 
 import std/audio;
 import std/math;
@@ -109,13 +112,38 @@ fn close_output(s: State) -> unit {
     }
 }
 
-/// Ends the output at once: what is queued is discarded, with a short fade.
+/// Whether `audio.flush` fades the sound out at the current track's rate (see the top).
+fn flush_fades(s: State) -> bool {
+    s.tracks[s.current].rate > 48000
+}
+
+/// Ends the output: at once, discarding the queue, where the flush fades; otherwise what is
+/// playing fades out and the queue plays before the device closes.
 fn cut_output(s: State) -> unit {
     if (s.handle != 0) {
-        let _f = audio.flush(s.handle);
+        if (flush_fades(s)) {
+            let _f = audio.flush(s.handle);
+        } else {
+            if (s.playing && !s.paused) {
+                fade_out(s);
+            }
+            let _d = audio.drain(s.handle);
+        }
         close(s.handle);
         s.handle = 0;
     }
+}
+
+/// Writes the next few milliseconds of the current track fading to silence (nothing past its end).
+fn fade_out(s: State) -> unit {
+    let t = s.tracks[s.current];
+    let left = synth.total_frames(t) - s.frame;
+    let frames = math.min(t.rate * FADE_MS / 1000, left);
+    if (frames > 0) {
+        write_counted(s, synth.chunk_ramp(t, s.frame, frames, s.volume_prev, 0), frames);
+        s.frame = s.frame + frames;
+    }
+    s.volume_prev = 0;
 }
 
 /// Opens the device for the current track at `ms` into it.
@@ -149,8 +177,15 @@ fn continue_at(s: State, ms: int) -> unit {
 }
 
 /// Moves playback to `ms` into the current track without reopening the device: what is queued
-/// is discarded (it fades out) and the new position fades in right after what has played.
+/// is discarded (it fades out) and the new position fades in right after what has played. Where
+/// the flush does not fade, the old position fades out after the queue and the new one follows.
 fn jump(s: State, ms: int) -> unit {
+    if (!flush_fades(s)) {
+        fade_out(s);
+        continue_at(s, ms);
+        fade_in(s);
+        return;
+    }
     let _f = audio.flush(s.handle);
     let t = s.tracks[s.current];
     let played = audio.played_ms(s.handle).unwrap_or(0);
@@ -194,10 +229,19 @@ fn start(s: State, index: int, ms: int) -> unit {
         && s.handle != 0
         && from.rate == to.rate
         && from.channels == to.channels) {
-        s.current = i;
         if (!ended) {
+            if (!flush_fades(s)) {
+                // The fade-out belongs to the track that is playing.
+                fade_out(s);
+                s.current = i;
+                continue_at(s, ms);
+                fade_in(s);
+                return;
+            }
+            s.current = i;
             jump(s, ms);
         } else {
+            s.current = i;
             continue_at(s, ms);
             if (ms > 0) {
                 fade_in(s);
@@ -224,9 +268,19 @@ fn stop(s: State) -> unit {
     s.frame = 0;
 }
 
-/// Pauses where the sound stops: what is queued is discarded, with a short fade.
+/// Pauses where the sound stops: what is queued is discarded, with a short fade; where the flush
+/// does not fade, after a fade of its own and the queue, which still plays.
 fn pause(s: State) -> unit {
     let t = s.tracks[s.current];
+    if (!flush_fades(s)) {
+        if (s.handle != 0) {
+            fade_out(s);
+        }
+        s.paused = true;
+        close_output(s);
+        s.base_ms = s.frame * 1000 / t.rate;
+        return;
+    }
     if (s.handle != 0) {
         let _f = audio.flush(s.handle);
     }
