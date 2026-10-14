@@ -69,7 +69,6 @@ con `std/audio`, y la página es solo la interfaz.
 │  mdct.ray     la IMDCT de AAC y Vorbis (DCT-IV por una FFT)         │
 │  bits.ray     lector de bits big-endian sobre bytes                 │
 │  dither.ray   de 24/32 bits a 16: dither TPDF según la posición     │
-│  b64.ray      base64 → bytes rápido (std/base64 no aguantaba 56 MB) │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -89,7 +88,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 50 tests: MP3, AAC, Vorbis, Opus, FLAC, ALAC, WAV, AIFF, dither, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
+make test            # 46 tests: MP3, AAC, Vorbis, Opus, FLAC, ALAC, WAV, AIFF, dither, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -130,7 +129,7 @@ el emulador Android.
 | Android | emulador arm64 (`ray bundle --android`, shell 1.27.19 con *foreground service* `mediaPlayback`): Play por `adb`, Home durante 10 s, vuelta: la posición pasó de 0:05 a 0:17 y el display dice «played in the background: 0:09». **El audio sigue en segundo plano** |
 | Desarrollo en vivo | `ray dev --device` + `ray dev-client` en el escritorio (1.27.25, headless): recibe los 12 archivos, monta `www/` y abre `ray://app/index.html`. Las shells `--dev` de iOS y Android se generan con `background_audio`; en un **iPhone real**, la shell de desarrollo arranca la app y suena (con los chasquidos del hallazgo 4) |
 | Segundo plano en iPhone real | **verificado** (29 sep 2026): Play, cambio de app, vuelta: el audio sigue y el display muestra lo reproducido en segundo plano |
-| MP3, FLAC, AIFF, ALAC, AAC, Ogg Vorbis y Opus en iPhone real, hasta 24/192 | **verificado** (12 oct 2026, iPhone 12, app nativa): MP3 y FLAC de 24 bits y 5 min cargados con el `<input type=file>` suenan limpios, también en segundo plano; con la decodificación en streaming empiezan al momento y el seek funciona en ambos sentidos. Con raylang 1.27.49, lo mismo; y un AIFF de 24 bits de `afconvert` (13 oct 2026). Un ALAC de 16 bits (.m4a de `afconvert`) suena bien, con los WAV y AIFF ya leídos directamente del archivo (13 oct 2026). Un AAC-LC de 6 s a 128 kb/s y otro de 5 min a 256 kb/s (.m4a de `afconvert`) suenan bien y el seek funciona (13 oct 2026); lo mismo con el decodificador acelerado. Un Ogg Vorbis de 6 s (q0.4) y otro de 5 min (de libvorbis) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). FLAC y ALAC de 24 bits a 96 y 192 kHz (un groove sintético de 33 s, bit a bit iguales a ffmpeg al pasar a 16 bits) suenan bien; con música rítmica, cada salto dejaba oír medio segundo de la posición vieja encima de la nueva al cerrar y reabrir la salida, y ahora el salto sigue en la misma salida con fundidos de 10 ms: los saltos suenan naturales y la traza de audio no da cortes (13 oct 2026). Next, el paso solo de una pista a la siguiente, pausa y reanudación ya no se solapan: con la misma frecuencia y canales la salida sigue (sin hueco entre pistas) y si no, se cierra cuando ha sonado su cola (13 oct 2026). Con el dither de 24 a 16 bits, los FLAC y ALAC de 24 bits suenan como antes (13 oct 2026). Tres Opus de libopus (el groove a 128 y 24 kb/s, y entero a 96 kb/s) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026) |
+| MP3, FLAC, AIFF, ALAC, AAC, Ogg Vorbis y Opus en iPhone real, hasta 24/192 | **verificado** (12 oct 2026, iPhone 12, app nativa): MP3 y FLAC de 24 bits y 5 min cargados con el `<input type=file>` suenan limpios, también en segundo plano; con la decodificación en streaming empiezan al momento y el seek funciona en ambos sentidos. Con raylang 1.27.49, lo mismo; y un AIFF de 24 bits de `afconvert` (13 oct 2026). Un ALAC de 16 bits (.m4a de `afconvert`) suena bien, con los WAV y AIFF ya leídos directamente del archivo (13 oct 2026). Un AAC-LC de 6 s a 128 kb/s y otro de 5 min a 256 kb/s (.m4a de `afconvert`) suenan bien y el seek funciona (13 oct 2026); lo mismo con el decodificador acelerado. Un Ogg Vorbis de 6 s (q0.4) y otro de 5 min (de libvorbis) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). FLAC y ALAC de 24 bits a 96 y 192 kHz (un groove sintético de 33 s, bit a bit iguales a ffmpeg al pasar a 16 bits) suenan bien; con música rítmica, cada salto dejaba oír medio segundo de la posición vieja encima de la nueva al cerrar y reabrir la salida, y ahora el salto sigue en la misma salida con fundidos de 10 ms: los saltos suenan naturales y la traza de audio no da cortes (13 oct 2026). Next, el paso solo de una pista a la siguiente, pausa y reanudación ya no se solapan: con la misma frecuencia y canales la salida sigue (sin hueco entre pistas) y si no, se cierra cuando ha sonado su cola (13 oct 2026). Con el dither de 24 a 16 bits, los FLAC y ALAC de 24 bits suenan como antes (13 oct 2026). Tres Opus de libopus (el groove a 128 y 24 kb/s, y entero a 96 kb/s) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). Con raylang 1.27.50 y la subida decodificada con `base64_decode_bytes`, una canción grande cargada con el botón entra y suena igual (13 oct 2026) |
 
 ## Limitaciones
 
@@ -157,8 +156,8 @@ el emulador Android.
   En iOS/Android no hay diálogo (`ui.pick_file_with` devuelve «file dialogs are not available on
   mobile (v1)», #152), así que la página usa su `<input type=file>` y el archivo cruza el puente
   entero en base64. Va como string plano y no como JSON, porque `json.parse` gasta ~55× un string
-  largo (#150), y se decodifica con `src/b64.ray` sobre los octetos de la petición: `std/base64`
-  pide un `string` y recortarlo copia (#161). Un WAV de 56 MB de 24 bits llega a unos 470 MB
+  largo (#150), y se decodifica con `base64_decode_bytes` (1.27.50) sobre los octetos de la petición,
+  sin copiarlos (#161). Un WAV de 56 MB de 24 bits llega a unos 470 MB
   durante la subida (casi todo, la petición y su base64) y tarda 0,3 s en nativo; en la shell de desarrollo (VM) no cabe.
 - Sin cola persistente: la lista vuelve a las tres pistas al relanzar.
 
@@ -187,7 +186,7 @@ Ver también `../findings/` (los números son los de allí) y el README de Ray80
    plano.
 6. **`base64.base64_decode` es lento y caro**: ~15 MB/s y ~14× la entrada en nativo. Un
    decodificador en raylang sobre `bytes` (`src/b64.ray`) es ~17× más rápido. Ver #151.
-   Corregido en 1.27.47, pero `src/b64.ray` se queda: ver el 11.
+   Corregido en 1.27.47; `src/b64.ray` se quedó hasta 1.27.50: ver el 11.
 7. **No hay diálogos de archivo en móvil** y la doc no lo dice: `ui.pick_file_with` devuelve
    «file dialogs are not available on mobile (v1)». Ver #152. Con 1.27.47, #150, #151 y #152
    están corregidos.
@@ -205,4 +204,7 @@ Ver también `../findings/` (los números son los de allí) y el README de Ray80
     ocupa ~450 MB; con `std/base64`, ≥ 510 ms y hasta 550 MB. Si el nombre del archivo lleva un
     acento, recortar con `substring` dispara el pico a 1 GB, porque cuesta ~6 octetos por carácter.
     Además, `ray_doc string.index_of` dice «octet index» y devuelve un índice de carácter. Ver
-    #159, #160 y #161.
+    #159, #160 y #161. **Corregidos en 1.27.50**: `base64_decode_bytes` decodifica el tramo de la
+    petición sin copiarlo, en unos 100 ms frente a 230 de `src/b64.ray` y con ~100 MB menos (78
+    MB de base64), así que `src/b64.ray` se quitó; `substring` ya no gasta memoria con acentos, y
+    `ray_doc` dice «character index».

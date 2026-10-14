@@ -10,7 +10,9 @@ version = "0.1.0"
 # page is always served with `mount_embed_at`.
 # 1.27.49: std/base64 decodes a song-sized upload in one cheap pass (findings #151, M380), and
 # native `for i in 0..xs.len()` loops that write `xs[i]` no longer panic (#156).
-raylang = "1.27.49"
+# 1.27.50: `base64_decode_bytes` decodes the song in place in the request's octets (#161),
+# so the app's own base64 decoder is gone.
+raylang = "1.27.50"
 
 # The page (www/) is plain HTML served by the process itself over ray://app; no Vite, no
 # local server. `ui.mount_embed_at("", "www")` puts www/index.html at ray://app/index.html.
