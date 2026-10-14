@@ -140,8 +140,9 @@ fn a_pause_holds_where_the_sound_stopped_and_resumes_there() {
 }
 
 @test
-fn a_seek_while_playing_at_96_khz_is_heard_at_once() {
-    // Only above 48 kHz does the flush fade, so only there is the queue discarded.
+fn a_seek_while_playing_at_96_khz_lands_after_the_queue() {
+    // No rate cuts with audio.flush for now (it clicks): the old position fades out after
+    // what is queued, and the new one follows.
     var data: [int] = [];
     for _ in 0..96000 * 2 * 4 {
         data.push(1);
@@ -151,15 +152,9 @@ fn a_seek_while_playing_at_96_khz_is_heard_at_once() {
     send(cmds, player.Cmd.Play(0));
     time.sleep(500);
     send(cmds, player.Cmd.Seek(1000));
-    // What was queued before the seek is discarded, so the new position plays right away: it
-    // is never behind the seek (with the queue in front, it was for some 150 ms).
-    time.sleep(50);
-    let soon = player.query(cmds).position_ms;
-    assert(soon >= 1000);
-    assert(soon < 1150);
-    time.sleep(250);
+    time.sleep(500);
     let s = player.query(cmds);
     assert(s.position_ms >= 1150);
-    assert(s.position_ms < 1400);
+    assert(s.position_ms < 1500);
     send(cmds, player.Cmd.Quit);
 }
