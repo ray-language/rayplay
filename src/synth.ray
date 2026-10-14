@@ -1,11 +1,12 @@
 // The tracks. Three are procedural — a few minutes of sound computed chunk by chunk, so the
 // app ships no audio files and no track ever sits whole in memory — and a song the user
 // loads stays as its file, turned into PCM as it plays (`codec.Stream`).
-// `chunk` renders any window of a track as s16le at the track's rate, which is all the
+// `chunk` renders any window of a track as s24le at the track's rate, which is all the
 // player needs.
 
 import std/math;
 import codec;
+import pcm24;
 
 pub enum Kind {
     Etude,
@@ -111,18 +112,15 @@ fn pulse(t: float) -> (float, float) {
     (v, v)
 }
 
-fn clamp16(x: float) -> int {
-    var v = (x * 32768.0) as int;
-    if (v > 32767) {
-        v = 32767;
-    }
-    if (v < -32768) {
-        v = -32768;
-    }
-    if (v < 0) { v + 65536 } else { v }
+/// Appends `v` (signed 24-bit) to `out` as three octets, low first.
+fn put24(out: [int], v: int) -> unit {
+    let u = v & 0xFFFFFF;
+    out.push(u & 255);
+    out.push((u >> 8) & 255);
+    out.push(u >> 16);
 }
 
-/// `frames` frames of `t` starting at `from` (frames), as s16le at `volume` (0–100).
+/// `frames` frames of `t` starting at `from` (frames), as s24le at `volume` (0–100).
 /// Past the end of the track it renders silence, so a caller can always ask for a full chunk.
 pub fn chunk(t: Track, from: int, frames: int, volume: int) -> bytes {
     chunk_ramp(t, from, frames, volume, volume)
@@ -144,10 +142,7 @@ pub fn chunk_ramp(t: Track, from: int, frames: int, volume_from: int, volume: in
             for i in 0..frames {
                 let gain = gain_from + step * ((i + 1) as float);
                 for c in 0..ch {
-                    let v = samples[i * ch + c];
-                    let sample = clamp16(((v as float) / 32768.0) * gain);
-                    out.push(sample % 256);
-                    out.push(sample / 256);
+                    put24(out, pcm24.round((samples[i * ch + c] as float) * gain));
                 }
             }
         },
@@ -167,12 +162,8 @@ pub fn chunk_ramp(t: Track, from: int, frames: int, volume_from: int, volume: in
                     l = lr.0 * gain;
                     r = lr.1 * gain;
                 }
-                let sl = clamp16(l);
-                let sr = clamp16(r);
-                out.push(sl % 256);
-                out.push(sl / 256);
-                out.push(sr % 256);
-                out.push(sr / 256);
+                put24(out, pcm24.round(l * 8388608.0));
+                put24(out, pcm24.round(r * 8388608.0));
             }
         },
     }

@@ -3,12 +3,16 @@
 // Sound is written to std/audio in 50 ms chunks; `write` parks the fiber while the device
 // is full, so the device sets the pace and commands are picked up between chunks.
 //
+// The output takes 24-bit samples (`audio.open_format`, "s24le"), so a 24-bit file reaches the
+// device as it is.
+//
 // Position keeping: `audio.played_ms` counts from when the device was opened, and `base_ms`
-// is what to add to it to get the position in the track. Closing the device does not cut what
-// is queued (on iOS, a quarter of a second or more): it would sound on under the next output.
-// So a seek, or a change of track into the same rate and channels, keeps the device and goes on
-// writing; and a device is closed only once its queue has played (a pause, a stop, a track in
-// another format).
+// is what to add to it to get the position in the track. What is queued (on iOS, a quarter of
+// a second or more) plays on after `close`, so a cut — a seek, a pause, a stop, another track
+// chosen — discards it first with `audio.flush`, which ends the sound with a short fade. A seek
+// or a change of track into the same rate and channels keeps the device and goes on writing; a
+// track that ends runs into the next one without a gap, or, in another format, closes the
+// device once its queue has played.
 
 import std/audio;
 import std/math;
@@ -47,7 +51,7 @@ const CHUNK_MS: int = 50;
 
 const LATENCY_MS: int = 120;
 
-/// The fades around a seek: short enough not to be heard as a gap, long enough not to click.
+/// The fade-in after a cut: short enough not to be heard as a gap, long enough not to click.
 const FADE_MS: int = 10;
 
 struct State {
@@ -71,7 +75,6 @@ struct State {
 
 fn position_ms(s: State) -> int {
     if (s.playing && !s.paused && s.handle != 0) {
-        // Right after a seek, until what was queued has played, this is a little short of it.
         let at = s.base_ms + audio.played_ms(s.handle).unwrap_or(0);
         if (at < 0) { 0 } else { at }
     } else {
@@ -97,34 +100,28 @@ fn snapshot(s: State) -> Snapshot {
     }
 }
 
-/// Ends the output: what is playing fades out, and the queue plays before the device closes.
+/// Ends the output once what is queued has played.
 fn close_output(s: State) -> unit {
     if (s.handle != 0) {
-        if (s.playing && !s.paused) {
-            fade_out(s);
-        }
         let _d = audio.drain(s.handle);
         close(s.handle);
         s.handle = 0;
     }
 }
 
-/// Writes the next few milliseconds of the current track fading to silence (nothing past its end).
-fn fade_out(s: State) -> unit {
-    let t = s.tracks[s.current];
-    let left = synth.total_frames(t) - s.frame;
-    let frames = math.min(t.rate * FADE_MS / 1000, left);
-    if (frames > 0) {
-        write_counted(s, synth.chunk_ramp(t, s.frame, frames, s.volume_prev, 0), frames);
-        s.frame = s.frame + frames;
+/// Ends the output at once: what is queued is discarded, with a short fade.
+fn cut_output(s: State) -> unit {
+    if (s.handle != 0) {
+        let _f = audio.flush(s.handle);
+        close(s.handle);
+        s.handle = 0;
     }
-    s.volume_prev = 0;
 }
 
 /// Opens the device for the current track at `ms` into it.
 fn open_at(s: State, ms: int) -> unit {
     let t = s.tracks[s.current];
-    match (audio.open_latency(t.rate, t.channels, LATENCY_MS)) {
+    match (audio.open_format(t.rate, t.channels, "s24le", LATENCY_MS)) {
         Result.Ok(h) => {
             s.handle = h;
             s.error = "";
@@ -151,11 +148,16 @@ fn continue_at(s: State, ms: int) -> unit {
     s.frame = ms * t.rate / 1000;
 }
 
-/// Moves playback to `ms` without reopening the device: the old position fades out and the
-/// new one fades in, each in a few milliseconds, after what is still queued.
-fn seek_playing(s: State, ms: int) -> unit {
-    fade_out(s);
-    continue_at(s, ms);
+/// Moves playback to `ms` into the current track without reopening the device: what is queued
+/// is discarded (it fades out) and the new position fades in right after what has played.
+fn jump(s: State, ms: int) -> unit {
+    let _f = audio.flush(s.handle);
+    let t = s.tracks[s.current];
+    let played = audio.played_ms(s.handle).unwrap_or(0);
+    // From here on the output holds only what has played: the new position follows it.
+    s.written = played * t.rate / 1000;
+    s.base_ms = ms - played;
+    s.frame = ms * t.rate / 1000;
     fade_in(s);
 }
 
@@ -177,8 +179,8 @@ fn write_counted(s: State, data: bytes, frames: int) -> unit {
 
 /// Plays track `index` from `ms`. While playing into an output of the same rate and channels,
 /// the output goes on: a track that ended runs into the next without a gap, and one that is
-/// cut fades out first. Otherwise the output is closed (once its queue has played) and a new
-/// one opened.
+/// cut jumps there at once. Otherwise the output is closed — once its queue has played if the
+/// track ended, at once if it was cut — and a new one opened.
 fn start(s: State, index: int, ms: int) -> unit {
     if (s.tracks.len() == 0) {
         return;
@@ -186,23 +188,28 @@ fn start(s: State, index: int, ms: int) -> unit {
     let i = (index % s.tracks.len() + s.tracks.len()) % s.tracks.len();
     let from = s.tracks[s.current];
     let to = s.tracks[i];
+    let ended = s.frame >= synth.total_frames(from);
     if (s.playing
         && !s.paused
         && s.handle != 0
         && from.rate == to.rate
         && from.channels == to.channels) {
-        let ended = s.frame >= synth.total_frames(from);
-        if (!ended) {
-            fade_out(s);
-        }
         s.current = i;
-        continue_at(s, ms);
-        if (!ended || ms > 0) {
-            fade_in(s);
+        if (!ended) {
+            jump(s, ms);
+        } else {
+            continue_at(s, ms);
+            if (ms > 0) {
+                fade_in(s);
+            }
         }
         return;
     }
-    close_output(s);
+    if (ended) {
+        close_output(s);
+    } else {
+        cut_output(s);
+    }
     s.current = i;
     s.playing = true;
     s.paused = false;
@@ -210,19 +217,28 @@ fn start(s: State, index: int, ms: int) -> unit {
 }
 
 fn stop(s: State) -> unit {
-    close_output(s);
+    cut_output(s);
     s.playing = false;
     s.paused = false;
     s.base_ms = 0;
     s.frame = 0;
 }
 
-/// Pauses where the sound stops: after a short fade and the queue, which still plays.
+/// Pauses where the sound stops: what is queued is discarded, with a short fade.
 fn pause(s: State) -> unit {
-    fade_out(s);
+    let t = s.tracks[s.current];
+    if (s.handle != 0) {
+        let _f = audio.flush(s.handle);
+    }
+    // After the flush, what has played is all that will.
+    let at = math.min(position_ms(s), t.duration_ms);
     s.paused = true;
-    close_output(s);
-    s.base_ms = s.frame * 1000 / s.tracks[s.current].rate;
+    if (s.handle != 0) {
+        close(s.handle);
+        s.handle = 0;
+    }
+    s.base_ms = at;
+    s.frame = at * t.rate / 1000;
 }
 
 fn handle(s: State, cmd: Cmd) -> bool {
@@ -250,7 +266,7 @@ fn handle(s: State, cmd: Cmd) -> bool {
                 ms
             };
             if (s.playing && !s.paused && s.handle != 0) {
-                seek_playing(s, clamped);
+                jump(s, clamped);
             } else if (s.playing && !s.paused) {
                 start(s, s.current, clamped);
             } else {
@@ -374,7 +390,7 @@ pub fn run(cmds: Channel<Cmd>, tracks: [synth.Track]) -> unit {
             }
         }
     }
-    close_output(s);
+    cut_output(s);
 }
 
 /// Asks the actor for a snapshot (from any other fiber).

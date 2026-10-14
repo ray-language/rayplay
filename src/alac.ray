@@ -5,8 +5,8 @@
 // is 16-bit PCM for the player: deeper samples are dithered.
 
 import bits;
-import dither;
 import mp4;
+import pcm24;
 
 /// ALACSpecificConfig, the 24 octets in the `alac` box.
 struct Config {
@@ -281,7 +281,7 @@ fn packet(b: bytes, at: int, size: int, cfg: Config, out: [int]) -> Result<unit,
     let n = chans[0].len();
     for i in 0..n {
         for c in 0..cfg.channels {
-            out.push(dither.to_16(chans[c][i], cfg.depth, dither.place(at, i, c)));
+            out.push(pcm24.of(chans[c][i], cfg.depth));
         }
     }
     Result.Ok({ })

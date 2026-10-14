@@ -1,0 +1,35 @@
+// The player's sample format: signed 24-bit integers, what the output is opened with
+// (`audio.open_format(…, "s24le", …)`). Lossless sources of up to 24 bits reach the device as
+// they are; 16-bit ones are scaled up, and the lossy decoders round their output straight to
+// 24 bits.
+
+pub const MAX: int = 8388607;
+
+pub const MIN: int = -8388608;
+
+/// `v`, a signed sample of `depth` bits (4 to 32), as 24 bits: scaled up if shallower, rounded
+/// if deeper (what is lost below the 24th bit is far under any converter's noise).
+pub fn of(v: int, depth: int) -> int {
+    if (depth <= 24) {
+        return v << (24 - depth);
+    }
+    let shift = depth - 24;
+    clamp((v + (1 << (shift - 1))) >> shift)
+}
+
+/// `v` limited to the 24-bit range.
+pub fn clamp(v: int) -> int {
+    if (v > MAX) { MAX } else if (v < MIN) { MIN } else { v }
+}
+
+/// `x`, in units of a 24-bit step, rounded to the nearest step and limited to the range.
+pub fn round(x: float) -> int {
+    if (x >= 8388607.0) {
+        return MAX;
+    }
+    if (x <= -8388608.0) {
+        return MIN;
+    }
+    let s = if (x < 0.0) { (x - 0.5) as int } else { (x + 0.5) as int };
+    s
+}
