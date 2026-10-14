@@ -69,7 +69,6 @@ con `std/audio`, y la página es solo la interfaz.
 │  mdct.ray     la IMDCT de AAC y Vorbis (DCT-IV por una FFT)         │
 │  bits.ray     lector de bits big-endian sobre bytes                 │
 │  dither.ray   de 24/32 bits a 16: dither TPDF según la posición     │
-│  b64.ray      base64 → bytes rápido (std/base64 no aguantaba 56 MB) │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -89,7 +88,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 50 tests: MP3, AAC, Vorbis, Opus, FLAC, ALAC, WAV, AIFF, dither, base64, pistas, el actor (audio nulo, diálogo headless), protocolo
+make test            # 46 tests: MP3, AAC, Vorbis, Opus, FLAC, ALAC, WAV, AIFF, dither, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -157,8 +156,8 @@ el emulador Android.
   En iOS/Android no hay diálogo (`ui.pick_file_with` devuelve «file dialogs are not available on
   mobile (v1)», #152), así que la página usa su `<input type=file>` y el archivo cruza el puente
   entero en base64. Va como string plano y no como JSON, porque `json.parse` gasta ~55× un string
-  largo (#150), y se decodifica con `src/b64.ray` sobre los octetos de la petición: `std/base64`
-  pide un `string` y recortarlo copia (#161). Un WAV de 56 MB de 24 bits llega a unos 470 MB
+  largo (#150), y se decodifica con `base64_decode_bytes` (1.27.50) sobre los octetos de la petición,
+  sin copiarlos (#161). Un WAV de 56 MB de 24 bits llega a unos 470 MB
   durante la subida (casi todo, la petición y su base64) y tarda 0,3 s en nativo; en la shell de desarrollo (VM) no cabe.
 - Sin cola persistente: la lista vuelve a las tres pistas al relanzar.
 
@@ -187,7 +186,7 @@ Ver también `../findings/` (los números son los de allí) y el README de Ray80
    plano.
 6. **`base64.base64_decode` es lento y caro**: ~15 MB/s y ~14× la entrada en nativo. Un
    decodificador en raylang sobre `bytes` (`src/b64.ray`) es ~17× más rápido. Ver #151.
-   Corregido en 1.27.47, pero `src/b64.ray` se queda: ver el 11.
+   Corregido en 1.27.47; `src/b64.ray` se quedó hasta 1.27.50: ver el 11.
 7. **No hay diálogos de archivo en móvil** y la doc no lo dice: `ui.pick_file_with` devuelve
    «file dialogs are not available on mobile (v1)». Ver #152. Con 1.27.47, #150, #151 y #152
    están corregidos.
@@ -205,4 +204,7 @@ Ver también `../findings/` (los números son los de allí) y el README de Ray80
     ocupa ~450 MB; con `std/base64`, ≥ 510 ms y hasta 550 MB. Si el nombre del archivo lleva un
     acento, recortar con `substring` dispara el pico a 1 GB, porque cuesta ~6 octetos por carácter.
     Además, `ray_doc string.index_of` dice «octet index» y devuelve un índice de carácter. Ver
-    #159, #160 y #161.
+    #159, #160 y #161. **Corregidos en 1.27.50**: `base64_decode_bytes` decodifica el tramo de la
+    petición sin copiarlo, en unos 100 ms frente a 230 de `src/b64.ray` y con ~100 MB menos (78
+    MB de base64), así que `src/b64.ray` se quitó; `substring` ya no gasta memoria con acentos, y
+    `ray_doc` dice «character index».

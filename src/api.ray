@@ -14,13 +14,13 @@
 //                                playlist; for a shell without a native dialog (iOS). A plain
 //                                string because `json.parse` costs ~55× a long string
 //                                (findings #150): a 56 MB WAV inside JSON blows the phone's
-//                                memory limit; decoded with `b64` over the request's octets,
-//                                which std/base64 (a `string` in) cannot do (#161).
+//                                memory limit; decoded in place over the request's octets
+//                                with `base64_decode_bytes` (1.27.50, findings #161).
 
+import std/base64;
 import std/fs;
 import std/json;
 import std/ui;
-import b64;
 import codec;
 import player;
 import synth;
@@ -109,7 +109,7 @@ fn add(cmds: Channel<player.Cmd>, body: string) -> Result<unit, string> {
         Option.None => return Result.Err("add: missing the file after the name"),
     };
     let name = from_utf8(b.sub_bytes(4, cut))?;
-    let src = codec.open(b64.decode(b, cut + 1)?)?;
+    let src = codec.open(base64.base64_decode_bytes(b, cut + 1, b.len())?)?;
     Result.Ok(send(cmds, player.Cmd.Add(synth.loaded(name, src))))
 }
 
