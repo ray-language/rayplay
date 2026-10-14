@@ -14,8 +14,9 @@
 // track that ends runs into the next one without a gap, or, in another format, closes the
 // device once its queue has played.
 //
-// At 44.1 and 48 kHz `flush` cuts with no fade and clicks (rayplay finding #171). There a cut
-// writes its own fade-out after the queue instead, and is heard once the queue has played.
+// But `flush` cuts with no fade and clicks: at 44.1 and 48 kHz since raylang 1.27.53 (rayplay
+// finding #171), and at every rate with 1.27.54 (#173). Where it does, a cut writes its own
+// fade-out after the queue instead, and is heard once the queue has played.
 
 import std/audio;
 import std/math;
@@ -56,6 +57,9 @@ const LATENCY_MS: int = 120;
 
 /// The fade-in after a cut: short enough not to be heard as a gap, long enough not to click.
 const FADE_MS: int = 10;
+
+/// The rate above which `audio.flush` fades the sound out; at 192000, none (see the top).
+const FLUSH_FADES_ABOVE_HZ: int = 192000;
 
 struct State {
     tracks: [synth.Track],
@@ -114,7 +118,7 @@ fn close_output(s: State) -> unit {
 
 /// Whether `audio.flush` fades the sound out at the current track's rate (see the top).
 fn flush_fades(s: State) -> bool {
-    s.tracks[s.current].rate > 48000
+    s.tracks[s.current].rate > FLUSH_FADES_ABOVE_HZ
 }
 
 /// Ends the output: at once, discarding the queue, where the flush fades; otherwise what is
