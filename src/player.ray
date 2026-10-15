@@ -14,9 +14,10 @@
 // track that ends runs into the next one without a gap, or, in another format, closes the
 // device once its queue has played.
 //
-// But `flush` cuts with no fade and clicks: at 44.1 and 48 kHz since raylang 1.27.53 (rayplay
-// finding #171), and at every rate with 1.27.54 (#173). Where it does, a cut writes its own
-// fade-out after the queue instead, and is heard once the queue has played.
+// The fade of `flush` is CoreAudio's (macOS and iOS; at every rate since raylang 1.27.55, rayplay
+// findings #171 and #173); the other backends drop their buffers without a ramp, and that clicks.
+// There a cut writes its own fade-out after the queue instead, and is heard once the queue has
+// played.
 
 import std/audio;
 import std/math;
@@ -58,9 +59,6 @@ const LATENCY_MS: int = 120;
 /// The fade-in after a cut: short enough not to be heard as a gap, long enough not to click.
 const FADE_MS: int = 10;
 
-/// The rate above which `audio.flush` fades the sound out; at 192000, none (see the top).
-const FLUSH_FADES_ABOVE_HZ: int = 192000;
-
 struct State {
     tracks: [synth.Track],
     current: int,
@@ -78,6 +76,8 @@ struct State {
     in_background: bool,
     background_ms: int,
     error: string,
+    /// Whether `audio.flush` fades the sound out here, so a cut can use it (see the top).
+    flush_fades: bool,
 }
 
 fn position_ms(s: State) -> int {
@@ -116,16 +116,11 @@ fn close_output(s: State) -> unit {
     }
 }
 
-/// Whether `audio.flush` fades the sound out at the current track's rate (see the top).
-fn flush_fades(s: State) -> bool {
-    s.tracks[s.current].rate > FLUSH_FADES_ABOVE_HZ
-}
-
 /// Ends the output: at once, discarding the queue, where the flush fades; otherwise what is
 /// playing fades out and the queue plays before the device closes.
 fn cut_output(s: State) -> unit {
     if (s.handle != 0) {
-        if (flush_fades(s)) {
+        if (s.flush_fades) {
             let _f = audio.flush(s.handle);
         } else {
             if (s.playing && !s.paused) {
@@ -184,7 +179,7 @@ fn continue_at(s: State, ms: int) -> unit {
 /// is discarded (it fades out) and the new position fades in right after what has played. Where
 /// the flush does not fade, the old position fades out after the queue and the new one follows.
 fn jump(s: State, ms: int) -> unit {
-    if (!flush_fades(s)) {
+    if (!s.flush_fades) {
         fade_out(s);
         continue_at(s, ms);
         fade_in(s);
@@ -234,7 +229,7 @@ fn start(s: State, index: int, ms: int) -> unit {
         && from.rate == to.rate
         && from.channels == to.channels) {
         if (!ended) {
-            if (!flush_fades(s)) {
+            if (!s.flush_fades) {
                 // The fade-out belongs to the track that is playing.
                 fade_out(s);
                 s.current = i;
@@ -276,7 +271,7 @@ fn stop(s: State) -> unit {
 /// does not fade, after a fade of its own and the queue, which still plays.
 fn pause(s: State) -> unit {
     let t = s.tracks[s.current];
-    if (!flush_fades(s)) {
+    if (!s.flush_fades) {
         if (s.handle != 0) {
             fade_out(s);
         }
@@ -412,8 +407,15 @@ pub fn run(cmds: Channel<Cmd>, tracks: [synth.Track]) -> unit {
         note: "",
         in_background: false,
         background_ms: 0,
-        error: ""
+        error: "",
+        flush_fades: platform() == "macos" || platform() == "ios"
     };
+    eprint(
+        "rayplay: platform "
+            + platform()
+            + ", cuts "
+            + if (s.flush_fades) { "with audio.flush" } else { "with our own fade" }
+    );
     var alive = true;
     while (alive) {
         if (s.playing && !s.paused && s.handle != 0) {

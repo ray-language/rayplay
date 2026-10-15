@@ -8,13 +8,9 @@ import synth;
 import wav;
 
 fn start_player() -> Channel<player.Cmd> {
-    start_player_with(synth.builtin())
-}
-
-fn start_player_with(tracks: [synth.Track]) -> Channel<player.Cmd> {
     let cmds: Channel<player.Cmd> = Channel.bounded(64);
     let _a = spawn(fn() {
-        player.run(cmds, tracks);
+        player.run(cmds, synth.builtin());
     });
     cmds
 }
@@ -98,9 +94,9 @@ fn next_while_playing_goes_on_from_the_start_of_the_next_track() {
     let s = player.query(cmds);
     assert_eq(s.current, 1);
     assert(s.playing);
-    // At 44.1 kHz the cut fades out after the queue: the next track starts once it has played.
-    assert(s.position_ms > 100);
-    assert(s.position_ms < 700);
+    // On macOS the queue of the last one is discarded: the next track starts at once.
+    assert(s.position_ms > 400);
+    assert(s.position_ms < 750);
     send(cmds, player.Cmd.Quit);
 }
 
@@ -128,9 +124,9 @@ fn a_pause_holds_where_the_sound_stopped_and_resumes_there() {
     send(cmds, player.Cmd.Toggle);
     let paused = player.query(cmds);
     assert(paused.paused);
-    // At 44.1 kHz the queue still plays after the pause: the position is where it ran out.
+    // On macOS the queue is discarded: the position is where the sound stopped, a moment later.
     assert(paused.position_ms >= before);
-    assert(paused.position_ms < before + 600);
+    assert(paused.position_ms < before + 200);
     send(cmds, player.Cmd.Toggle);
     time.sleep(500);
     let s = player.query(cmds);
@@ -140,21 +136,20 @@ fn a_pause_holds_where_the_sound_stopped_and_resumes_there() {
 }
 
 @test
-fn a_seek_while_playing_at_96_khz_lands_after_the_queue() {
-    // No rate cuts with audio.flush for now (it clicks): the old position fades out after
-    // what is queued, and the new one follows.
-    var data: [int] = [];
-    for _ in 0..96000 * 2 * 4 {
-        data.push(1);
-    }
-    let p = wav.Pcm { rate: 96000, channels: 2, data: bytes_of(data) };
-    let cmds = start_player_with([synth.loaded("hi", codec.open(wav.encode(p)).unwrap())]);
+fn a_seek_while_playing_is_heard_at_once() {
+    let cmds = start_player();
     send(cmds, player.Cmd.Play(0));
     time.sleep(500);
-    send(cmds, player.Cmd.Seek(1000));
-    time.sleep(500);
+    send(cmds, player.Cmd.Seek(60000));
+    // On macOS what was queued before the seek is discarded, so the new position plays right
+    // away: it is never behind the seek (with the queue in front, it was for some 150 ms).
+    time.sleep(50);
+    let soon = player.query(cmds).position_ms;
+    assert(soon >= 60000);
+    assert(soon < 60150);
+    time.sleep(250);
     let s = player.query(cmds);
-    assert(s.position_ms >= 1150);
-    assert(s.position_ms < 1500);
+    assert(s.position_ms >= 60150);
+    assert(s.position_ms < 60400);
     send(cmds, player.Cmd.Quit);
 }
