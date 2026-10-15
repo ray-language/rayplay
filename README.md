@@ -88,6 +88,15 @@ con `std/audio`, y la página es solo la interfaz.
   `ray.toml` (raylang 1.27.19, M324): sesión `playback` + `UIBackgroundModes = audio` en iOS,
   *foreground service* `mediaPlayback` en Android. La página deja de pedir el estado cuando no
   se ve (sus timers se paran igualmente); el programa ni se entera.
+- **Now Playing** (`std/media`, raylang 1.27.58, hallazgo #170): el actor publica la pista
+  —título, artista, álbum y carátula si el archivo los trae; si no, su nombre y «RayPlay»— cada
+  vez que cambia lo que se ve (otra pista, pausa, reanudar, seek), nunca mientras suena, y no
+  antes de que suene algo. Los comandos de la pantalla de bloqueo, el Centro de Control, los
+  auriculares y las teclas multimedia llegan como eventos `media` y `remote` los pasa al actor
+  (`play`/`pause` a `Resume`/`Pause`, que no hacen nada si ya está en ese estado); el segundo
+  `seek` de cada arrastre, que macOS manda repetido, se descarta. Las etiquetas las lee `tags`:
+  ID3v2.2–2.4, comentarios y bloque `PICTURE` de FLAC, comentarios de Ogg Vorbis y Opus
+  (carátula en `METADATA_BLOCK_PICTURE`) e `ilst` de MP4.
 - **Sin servidor local**: la página va embebida (`[native] embed = ["www"]`) y se sirve por
   `ray://app` con `ui.mount_embed_at("", "www")`; bajo `ray run` y `ray dev --device` se lee
   del disco (bajo `--device`, desde 1.27.46; ver hallazgo 2).
@@ -95,7 +104,7 @@ con `std/audio`, y la página es solo la interfaz.
 ## Uso
 
 ```bash
-make test            # 45 tests: MP3, AAC, Vorbis, Opus, FLAC, ALAC (24 bits exactos), WAV, AIFF, pistas, el actor (audio nulo, diálogo headless), protocolo
+make test            # 56 tests: MP3, AAC, Vorbis, Opus, FLAC, ALAC (24 bits exactos), WAV, AIFF, pistas, el actor (audio nulo, diálogo headless), protocolo
 make run             # ventana de escritorio
 make bundle-ios      # proyecto Xcode en RayPlay-ios/ (iPhone + simulador)
 make bundle-android  # proyecto Gradle en RayPlay-android/ (arm64)
@@ -129,7 +138,7 @@ el emulador Android.
 
 | Qué | Verificado |
 |---|---|
-| Backend | `make test`: 45 tests, VM y nativo (`make test-native`) |
+| Backend | `make test`: 56 tests, VM y nativo (`make test-native`) |
 | Decodificadores | Opus a ±1 de libopus 1.5.2 en float (`op_read_float` de opusfile redondeado a 16 bits) y con la misma longitud (pre-skip y granule final), en 36 archivos del codificador libopus (vía ffmpeg): CELT de 12 a 510 kb/s, CBR, VBR y VBR restringido, tramas de 2,5 a 60 ms (40 y 60 ms empaquetadas), mono y estéreo, ruido y tonos; SILK de 6 a 24 kb/s en banda estrecha, media y ancha, tramas de 10 a 60 ms, con FEC (LBRR) y estéreo (mid/side); híbrido, y archivos que cambian entre SILK, híbrido y CELT con las tramas redundantes de cada cambio. SILK sale idéntico bit a bit (es de punto fijo; también al libopus en punto fijo). El decodificador nativo de ffmpeg se aparta de libopus (hasta 86 en CELT y SNR de 22 dB en SILK, que remuestrea a su manera). 5 min en 1,8 s (CELT a 128 kb/s) y 1,9 s (SILK, híbrido y CELT a 32 kb/s) y ~21 MB de pico en nativo, leído como lo hace el reproductor (el archivo pesa 6 MB); en la VM, SILK mono ~6× tiempo real, CELT estéreo ~2,6× e híbrido estéreo ~2,3×; 1500 archivos con bytes corrompidos (cabeceras, paquetes, TOC, cortes) se rechazan o suenan sin un fallo, también tras saltos. Vorbis a ±1 del decodificador de libvorbis y de la salida en float de ffmpeg redondeada, con la misma longitud (el granule de la última página recorta el final): archivos del codificador de libvorbis de calidad −0,1 a 1, mono y estéreo, de 8 a 96 kHz, con transitorios (bloques cortos) y ruido blanco; los del codificador experimental de ffmpeg coinciden con libvorbis (el decodificador de ffmpeg da otro canal derecho en ellos). 5 min en 1,2 s y 17 MB de pico en nativo (el archivo pesa 3,7), ~4,6× tiempo real en la VM; 900 archivos con bytes corrompidos al azar se rechazan o suenan sin un fallo. AAC-LC a ±1 de la salida en float de ffmpeg redondeada y del decodificador de Apple (`afconvert`), con la misma longitud gapless (`iTunSMPB` o `elst`): archivos de `afconvert` y del codificador de ffmpeg, mono y estéreo, de 8 a 96 kHz y de 16 a 256 kb/s, ventanas cortas, M/S, intensidad, TNS y PNS (el mismo generador de ruido que ffmpeg, así que también coincide). De un HE-AAC suena el núcleo AAC-LC, a media frecuencia y alineado con el original. 5 min en 1,1 s y 27 MB de pico en nativo (el archivo pesa 9,5), ~5× tiempo real en la VM. ALAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono y estéreo, 44,1/48/96 kHz, ruido blanco con escapes, silencio con rachas de ceros; codificado por `afconvert` de Apple y por ffmpeg); 5 min en 1,5 s en nativo y ~3,7× tiempo real en la VM. AIFF idéntico bit a bit a ffmpeg (8, 16, 24 y 32 bits; mono y estéreo; AIFF-C `NONE` y `sowt`; archivos de `afconvert` de Apple). FLAC idéntico bit a bit a ffmpeg (16 y 24 bits, mono, nivel 12, el codificador de Apple). MP3 idéntico a minimp3 compilado en C salvo ±1 en el 0,1 % de las muestras (floats de 64 frente a 32 bits): CBR, VBR, mono, joint y simple stereo, MPEG-2 22 kHz, MPEG-2.5 8 kHz, con ID3v2/ID3v1 y el recorte gapless de LAME. Una pista de 5 min en nativo (Mac), entera en streaming: FLAC 0,6 s y 68 MB de pico (el archivo pesa 30), MP3 1,0 s y 16 MB (antes, decodificándola entera al cargar: 287 y 256 MB). Abrir y servir el primer trozo, ~1 ms. Tras 40 saltos aleatorios por archivo, las muestras coinciden exactamente con la decodificación completa |
 | Programa completo | `ray run` headless: monta `www/` y abre `ray://app/index.html` |
 | iOS | simulador iPhone 16 Pro (`ray bundle --ios --ios-target sim`, shell 1.27.19 con sesión `playback` y `UIBackgroundModes = audio`): arranca, la página llega por `ray://app`, el puente responde y el display muestra el `lifecycle` del shell; `audio.open` abre el dispositivo dentro del shell (comprobado con una mini app) |
@@ -137,6 +146,7 @@ el emulador Android.
 | Desarrollo en vivo | `ray dev --device` + `ray dev-client` en el escritorio (1.27.25, headless): recibe los 12 archivos, monta `www/` y abre `ray://app/index.html`. Las shells `--dev` de iOS y Android se generan con `background_audio`; en un **iPhone real**, la shell de desarrollo arranca la app y suena (con los chasquidos del hallazgo 4) |
 | Segundo plano en iPhone real | **verificado** (29 sep 2026): Play, cambio de app, vuelta: el audio sigue y el display muestra lo reproducido en segundo plano |
 | MP3, FLAC, AIFF, ALAC, AAC, Ogg Vorbis y Opus en iPhone real, hasta 24/192 | **verificado** (12 oct 2026, iPhone 12, app nativa): MP3 y FLAC de 24 bits y 5 min cargados con el `<input type=file>` suenan limpios, también en segundo plano; con la decodificación en streaming empiezan al momento y el seek funciona en ambos sentidos. Con raylang 1.27.49, lo mismo; y un AIFF de 24 bits de `afconvert` (13 oct 2026). Un ALAC de 16 bits (.m4a de `afconvert`) suena bien, con los WAV y AIFF ya leídos directamente del archivo (13 oct 2026). Un AAC-LC de 6 s a 128 kb/s y otro de 5 min a 256 kb/s (.m4a de `afconvert`) suenan bien y el seek funciona (13 oct 2026); lo mismo con el decodificador acelerado. Un Ogg Vorbis de 6 s (q0.4) y otro de 5 min (de libvorbis) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). FLAC y ALAC de 24 bits a 96 y 192 kHz (un groove sintético de 33 s, bit a bit iguales a ffmpeg al pasar a 16 bits) suenan bien; con música rítmica, cada salto dejaba oír medio segundo de la posición vieja encima de la nueva al cerrar y reabrir la salida, y ahora el salto sigue en la misma salida con fundidos de 10 ms: los saltos suenan naturales y la traza de audio no da cortes (13 oct 2026). Next, el paso solo de una pista a la siguiente, pausa y reanudación ya no se solapan: con la misma frecuencia y canales la salida sigue (sin hueco entre pistas) y si no, se cierra cuando ha sonado su cola (13 oct 2026). Con el dither de 24 a 16 bits, los FLAC y ALAC de 24 bits suenan como antes (13 oct 2026). Tres Opus de libopus (el groove a 128 y 24 kb/s, y entero a 96 kb/s) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). Con raylang 1.27.50 y la subida decodificada con `base64_decode_bytes`, una canción grande cargada con el botón entra y suena igual (13 oct 2026) |
+| Now Playing en iPhone real y en el Mac | **verificado** (15 oct 2026, iPhone 12, app nativa, raylang 1.27.58): la pantalla de bloqueo y el Centro de Control muestran la pista con título, artista y carátula (MP3 con ID3v2.3, FLAC de 24 bits y AAC en M4A, carátula PNG de 600×600); pausa, reanudar, siguiente, anterior, la barra y los AirPods mueven el reproductor y la página lo refleja; una publicación por cambio. En el Mac (repro con un tono sonando): Centro de Control, AirPods, teclado, barra, siguiente y anterior |
 
 ## Limitaciones
 
@@ -167,6 +177,9 @@ el emulador Android.
   sin copiarlos (#161). Un WAV de 56 MB de 24 bits llega a unos 470 MB
   durante la subida (casi todo, la petición y su base64) y tarda 0,3 s en nativo; en la shell de desarrollo (VM) no cabe.
 - Sin cola persistente: la lista vuelve a las tres pistas al relanzar.
+- Now Playing solo en macOS e iOS: en Android y Linux `std/media` devuelve `Err` (aún no hay
+  `MediaSession` ni MPRIS) y la app sigue sin él. No se leen las etiquetas de WAV y AIFF (chunks
+  `LIST`/`id3 `), ni las de un MP3 con ID3v2 desincronizado entero (raro).
 
 ## Hallazgos de dogfood
 

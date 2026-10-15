@@ -1,0 +1,77 @@
+// Title, artist, album and cover from each format's tags (fixtures written by ffmpeg 8.1 from
+// the tiny files, with tests/fixtures/cover8.png as the cover).
+
+import std/fs;
+import codec;
+import tags;
+
+fn fixture(name: string) -> bytes {
+    fs.read_file_bytes("tests/fixtures/" + name).unwrap()
+}
+
+fn check(name: string) {
+    let t = tags.read(fixture(name));
+    assert_eq_msg(t.title, "Canción del ñandú", name);
+    assert_eq_msg(t.artist, "Ray Ensemble", name);
+    assert_eq_msg(t.album, "Tagged ✓", name);
+    assert_msg_cover(name, t.artwork);
+}
+
+fn assert_msg_cover(name: string, artwork: bytes) {
+    assert_eq_msg(artwork == fixture("cover8.png"), true, name + ": the cover is the PNG");
+}
+
+@test
+fn id3v2_3_with_utf16_text_and_its_cover() {
+    check("tags23.mp3");
+}
+
+@test
+fn id3v2_4_with_utf8_text_and_its_cover() {
+    check("tags24.mp3");
+}
+
+@test
+fn flac_comments_and_picture_block() {
+    check("tags.flac");
+}
+
+@test
+fn mp4_ilst_and_covr() {
+    check("tags.m4a");
+}
+
+@test
+fn ogg_vorbis_and_opus_comments_with_a_base64_picture() {
+    check("tags.ogg");
+    check("tags.opus");
+}
+
+@test
+fn tagged_files_still_play_and_untagged_ones_have_no_tags() {
+    for name in ["tags23.mp3", "tags.flac", "tags.m4a", "tags.ogg", "tags.opus"] {
+        assert_eq_msg(codec.open(fixture(name)).is_ok(), true, name);
+    }
+    for name in ["tiny.wav", "tiny.flac", "tiny.opus", "tiny-aac.m4a"] {
+        let t = tags.read(fixture(name));
+        assert_eq_msg(t.title + t.artist + t.album, "", name);
+        assert_eq_msg(t.artwork.len(), 0, name);
+    }
+}
+
+@test
+fn damaged_tags_leave_the_fields_empty() {
+    // Cut anywhere, a tag must not panic: fields come out empty or as far as they were read.
+    let b = fixture("tags24.mp3");
+    for cut in [3, 10, 20, 40, 80, 120, 200] {
+        let _t = tags.read(b.sub_bytes(0, cut));
+    }
+    let f = fixture("tags.flac");
+    for cut in [4, 8, 40, 100, 300] {
+        let _t = tags.read(f.sub_bytes(0, cut));
+    }
+    let m = fixture("tags.m4a");
+    for cut in [12, 100, 1000, m.len() - 200] {
+        let _t = tags.read(m.sub_bytes(0, cut));
+    }
+}

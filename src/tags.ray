@@ -1,0 +1,441 @@
+// What a song file says about itself —title, artist, album and its cover— for the system's Now
+// Playing: ID3v2 (MP3, and in front of some FLACs), FLAC's Vorbis comment and picture blocks,
+// the comment header of Ogg Vorbis and Opus (with the cover as a base64 FLAC picture block), and
+// the iTunes `ilst` of an MP4 / M4A. A tag that is missing or damaged leaves its fields empty:
+// it never keeps a song from playing.
+
+import std/base64;
+import ogg;
+import opus;
+
+pub struct Tags {
+    title: string,
+    artist: string,
+    album: string,
+    /// The cover as a PNG or JPEG file; empty if there is none.
+    artwork: bytes,
+}
+
+pub fn none() -> Tags {
+    Tags { title: "", artist: "", album: "", artwork: bytes_of([]) }
+}
+
+/// The tags of the song in `b`, whatever its format (recognized by its content).
+pub fn read(b: bytes) -> Tags {
+    let t = none();
+    if (b.len() >= 4 && ogg.sniff(b)) {
+        from_ogg(b, t);
+        return t;
+    }
+    if (b.len() >= 12 && b.sub_bytes(4, 8) == "ftyp".to_bytes()) {
+        from_mp4(b, t);
+        return t;
+    }
+    var at = 0;
+    while (at + 10 <= b.len() && b.sub_bytes(at, at + 3) == "ID3".to_bytes()) {
+        at = from_id3(b, at, t);
+    }
+    if (at + 4 <= b.len() && b.sub_bytes(at, at + 4) == "fLaC".to_bytes()) {
+        from_flac(b, at + 4, t);
+    }
+    t
+}
+
+fn be32(b: bytes, at: int) -> int {
+    (b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]
+}
+
+fn le32(b: bytes, at: int) -> int {
+    b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24)
+}
+
+fn syncsafe(b: bytes, at: int) -> int {
+    (b[at] << 21) | (b[at + 1] << 14) | (b[at + 2] << 7) | b[at + 3]
+}
+
+/// Sets each field the first time a value for it turns up.
+fn take(t: Tags, field: string, value: string) -> unit {
+    let v = value.trim();
+    if (v == "") {
+        return;
+    }
+    if (field == "title" && t.title == "") {
+        t.title = v;
+    } else if (field == "artist" && t.artist == "") {
+        t.artist = v;
+    } else if (field == "album" && t.album == "") {
+        t.album = v;
+    }
+}
+
+/// A picture of type `kind` (3 = the front cover, which wins over any other).
+fn take_picture(t: Tags, kind: int, data: bytes, front: [bool]) -> unit {
+    if (data.len() == 0 || front[0]) {
+        return;
+    }
+    if (kind == 3 || t.artwork.len() == 0) {
+        t.artwork = data;
+        front[0] = kind == 3;
+    }
+}
+
+// ---- text ----
+
+fn push_utf8(out: [int], c: int) -> unit {
+    if (c < 0x80) {
+        out.push(c);
+    } else if (c < 0x800) {
+        out.push(0xC0 | (c >> 6));
+        out.push(0x80 | (c & 63));
+    } else if (c < 0x10000) {
+        out.push(0xE0 | (c >> 12));
+        out.push(0x80 | ((c >> 6) & 63));
+        out.push(0x80 | (c & 63));
+    } else {
+        out.push(0xF0 | (c >> 18));
+        out.push(0x80 | ((c >> 12) & 63));
+        out.push(0x80 | ((c >> 6) & 63));
+        out.push(0x80 | (c & 63));
+    }
+}
+
+fn latin1(b: bytes, from: int, to: int) -> string {
+    var out: [int] = [];
+    for i in from..to {
+        push_utf8(out, b[i]);
+    }
+    from_utf8(bytes_of(out)).unwrap_or("")
+}
+
+/// UTF-16, big-endian unless a byte order mark says otherwise.
+fn utf16(b: bytes, from: int, to: int) -> string {
+    var at = from;
+    var little = false;
+    if (at + 2 <= to && b[at] == 0xFF && b[at + 1] == 0xFE) {
+        little = true;
+        at = at + 2;
+    } else if (at + 2 <= to && b[at] == 0xFE && b[at + 1] == 0xFF) {
+        at = at + 2;
+    }
+    var out: [int] = [];
+    var high = 0;
+    while (at + 2 <= to) {
+        let u = if (little) { b[at] | (b[at + 1] << 8) } else { (b[at] << 8) | b[at + 1] };
+        at = at + 2;
+        if (u >= 0xD800 && u < 0xDC00) {
+            high = u;
+        } else if (u >= 0xDC00 && u < 0xE000) {
+            if (high != 0) {
+                push_utf8(out, 0x10000 + ((high - 0xD800) << 10) + (u - 0xDC00));
+            }
+            high = 0;
+        } else {
+            push_utf8(out, u);
+            high = 0;
+        }
+    }
+    from_utf8(bytes_of(out)).unwrap_or("")
+}
+
+/// ID3v2 text in `encoding` (0 Latin-1, 1 UTF-16 with BOM, 2 UTF-16BE, 3 UTF-8), up to its
+/// first terminator: of several values (ID3v2.4), the first.
+fn id3_text(b: bytes, from: int, to: int, encoding: int) -> string {
+    let end = text_end(b, from, to, encoding);
+    if (encoding == 1 || encoding == 2) {
+        utf16(b, from, end)
+    } else if (encoding == 3) {
+        from_utf8(b.sub_bytes(from, end)).unwrap_or("")
+    } else {
+        latin1(b, from, end)
+    }
+}
+
+/// Where the text from `from` ends: its terminator (two zero octets, aligned, in UTF-16), or `to`.
+fn text_end(b: bytes, from: int, to: int, encoding: int) -> int {
+    var at = from;
+    if (encoding == 1 || encoding == 2) {
+        while (at + 2 <= to) {
+            if (b[at] == 0 && b[at + 1] == 0) {
+                return at;
+            }
+            at = at + 2;
+        }
+        return to;
+    }
+    while (at < to) {
+        if (b[at] == 0) {
+            return at;
+        }
+        at = at + 1;
+    }
+    to
+}
+
+/// Past the terminator of the text that ends at `end`.
+fn past_text(end: int, to: int, encoding: int) -> int {
+    let n = if (encoding == 1 || encoding == 2) { 2 } else { 1 };
+    if (end + n > to) { to } else { end + n }
+}
+
+// ---- ID3v2 ----
+
+/// Reads the ID3v2 tag at `at`; where it ends.
+fn from_id3(b: bytes, at: int, t: Tags) -> int {
+    let version = b[at + 3];
+    let flags = b[at + 5];
+    let end = at + 10 + syncsafe(b, at + 6) + if ((flags & 16) != 0) { 10 } else { 0 };
+    let to = if (at + 10 + syncsafe(b, at + 6) > b.len()) {
+        b.len()
+    } else {
+        at + 10 + syncsafe(b, at + 6)
+    };
+    // A tag unsynchronised as a whole (ID3v2.2–2.3) is not worth undoing for a title.
+    if (version < 2 || version > 4 || (version < 4 && (flags & 0x80) != 0)) {
+        return end;
+    }
+    var p = at + 10;
+    if ((flags & 0x40) != 0 && version >= 3 && p + 4 <= to) {
+        p = p + if (version == 4) { syncsafe(b, p) } else { be32(b, p) + 4 };
+    }
+    let front = [false];
+    let head = if (version == 2) { 6 } else { 10 };
+    while (p + head <= to && b[p] != 0) {
+        let id = latin1(b, p, p + if (version == 2) { 3 } else { 4 });
+        let size = if (version == 2) {
+            (b[p + 3] << 16) | (b[p + 4] << 8) | b[p + 5]
+        } else if (version == 4) {
+            syncsafe(b, p + 4)
+        } else {
+            be32(b, p + 4)
+        };
+        var from = p + head;
+        let next = from + size;
+        if (size <= 0 || next > to) {
+            break;
+        }
+        if (version == 4) {
+            let frame_flags = b[p + 9];
+            // Unsynchronised or compressed frames are skipped; a data length indicator is not part
+            // of the content.
+            if ((frame_flags & 0x0A) != 0) {
+                p = next;
+                continue;
+            }
+            if ((frame_flags & 1) != 0) {
+                from = from + 4;
+            }
+        }
+        if (from < next) {
+            id3_frame(b, id, from, next, t, front);
+        }
+        p = next;
+    }
+    end
+}
+
+fn id3_frame(b: bytes, id: string, from: int, to: int, t: Tags, front: [bool]) -> unit {
+    let encoding = b[from];
+    if (id == "TIT2" || id == "TT2") {
+        take(t, "title", id3_text(b, from + 1, to, encoding));
+    } else if (id == "TPE1" || id == "TP1") {
+        take(t, "artist", id3_text(b, from + 1, to, encoding));
+    } else if (id == "TALB" || id == "TAL") {
+        take(t, "album", id3_text(b, from + 1, to, encoding));
+    } else if (id == "APIC" || id == "PIC") {
+        // APIC: encoding, MIME type (Latin-1, terminated), picture type, description, data;
+        // PIC (ID3v2.2): a three-letter format instead of the MIME type.
+        var at = from + 1;
+        if (id == "APIC") {
+            at = past_text(text_end(b, at, to, 0), to, 0);
+        } else {
+            at = at + 3;
+        }
+        if (at >= to) {
+            return;
+        }
+        let kind = b[at];
+        at = past_text(text_end(b, at + 1, to, encoding), to, encoding);
+        take_picture(t, kind, b.sub_bytes(at, to), front);
+    }
+}
+
+// ---- FLAC ----
+
+/// The metadata blocks after the `fLaC` marker.
+fn from_flac(b: bytes, from: int, t: Tags) -> unit {
+    var at = from;
+    let front = [false];
+    while (at + 4 <= b.len()) {
+        let last = (b[at] & 0x80) != 0;
+        let kind = b[at] & 0x7F;
+        let size = (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3];
+        let body = at + 4;
+        if (body + size > b.len()) {
+            return;
+        }
+        if (kind == 4) {
+            vorbis_comment(b, body, body + size, t, front);
+        } else if (kind == 6) {
+            flac_picture(b, body, body + size, t, front);
+        }
+        if (last) {
+            return;
+        }
+        at = body + size;
+    }
+}
+
+/// A FLAC picture block: type, MIME type, description, size and colours, then the data.
+fn flac_picture(b: bytes, from: int, to: int, t: Tags, front: [bool]) -> unit {
+    if (from + 8 > to) {
+        return;
+    }
+    let kind = be32(b, from);
+    var at = from + 4;
+    at = at + 4 + be32(b, at);
+    if (at + 4 > to) {
+        return;
+    }
+    at = at + 4 + be32(b, at) + 16;
+    if (at + 4 > to) {
+        return;
+    }
+    let size = be32(b, at);
+    at = at + 4;
+    if (at + size <= to) {
+        take_picture(t, kind, b.sub_bytes(at, at + size), front);
+    }
+}
+
+/// A Vorbis comment (FLAC, Ogg Vorbis, Opus): vendor, then `KEY=value` fields.
+fn vorbis_comment(b: bytes, from: int, to: int, t: Tags, front: [bool]) -> unit {
+    if (from + 4 > to) {
+        return;
+    }
+    var at = from + 4 + le32(b, from);
+    if (at + 4 > to) {
+        return;
+    }
+    let n = le32(b, at);
+    at = at + 4;
+    for _ in 0..n {
+        if (at + 4 > to) {
+            return;
+        }
+        let size = le32(b, at);
+        at = at + 4;
+        if (size < 0 || at + size > to) {
+            return;
+        }
+        let field = b.sub_bytes(at, at + size);
+        at = at + size;
+        let eq = match (field.index_of("=".to_bytes())) {
+            Option.Some(i) => i,
+            Option.None => continue,
+        };
+        let key = from_utf8(field.sub_bytes(0, eq)).unwrap_or("").to_upper();
+        if (key == "METADATA_BLOCK_PICTURE") {
+            if let Result.Ok(block) = base64.base64_decode_bytes(field, eq + 1, field.len()) {
+                flac_picture(block, 0, block.len(), t, front);
+            }
+            continue;
+        }
+        let value = from_utf8(field.sub_bytes(eq + 1, field.len())).unwrap_or("");
+        if (key == "TITLE") {
+            take(t, "title", value);
+        } else if (key == "ARTIST") {
+            take(t, "artist", value);
+        } else if (key == "ALBUM") {
+            take(t, "album", value);
+        }
+    }
+}
+
+// ---- Ogg ----
+
+/// The comment header, the stream's second packet: `\x03vorbis` or `OpusTags` before it.
+fn from_ogg(b: bytes, t: Tags) -> unit {
+    let s = match (ogg.open(b)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return,
+    };
+    if (s.offsets.len() < 2) {
+        return;
+    }
+    let p = ogg.packet(s, 1);
+    let skip = if (opus.sniff(b)) { 8 } else { 7 };
+    if (p.2 > skip) {
+        vorbis_comment(p.0, p.1 + skip, p.1 + p.2, t, [false]);
+    }
+}
+
+// ---- MP4 ----
+
+/// The body of the first box of type `kind` (four octets, `©` included) in `from..to`.
+fn mp4_child(b: bytes, from: int, to: int, kind: bytes) -> Option<(int, int)> {
+    var at = from;
+    while (at + 8 <= to) {
+        var size = be32(b, at);
+        var head = 8;
+        if (size == 1 && at + 16 <= to) {
+            size = (be32(b, at + 8) << 32) | be32(b, at + 12);
+            head = 16;
+        } else if (size == 0) {
+            size = to - at;
+        }
+        if (size < head || at + size > to) {
+            return Option.None;
+        }
+        if (b.sub_bytes(at + 4, at + 8) == kind) {
+            return Option.Some((at + head, at + size));
+        }
+        at = at + size;
+    }
+    Option.None
+}
+
+fn mp4_path(b: bytes, from: int, to: int, kinds: [string]) -> Option<(int, int)> {
+    var range = (from, to);
+    for k in kinds {
+        match (mp4_child(b, range.0, range.1, k.to_bytes())) {
+            Option.Some(r) => {
+                range = r;
+            },
+            Option.None => return Option.None,
+        }
+    }
+    Option.Some(range)
+}
+
+/// The payload of an `ilst` item's `data` box (after its type and locale).
+fn mp4_data(b: bytes, ilst: (int, int), kind: bytes) -> Option<(int, int)> {
+    let item = mp4_child(b, ilst.0, ilst.1, kind)?;
+    let data = mp4_child(b, item.0, item.1, "data".to_bytes())?;
+    if (data.0 + 8 > data.1) {
+        return Option.None;
+    }
+    Option.Some((data.0 + 8, data.1))
+}
+
+/// iTunes metadata: `moov/udta/meta/ilst`, `©nam`, `©ART`, `©alb` and `covr`.
+fn from_mp4(b: bytes, t: Tags) -> unit {
+    let meta = match (mp4_path(b, 0, b.len(), ["moov", "udta", "meta"])) {
+        Option.Some(m) => m,
+        Option.None => return,
+    };
+    // `meta` is a full box: version and flags first.
+    let ilst = match (mp4_child(b, meta.0 + 4, meta.1, "ilst".to_bytes())) {
+        Option.Some(i) => i,
+        Option.None => return,
+    };
+    let fields = [("title", "nam"), ("artist", "ART"), ("album", "alb")];
+    for f in fields {
+        let kind = bytes_concat([bytes_of([0xA9]), f.1.to_bytes()]);
+        if let Option.Some(r) = mp4_data(b, ilst, kind) {
+            take(t, f.0, from_utf8(b.sub_bytes(r.0, r.1)).unwrap_or(""));
+        }
+    }
+    if let Option.Some(r) = mp4_data(b, ilst, "covr".to_bytes()) {
+        take_picture(t, 3, b.sub_bytes(r.0, r.1), [false]);
+    }
+}

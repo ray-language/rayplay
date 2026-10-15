@@ -12,7 +12,9 @@ version = "0.1.0"
 # native `for i in 0..xs.len()` loops that write `xs[i]` no longer panic (#156).
 # 1.27.50: `base64_decode_bytes` decodes the song in place in the request's octets (#161),
 # so the app's own base64 decoder is gone.
-raylang = "1.27.55"
+# 1.27.55: `audio.flush` cuts with a ramp at every rate on CoreAudio (#171, #173).
+# 1.27.58: `std/media` puts the player in the system's Now Playing (#170).
+raylang = "1.27.58"
 
 # The page (www/) is plain HTML served by the process itself over ray://app; no Vite, no
 # local server. `ui.mount_embed_at("", "www")` puts www/index.html at ray://app/index.html.

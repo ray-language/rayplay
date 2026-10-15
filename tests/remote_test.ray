@@ -1,0 +1,50 @@
+// The system's media commands, mapped to the player's.
+
+import player;
+import remote;
+
+fn name(c: Option<player.Cmd>) -> string {
+    match (c) {
+        Option.Some(player.Cmd.Resume) => "resume",
+        Option.Some(player.Cmd.Pause) => "pause",
+        Option.Some(player.Cmd.Toggle) => "toggle",
+        Option.Some(player.Cmd.Next) => "next",
+        Option.Some(player.Cmd.Prev) => "prev",
+        Option.Some(player.Cmd.Stop) => "stop",
+        Option.Some(player.Cmd.Seek(ms)) => "seek ${ms}",
+        Option.Some(_) => "other",
+        Option.None => "none",
+    }
+}
+
+@test
+fn every_declared_command_maps_to_the_player() {
+    assert_eq(name(remote.command("play")), "resume");
+    assert_eq(name(remote.command("pause")), "pause");
+    assert_eq(name(remote.command("toggle")), "toggle");
+    assert_eq(name(remote.command("next")), "next");
+    assert_eq(name(remote.command("previous")), "prev");
+    assert_eq(name(remote.command("stop")), "stop");
+    assert_eq(name(remote.command("seek:129966")), "seek 129966");
+    for c in remote.commands() {
+        if (c != "seek") {
+            assert(name(remote.command(c)) != "none");
+        }
+    }
+}
+
+@test
+fn unknown_commands_and_bad_seeks_map_to_nothing() {
+    assert_eq(name(remote.command("rewind")), "none");
+    assert_eq(name(remote.command("seek:")), "none");
+    assert_eq(name(remote.command("seek:x")), "none");
+}
+
+@test
+fn the_second_seek_of_a_drag_is_a_repeat() {
+    // As macOS sent them: 129966 then 129958 in the same few milliseconds.
+    assert(remote.is_repeat(129958, 1008, 129966, 1000));
+    assert(!remote.is_repeat(71576, 9000, 129958, 1008));
+    assert(!remote.is_repeat(129958, 2000, 129966, 1000));
+    assert(!remote.is_repeat(0, 1000, -1, 0));
+}

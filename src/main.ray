@@ -3,9 +3,12 @@
 // (`[ios] background_audio`, `[android] background_audio` in ray.toml). The page (www/) is
 // plain HTML served over ray://app and talks to the player through `window.ray.request`.
 
+import std/media;
+import std/time;
 import std/ui;
 import api;
 import player;
+import remote;
 import synth;
 
 const APP_NAME: string = "RayPlay";
@@ -48,6 +51,13 @@ fn main() -> int {
         },
     };
 
+    // Into the system's Now Playing: the player publishes the track, the commands come here.
+    if let Result.Err(e) = media.controls(remote.commands()) {
+        eprint("rayplay: media controls: " + e);
+    }
+    var seek_ms = -1;
+    var seek_at = 0;
+
     while (true) {
         let e = match (ui.next_event()) {
             Result.Ok(e) => e,
@@ -66,6 +76,20 @@ fn main() -> int {
             let note = e.tag + " " + player.stamp();
             eprint("rayplay: lifecycle " + note);
             send(cmds, player.Cmd.Note(note));
+        }
+        if (e.kind == "media") {
+            match (remote.command(e.tag)) {
+                Option.Some(player.Cmd.Seek(ms)) => {
+                    let now = time.now();
+                    if (!remote.is_repeat(ms, now, seek_ms, seek_at)) {
+                        send(cmds, player.Cmd.Seek(ms));
+                    }
+                    seek_ms = ms;
+                    seek_at = now;
+                },
+                Option.Some(c) => send(cmds, c),
+                Option.None => eprint("rayplay: unknown media command " + e.tag),
+            }
         }
         if (e.kind == "message") {
             match (ui.as_request(e)) {
