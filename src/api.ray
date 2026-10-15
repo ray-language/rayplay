@@ -24,6 +24,7 @@ import std/ui;
 import codec;
 import player;
 import synth;
+import tags;
 
 fn fail(msg: string) -> string {
     json.obj().field("ok", false).field("error", msg).render()
@@ -92,8 +93,9 @@ fn pick(cmds: Channel<player.Cmd>) -> Result<bool, string> {
     let chosen = ui.pick_file_with(o).map_err(fn(e: string) -> string { "dialog: " + e })?;
     match (chosen) {
         Option.Some(path) => {
-            let src = codec.open(fs.read_file_bytes(path)?)?;
-            send(cmds, player.Cmd.Add(synth.loaded(track_name(path), src)));
+            let file = fs.read_file_bytes(path)?;
+            let src = codec.open(file)?;
+            send(cmds, player.Cmd.Add(synth.tagged(track_name(path), src, tags.read(file))));
             Result.Ok(true)
         },
         Option.None => Result.Ok(false),
@@ -109,8 +111,9 @@ fn add(cmds: Channel<player.Cmd>, body: string) -> Result<unit, string> {
         Option.None => return Result.Err("add: missing the file after the name"),
     };
     let name = from_utf8(b.sub_bytes(4, cut))?;
-    let src = codec.open(base64.base64_decode_bytes(b, cut + 1, b.len())?)?;
-    Result.Ok(send(cmds, player.Cmd.Add(synth.loaded(name, src))))
+    let file = base64.base64_decode_bytes(b, cut + 1, b.len())?;
+    let src = codec.open(file)?;
+    Result.Ok(send(cmds, player.Cmd.Add(synth.tagged(name, src, tags.read(file)))))
 }
 
 fn dispatch(cmds: Channel<player.Cmd>, body: string) -> Result<string, string> {

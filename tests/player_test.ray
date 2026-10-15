@@ -153,3 +153,28 @@ fn a_seek_while_playing_is_heard_at_once() {
     assert(s.position_ms < 60400);
     send(cmds, player.Cmd.Quit);
 }
+
+@test
+fn resume_and_pause_only_act_when_they_change_something() {
+    let cmds = start_player();
+    send(cmds, player.Cmd.Pause);
+    assert(!player.query(cmds).playing);
+    send(cmds, player.Cmd.Resume);
+    time.sleep(400);
+    let s = player.query(cmds);
+    assert(s.playing);
+    assert(!s.paused);
+    send(cmds, player.Cmd.Resume);
+    assert(!player.query(cmds).paused);
+    send(cmds, player.Cmd.Pause);
+    let paused = player.query(cmds);
+    assert(paused.paused);
+    send(cmds, player.Cmd.Pause);
+    assert(player.query(cmds).paused);
+    send(cmds, player.Cmd.Resume);
+    time.sleep(300);
+    let again = player.query(cmds);
+    assert(!again.paused);
+    assert(again.position_ms > paused.position_ms);
+    send(cmds, player.Cmd.Quit);
+}

@@ -18,15 +18,23 @@
 // findings #171 and #173); the other backends drop their buffers without a ramp, and that clicks.
 // There a cut writes its own fade-out after the queue instead, and is heard once the queue has
 // played.
+//
+// The system's Now Playing (lock screen, Control Center; `std/media`, raylang 1.27.58) shows the
+// track and where it is: the actor publishes it whenever that changes —another track, a pause or
+// a resume, a seek— and the system moves the position on by itself while it plays.
 
 import std/audio;
 import std/math;
+import std/media;
 import std/time;
 import synth;
 
 pub enum Cmd {
     Play(int),
     Toggle,
+    /// Plays the current track: from where it paused, from the start if stopped.
+    Resume,
+    Pause,
     Stop,
     Next,
     Prev,
@@ -78,6 +86,10 @@ struct State {
     error: string,
     /// Whether `audio.flush` fades the sound out here, so a cut can use it (see the top).
     flush_fades: bool,
+    /// What Now Playing shows (track, state, start of the position), to publish only changes;
+    /// `now_playing` is false once the platform refused it (no backend).
+    shown: string,
+    now_playing: bool,
 }
 
 fn position_ms(s: State) -> int {
@@ -294,15 +306,55 @@ fn pause(s: State) -> unit {
     s.frame = at * t.rate / 1000;
 }
 
+fn resume(s: State) -> unit {
+    if (!s.playing) {
+        start(s, s.current, 0);
+    } else if (s.paused) {
+        start(s, s.current, s.base_ms);
+    }
+}
+
+/// Publishes the track and where it is to the system's Now Playing, if that changed: the
+/// position starts moving from `base_ms` (a seek, a pause, another track), so with the track and
+/// the state it tells a change apart from playback going on.
+fn announce(s: State) -> unit {
+    // Nothing is published until something has played: the app is not "playing" before that.
+    if (!s.now_playing || s.tracks.len() == 0 || (s.shown == "" && !s.playing)) {
+        return;
+    }
+    let key = "${s.current}/${s.playing}/${s.paused}/${s.base_ms}";
+    if (key == s.shown) {
+        return;
+    }
+    s.shown = key;
+    let t = s.tracks[s.current];
+    // A song's own tags when it has them; the file name and the app otherwise.
+    let title = if (t.tags.title != "") { t.tags.title } else { t.name };
+    let album = if (t.tags.title != "" || t.tags.album != "") { t.tags.album } else { "RayPlay" };
+    var info = media.track(title, t.tags.artist, album);
+    info.artwork = t.tags.artwork;
+    info.duration_ms = t.duration_ms;
+    info.position_ms = math.min(position_ms(s), t.duration_ms);
+    info.playing = s.playing && !s.paused;
+    if let Result.Err(e) = media.now_playing(info) {
+        eprint("rayplay: now playing: " + e);
+        s.now_playing = false;
+    }
+}
+
 fn handle(s: State, cmd: Cmd) -> bool {
     match (cmd) {
         Cmd.Play(i) => start(s, i, 0),
         Cmd.Toggle => {
-            if (!s.playing) {
-                start(s, s.current, 0);
-            } else if (s.paused) {
-                start(s, s.current, s.base_ms);
+            if (s.playing && !s.paused) {
+                pause(s);
             } else {
+                resume(s);
+            }
+        },
+        Cmd.Resume => resume(s),
+        Cmd.Pause => {
+            if (s.playing && !s.paused) {
                 pause(s);
             }
         },
@@ -408,7 +460,9 @@ pub fn run(cmds: Channel<Cmd>, tracks: [synth.Track]) -> unit {
         in_background: false,
         background_ms: 0,
         error: "",
-        flush_fades: platform() == "macos" || platform() == "ios"
+        flush_fades: platform() == "macos" || platform() == "ios",
+        shown: "",
+        now_playing: true
     };
     eprint(
         "rayplay: platform "
@@ -439,6 +493,7 @@ pub fn run(cmds: Channel<Cmd>, tracks: [synth.Track]) -> unit {
             if (alive && s.playing && !s.paused && s.handle != 0) {
                 feed(s);
             }
+            announce(s);
         } else {
             match (recv(cmds)) {
                 Option.Some(c) => {
@@ -448,9 +503,13 @@ pub fn run(cmds: Channel<Cmd>, tracks: [synth.Track]) -> unit {
                     alive = false;
                 },
             }
+            announce(s);
         }
     }
     cut_output(s);
+    if (s.now_playing) {
+        let _c = media.clear();
+    }
 }
 
 /// Asks the actor for a snapshot (from any other fiber).

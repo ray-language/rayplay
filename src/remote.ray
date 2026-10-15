@@ -1,0 +1,36 @@
+// The system's media commands —the lock screen, the Control Center, headphone buttons and media
+// keys (`std/media`, raylang 1.27.58)— arrive as "media" events of `ui.next_event()`; this maps
+// them to the player's commands.
+
+import player;
+
+/// The commands RayPlay handles, for `media.controls`.
+pub fn commands() -> [string] {
+    ["play", "pause", "toggle", "next", "previous", "stop", "seek"]
+}
+
+/// The player command for the `tag` of a "media" event.
+pub fn command(tag: string) -> Option<player.Cmd> {
+    if (tag.starts_with("seek:")) {
+        return parse_int(tag.substring(5, tag.len())).map(fn(ms: int) -> player.Cmd {
+            player.Cmd.Seek(ms)
+        });
+    }
+    match (tag) {
+        "play" => Option.Some(player.Cmd.Resume),
+        "pause" => Option.Some(player.Cmd.Pause),
+        "toggle" => Option.Some(player.Cmd.Toggle),
+        "next" => Option.Some(player.Cmd.Next),
+        "previous" => Option.Some(player.Cmd.Prev),
+        "stop" => Option.Some(player.Cmd.Stop),
+        _ => Option.None,
+    }
+}
+
+/// Whether a seek to `ms` at `at` repeats the previous one (`prev_ms` at `prev_at`): macOS sends
+/// each drag of the bar twice, a few milliseconds and positions apart, and the second would cut
+/// the sound again for nothing.
+pub fn is_repeat(ms: int, at: int, prev_ms: int, prev_at: int) -> bool {
+    let apart = if (ms > prev_ms) { ms - prev_ms } else { prev_ms - ms };
+    at - prev_at < 300 && apart < 300
+}

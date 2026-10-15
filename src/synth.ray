@@ -7,6 +7,7 @@
 import std/math;
 import codec;
 import pcm24;
+import tags;
 
 pub enum Kind {
     Etude,
@@ -21,6 +22,8 @@ pub struct Track {
     rate: int,
     channels: int,
     duration_ms: int,
+    /// What the file says about itself (empty for a procedural track).
+    tags: tags.Tags,
 }
 
 /// The built-in playlist.
@@ -31,27 +34,42 @@ pub fn builtin() -> [Track] {
             kind: Kind.Etude,
             rate: 44100,
             channels: 2,
-            duration_ms: 180000
+            duration_ms: 180000,
+            tags: tags.none()
         },
         Track {
             name: "Slow Drone",
             kind: Kind.Drone,
             rate: 44100,
             channels: 2,
-            duration_ms: 120000
+            duration_ms: 120000,
+            tags: tags.none()
         },
-        Track { name: "Pulse Bass", kind: Kind.Pulse, rate: 44100, channels: 2, duration_ms: 90000 }
+        Track {
+            name: "Pulse Bass",
+            kind: Kind.Pulse,
+            rate: 44100,
+            channels: 2,
+            duration_ms: 90000,
+            tags: tags.none()
+        }
     ]
 }
 
 /// A track from a file the user loaded, as `codec.open` left it.
 pub fn loaded(name: string, s: codec.Stream) -> Track {
+    tagged(name, s, tags.none())
+}
+
+/// The same, with what the file's tags say (`tags.read`).
+pub fn tagged(name: string, s: codec.Stream, t: tags.Tags) -> Track {
     Track {
         name: name,
         kind: Kind.Loaded(s),
         rate: s.rate,
         channels: s.channels,
-        duration_ms: s.total * 1000 / s.rate
+        duration_ms: s.total * 1000 / s.rate,
+        tags: t
     }
 }
 
