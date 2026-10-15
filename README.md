@@ -79,10 +79,10 @@ con `std/audio`, y la página es solo la interfaz.
 - **Posición**: `audio.played_ms` cuenta desde que se abrió el dispositivo y `base_ms` es lo que
   hay que sumarle para saber dónde va la pista. Un seek, una pausa, un stop o una pista elegida
   descartan lo que queda en cola con `audio.flush` (1.27.53), que corta con un fundido breve, y
-  lo nuevo suena enseguida. Pero el `flush` corta sin fundido y chasquea: a 44,1 y 48 kHz desde
-  1.27.53 (hallazgo #171) y a cualquier frecuencia con 1.27.54 (#173), así que por ahora el corte
-  escribe su propio fundido de 10 ms detrás de la cola y lo nuevo suena cuando esta termina
-  (`FLUSH_FADES_ABOVE_HZ` en `src/player.ray`). Con la misma frecuencia y canales, la salida sigue abierta. Una pista
+  lo nuevo suena enseguida. Ese fundido es de CoreAudio (macOS e iOS, a cualquier frecuencia
+  desde 1.27.55; hallazgos #171 y #173); en los demás backends el corte va sin rampa y chasquea,
+  así que ahí (según `platform()`) el corte escribe su propio fundido de 10 ms detrás de la cola
+  y lo nuevo suena cuando esta termina. Con la misma frecuencia y canales, la salida sigue abierta. Una pista
   que termina pasa a la siguiente sin hueco. La pausa cierra el dispositivo.
 - **Segundo plano**: `[ios] background_audio = true` y `[android] background_audio = true` en
   `ray.toml` (raylang 1.27.19, M324): sesión `playback` + `UIBackgroundModes = audio` en iOS,
@@ -221,6 +221,7 @@ Ver también `../findings/` (los números son los de allí) y el README de Ray80
     reproductor hacía sus propios fundidos detrás de ella. Ver #166 y #167. **Corregidos en
     1.27.53**: `audio.open_format` acepta s24le (y s32le y f32le), y `audio.flush` descarta la
     cola sin cerrar la salida. Se quitó el dither, y en el Mac un salto con latencia de 120 ms
-    suena unos 70 ms antes (290 ms con 500 ms de latencia). Solo por encima de 48 kHz: a 44,1
-    y 48 kHz el `flush` chasquea (#171) y se mantienen los fundidos propios. Con 1.27.54 chasquea
-    a cualquier frecuencia (#173), así que no se usa en ninguna.
+    suena unos 70 ms antes (290 ms con 500 ms de latencia). Hasta 1.27.55 el corte de `flush`
+    chasqueaba a 44,1 y 48 kHz (#171) y, con 1.27.54, a cualquier frecuencia (#173); desde 1.27.55
+    lleva rampa a cualquier frecuencia, pero solo en CoreAudio (#174), y en los demás backends
+    se mantienen los fundidos propios.
