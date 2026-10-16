@@ -37,7 +37,7 @@ con `std/audio`, y la página es solo la interfaz.
 
 ```
 ┌──────────── webview del sistema ────────────┐
-│  www/index.html   botones, lista, barra      │
+│  www/index.html   ray-elements: controles    │
 │      │ window.ray.request({op, …})   ▲ JSON  │
 └──────┼───────────────────────────────┼───────┘
        ▼                               │
@@ -101,6 +101,15 @@ con `std/audio`, y la página es solo la interfaz.
 - **Sin servidor local**: la página va embebida (`[native] embed = ["www"]`) y se sirve por
   `ray://app` con `ui.mount_embed_at("", "www")`; bajo `ray run` y `ray dev --device` se lee
   del disco (bajo `--device`, desde 1.27.46; ver hallazgo 2).
+- **Interfaz con ray-elements** (paquete `elements` 0.5.1, `ray add elements`): `ray-app-shell`
+  con `ray-app-bar` y `ray-theme-toggle`, la pista actual en `ray-card` con `ray-slider` para la
+  posición (el seek va al soltar) y el volumen, `ray-icon-button` para los controles (anterior,
+  siguiente y stop registrados con `setIcons`), la lista en `ray-table` y el respaldo de carga en
+  `ray-file-upload`. Tema claro u oscuro según el sistema o el conmutador, con el primario naranja
+  (`data-primary="orange"`); el CSS propio solo usa tokens (`--ray-*`). raylang sirve el paquete en
+  `ray://app/node_modules/@raylang/elements/` con un import map y lo enlaza en `node_modules/`
+  (ignorado); `elements/bridge` atiende las peticiones de los componentes antes que las de la app,
+  y el protocolo de `window.ray.request` no cambia.
 
 ## Uso
 
@@ -149,6 +158,7 @@ el emulador Android.
 | MP3, FLAC, AIFF, ALAC, AAC, Ogg Vorbis y Opus en iPhone real, hasta 24/192 | **verificado** (12 oct 2026, iPhone 12, app nativa): MP3 y FLAC de 24 bits y 5 min cargados con el `<input type=file>` suenan limpios, también en segundo plano; con la decodificación en streaming empiezan al momento y el seek funciona en ambos sentidos. Con raylang 1.27.49, lo mismo; y un AIFF de 24 bits de `afconvert` (13 oct 2026). Un ALAC de 16 bits (.m4a de `afconvert`) suena bien, con los WAV y AIFF ya leídos directamente del archivo (13 oct 2026). Un AAC-LC de 6 s a 128 kb/s y otro de 5 min a 256 kb/s (.m4a de `afconvert`) suenan bien y el seek funciona (13 oct 2026); lo mismo con el decodificador acelerado. Un Ogg Vorbis de 6 s (q0.4) y otro de 5 min (de libvorbis) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). FLAC y ALAC de 24 bits a 96 y 192 kHz (un groove sintético de 33 s, bit a bit iguales a ffmpeg al pasar a 16 bits) suenan bien; con música rítmica, cada salto dejaba oír medio segundo de la posición vieja encima de la nueva al cerrar y reabrir la salida, y ahora el salto sigue en la misma salida con fundidos de 10 ms: los saltos suenan naturales y la traza de audio no da cortes (13 oct 2026). Next, el paso solo de una pista a la siguiente, pausa y reanudación ya no se solapan: con la misma frecuencia y canales la salida sigue (sin hueco entre pistas) y si no, se cierra cuando ha sonado su cola (13 oct 2026). Con el dither de 24 a 16 bits, los FLAC y ALAC de 24 bits suenan como antes (13 oct 2026). Tres Opus de libopus (el groove a 128 y 24 kb/s, y entero a 96 kb/s) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). Con raylang 1.27.50 y la subida decodificada con `base64_decode_bytes`, una canción grande cargada con el botón entra y suena igual (13 oct 2026) |
 | Now Playing en iPhone real y en el Mac | **verificado** (15 oct 2026, iPhone 12, app nativa, raylang 1.27.58): la pantalla de bloqueo y el Centro de Control muestran la pista con título, artista y carátula (MP3 con ID3v2.3, FLAC de 24 bits y AAC en M4A, carátula PNG de 600×600); pausa, reanudar, siguiente, anterior, la barra y los AirPods mueven el reproductor y la página lo refleja; una publicación por cambio. En el Mac (repro con un tono sonando): Centro de Control, AirPods, teclado, barra, siguiente y anterior |
 | Now Playing en Android | **verificado** (16 oct 2026, emulador arm64, app nativa con la shell de raylang 1.27.61): al dar play la sesión sale `PLAYING` con la pista; la notificación multimedia muestra título, artista, anterior/pausa/siguiente y la barra; `cmd media_session dispatch` pause/play/next/previous, la tecla multimedia y arrastrar la barra mueven el reproductor. Con 1.27.59 y 1.27.60 la app moría al dar play (#176) |
+| Interfaz con ray-elements | **verificado** (16 oct 2026, raylang 1.27.61, elements 0.5.1): en el Mac (`ray run`), en el emulador Android (play, pausa, siguiente, la barra, el volumen, tocar una pista, cargar con el selector del sistema y el conmutador de tema) y en el iPhone 12 (el respaldo `ray-file-upload` carga una canción de Archivos y suena; el tema sigue al sistema). En Android la página no sigue el modo oscuro del sistema, solo el conmutador (#177) |
 
 ## Limitaciones
 
@@ -173,7 +183,7 @@ el emulador Android.
   ocupa lo que pesa (antes, convertido entero: 213 ms y 325 MB de pico).
 - Cargar un archivo: en el escritorio, el programa abre el diálogo nativo y lo lee del disco.
   En iOS/Android no hay diálogo (`ui.pick_file_with` devuelve «file dialogs are not available on
-  mobile (v1)», #152), así que la página usa su `<input type=file>` y el archivo cruza el puente
+  mobile (v1)», #152), así que la página usa su `ray-file-upload` y el archivo cruza el puente
   entero en base64. Va como string plano y no como JSON, porque `json.parse` gasta ~55× un string
   largo (#150), y se decodifica con `base64_decode_bytes` (1.27.50) sobre los octetos de la petición,
   sin copiarlos (#161). Un WAV de 56 MB de 24 bits llega a unos 470 MB

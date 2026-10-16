@@ -37,3 +37,6 @@ background_audio = true
 
 [android]
 background_audio = true
+
+[dependencies]
+elements = "^0.5.1"

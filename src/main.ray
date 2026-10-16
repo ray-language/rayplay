@@ -1,11 +1,13 @@
 // RayPlay — a small audio player whose sound comes from the raylang program (std/audio), not
 // from the page: the point is to exercise playback in the background on iOS and Android
 // (`[ios] background_audio`, `[android] background_audio` in ray.toml). The page (www/) is
-// plain HTML served over ray://app and talks to the player through `window.ray.request`.
+// plain HTML on ray-elements served over ray://app and talks to the player through
+// `window.ray.request`; `elements/bridge` answers the components' own requests.
 
 import std/media;
 import std/time;
 import std/ui;
+import elements/bridge;
 import api;
 import player;
 import remote;
@@ -42,7 +44,6 @@ fn main() -> int {
     o.min_width = 320;
     o.min_height = 480;
     o.autosave = "rayplay.main";
-    o.titlebar_color = "#101418";
     let window = match (ui.open_with(APP_NAME, url, o)) {
         Result.Ok(w) => w,
         Result.Err(e) => {
@@ -66,6 +67,9 @@ fn main() -> int {
                 return 1;
             },
         };
+        if (bridge.handle(e)) {
+            continue; // a ray-elements request, already answered
+        }
         if (e.kind == "closed" && e.window == window) {
             send(cmds, player.Cmd.Quit);
             return 0;

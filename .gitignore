@@ -9,3 +9,4 @@ RayPlay-dev-android/
 # `ray dev --device` pairing link (port + secret token)
 .ray-dev
 .DS_Store
+node_modules/

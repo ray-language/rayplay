@@ -1,74 +1,75 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-primary="orange">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>RayPlay</title>
+<link rel="stylesheet" href="/node_modules/@raylang/elements/tokens.css">
+<link rel="stylesheet" href="/node_modules/@raylang/elements/base.css">
 <style>
-  :root { color-scheme: dark; --bg: #101418; --panel: #1a2028; --fg: #e8ecf1; --dim: #8b95a3; --accent: #ff8c42; }
+  :not(:defined) { visibility: hidden; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.4 -apple-system, system-ui, sans-serif; }
-  body { padding: calc(env(safe-area-inset-top) + 16px) 16px calc(env(safe-area-inset-bottom) + 16px); }
-  h1 { font-size: 20px; margin: 0 0 12px; letter-spacing: .08em; }
-  h1 span { color: var(--accent); }
-  .now { background: var(--panel); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
-  .title { font-size: 18px; font-weight: 600; min-height: 1.4em; }
-  .time { color: var(--dim); font-variant-numeric: tabular-nums; margin: 6px 0; }
-  .bar { position: relative; height: 10px; margin: 14px 0 10px; border-radius: 5px; background: #2a323d; }
-  .bar > i { display: block; height: 100%; width: 0; border-radius: 5px; background: var(--accent); }
-  /* Only the knob moves the position: a tap elsewhere on the bar does nothing. */
-  .knob { position: absolute; top: 50%; left: 0; width: 22px; height: 22px; margin: -11px 0 0 -11px; border-radius: 50%; background: var(--fg); touch-action: none; transition: transform .1s; }
-  .knob::before { content: ''; position: absolute; inset: -12px; }
-  .knob.drag { transform: scale(1.3); }
-  .knob[hidden] { display: none; }
-  .controls { display: flex; gap: 10px; margin-top: 14px; }
-  button { flex: 1; min-height: 56px; border: 0; border-radius: 12px; background: #2a323d; color: var(--fg); font-size: 22px; }
-  button.main { background: var(--accent); color: #101418; flex: 2; }
-  button:active { filter: brightness(1.2); }
-  .vol { display: flex; align-items: center; gap: 10px; margin-top: 14px; color: var(--dim); }
-  .vol input { flex: 1; }
-  .list { background: var(--panel); border-radius: 14px; overflow: hidden; }
-  .list div { padding: 14px 16px; border-bottom: 1px solid #242b35; display: flex; justify-content: space-between; }
-  .list div:last-child { border-bottom: 0; }
-  .list div.on { color: var(--accent); }
-  .list small { color: var(--dim); }
-  .status { margin-top: 14px; color: var(--dim); font-size: 14px; white-space: pre-line; min-height: 3.6em; }
-  .status b { color: var(--fg); }
-  .load { display: block; width: 100%; margin-top: 14px; padding: 14px; text-align: center; border: 1px dashed #3a4450; border-radius: 12px; color: var(--dim); background: none; font: inherit; }
+  .page { padding-bottom: env(safe-area-inset-bottom); }
+  .now { margin-bottom: var(--ray-space-sm); }
+  .title { font-size: var(--ray-font-size-lg); font-weight: var(--ray-font-weight-semibold); min-height: 1.4em; }
+  .time { color: var(--ray-muted-foreground); font-variant-numeric: tabular-nums; margin: var(--ray-space-1) 0; }
+  .status { margin-top: var(--ray-space-sm); color: var(--ray-muted-foreground); font-size: var(--ray-font-size-sm); white-space: pre-line; min-height: 3.6em; }
+  .load { margin-top: var(--ray-space-sm); }
   .load[hidden] { display: none; }
-  label.load input { display: none; }
 </style>
 </head>
 <body>
-<h1>RAY<span>PLAY</span></h1>
-<div class="now">
-  <div class="title" id="title">…</div>
-  <div class="time"><span id="pos">0:00</span> / <span id="dur">0:00</span></div>
-  <div class="bar" id="bar"><i id="fill"></i><b class="knob" id="knob" hidden></b></div>
-  <div class="controls">
-    <button id="prev" aria-label="previous">⏮</button>
-    <button id="toggle" class="main" aria-label="play or pause">▶</button>
-    <button id="next" aria-label="next">⏭</button>
-    <button id="stop" aria-label="stop">■</button>
-  </div>
-  <div class="vol">🔈<input id="vol" type="range" min="0" max="100" value="80">🔊</div>
-</div>
-<div class="list" id="list"></div>
+<ray-app-shell padding="md">
+  <ray-app-bar slot="header" label="RayPlay">
+    <ray-theme-toggle slot="end"></ray-theme-toggle>
+  </ray-app-bar>
+<div class="page">
+<ray-card class="now" with-border>
+  <ray-stack gap="sm">
+    <div>
+      <div class="title" id="title">…</div>
+      <div class="time"><span id="pos">0:00</span> / <span id="dur">0:00</span></div>
+    </div>
+    <ray-slider id="seek" min="0" max="1" value="0" disabled></ray-slider>
+    <ray-group justify="space-between" nowrap>
+      <ray-icon-button id="prev" label="Previous" size="lg" variant="default"><ray-icon name="skip-back"></ray-icon></ray-icon-button>
+      <ray-icon-button id="toggle" label="Play" size="lg" variant="filled"><ray-icon name="play"></ray-icon></ray-icon-button>
+      <ray-icon-button id="next" label="Next" size="lg" variant="default"><ray-icon name="skip-forward"></ray-icon></ray-icon-button>
+      <ray-icon-button id="stop" label="Stop" size="lg" variant="default"><ray-icon name="stop"></ray-icon></ray-icon-button>
+    </ray-group>
+    <ray-slider id="vol" label="Volume" min="0" max="100" value="80"></ray-slider>
+  </ray-stack>
+</ray-card>
+<ray-table id="list" label="Playlist" clickable-rows with-border density="md"></ray-table>
 <!-- The program opens the native dialog and reads the file itself; the input is the fallback
      for a shell without one (there the whole file crosses the bridge as base64). -->
-<button class="load" id="pick">Load a song (MP3, AAC, Ogg, Opus, FLAC, ALAC, WAV or AIFF)</button>
-<label class="load" id="fallback" hidden>Load a song (MP3, AAC, Ogg, Opus, FLAC, ALAC, WAV or AIFF)<input id="file" type="file" accept=".mp3,.flac,.m4a,.ogg,.oga,.opus,.wav,.aif,.aiff,.aifc,audio/mpeg,audio/flac,audio/wav,audio/x-wav,audio/aiff,audio/x-aiff,audio/mp4,audio/x-m4a,audio/ogg,audio/opus"></label>
+<ray-button class="load" id="pick" variant="default" size="md" full-width><ray-icon slot="left" name="upload"></ray-icon>Load a song</ray-button>
+<ray-file-upload class="load" id="file" hidden list="none" hint="MP3, AAC, Ogg, Opus, FLAC, ALAC, WAV or AIFF" drop-label="Drop a song here" tap-label="Load a song" accept=".mp3,.flac,.m4a,.ogg,.oga,.opus,.wav,.aif,.aiff,.aifc,audio/mpeg,audio/flac,audio/wav,audio/x-wav,audio/aiff,audio/x-aiff,audio/mp4,audio/x-m4a,audio/ogg,audio/opus"></ray-file-upload>
 <div class="status" id="status"></div>
-<script>
-(function () {
+</div>
+</ray-app-shell>
+<script type="module">
+import { enableRaylang, setIcons } from "@raylang/elements";
+// The transport icons the registry lacks, drawn like the built-in set (24×24, 2px currentColor stroke).
+const stroke = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">';
+setIcons({
+  'skip-back': stroke + '<polygon points="19 20 9 12 19 4 19 20"/><line x1="5" y1="19" x2="5" y2="5"/></svg>',
+  'skip-forward': stroke + '<polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19"/></svg>',
+  'stop': stroke + '<rect x="5" y="5" width="14" height="14" rx="2"/></svg>',
+});
+// The system dialogs, menus and window for the components; null in a plain browser.
+await enableRaylang();
+{
   const $ = (id) => document.getElementById(id);
   let state = null;
   let volTimer = 0;
-  // While the knob is held: the track it belongs to and the position it points at.
+  // While the position slider is held: the track it belongs to.
   let drag = null;
   // Replies to requests sent before the last seek carry the old position: they are not painted.
   let sent = 0;
   let seekAt = 0;
+  // What the playlist last showed: it is only rebuilt when that changes, not on every poll.
+  let shownList = '';
 
   function fmt(ms) {
     const s = Math.max(0, Math.floor(ms / 1000));
@@ -101,21 +102,17 @@
     const t = state.tracks[state.current];
     $('title').textContent = t ? t.name : '(no tracks)';
     $('dur').textContent = fmt(t ? t.duration_ms : 0);
-    $('knob').hidden = !(t && t.duration_ms);
+    $('seek').disabled = !(t && t.duration_ms);
     if (!drag) paintPosition(state.position_ms, t ? t.duration_ms : 0);
-    $('toggle').textContent = state.playing && !state.paused ? '⏸' : '▶';
+    const sounding = state.playing && !state.paused;
+    $('toggle').label = sounding ? 'Pause' : 'Play';
+    $('toggle').firstElementChild.name = sounding ? 'pause' : 'play';
     if (document.activeElement !== $('vol')) $('vol').value = state.volume;
-    const list = $('list');
-    list.innerHTML = '';
-    state.tracks.forEach((tr, i) => {
-      const row = document.createElement('div');
-      row.className = i === state.current ? 'on' : '';
-      row.innerHTML = '<span></span><small></small>';
-      row.firstChild.textContent = (i === state.current && state.playing && !state.paused ? '▶ ' : '') + tr.name;
-      row.lastChild.textContent = fmt(tr.duration_ms);
-      row.onclick = () => call('play', { index: i });
-      list.appendChild(row);
-    });
+    const listKey = JSON.stringify([state.current, sounding, state.tracks]);
+    if (listKey !== shownList) {
+      shownList = listKey;
+      $('list').data = state.tracks.map((tr, i) => ({ id: i, name: tr.name, duration_ms: tr.duration_ms }));
+    }
     let s = '';
     if (state.note) s += 'last lifecycle: ' + state.note + '\n';
     if (state.background_ms > 0) s += 'played in the background: ' + fmt(state.background_ms) + '\n';
@@ -125,53 +122,46 @@
   }
 
   function paintPosition(ms, duration) {
-    const pct = duration ? Math.min(100, 100 * ms / duration) + '%' : '0';
     $('pos').textContent = fmt(ms);
-    $('fill').style.width = pct;
-    $('knob').style.left = pct;
+    $('seek').max = Math.max(1, duration);
+    $('seek').value = Math.min(ms, duration);
   }
 
+  // The current track in the primary color, with ▶ while it sounds.
+  function trackCell(row) {
+    const span = document.createElement('span');
+    const on = state && row.id === state.current;
+    span.textContent = (on && state.playing && !state.paused ? '▶ ' : '') + row.name;
+    if (on) span.style.color = 'var(--ray-primary)';
+    return span;
+  }
+  $('list').columns = [
+    { key: 'name', label: 'Track', render: trackCell },
+    { key: 'duration_ms', label: 'Length', align: 'right', render: (row) => fmt(row.duration_ms) },
+  ];
+  $('list').addEventListener('ray-row-click', (e) => call('play', { index: e.detail.row.id }));
   $('toggle').onclick = () => call('toggle');
   $('stop').onclick = () => call('stop');
   $('next').onclick = () => call('next');
   $('prev').onclick = () => call('prev');
-  $('vol').oninput = (e) => {
+  $('vol').addEventListener('input', (e) => {
     clearTimeout(volTimer);
     volTimer = setTimeout(() => call('volume', { value: Number(e.target.value) }), 80);
-  };
-  // Dragging the knob only moves it (the music keeps playing where it was); letting go seeks.
-  function dragTo(e) {
-    const rect = $('bar').getBoundingClientRect();
-    const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
-    drag.ms = Math.round(frac * drag.duration);
-    paintPosition(drag.ms, drag.duration);
-  }
-  function endDrag() {
-    $('knob').classList.remove('drag');
+  });
+  // Dragging the slider only moves it (the music keeps playing where it was); letting go seeks.
+  $('seek').addEventListener('input', (e) => {
+    if (!state) return;
+    if (!drag) drag = { track: state.current };
+    $('pos').textContent = fmt(Number(e.target.value));
+  });
+  $('seek').addEventListener('change', (e) => {
     const d = drag;
     drag = null;
-    return d;
-  }
-  $('knob').onpointerdown = (e) => {
-    if (!state || drag) return;
-    const t = state.tracks[state.current];
-    if (!t || !t.duration_ms) return;
-    e.preventDefault();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    e.currentTarget.classList.add('drag');
-    drag = { track: state.current, duration: t.duration_ms, ms: state.position_ms };
-  };
-  $('knob').onpointermove = (e) => { if (drag) dragTo(e); };
-  $('knob').onpointerup = (e) => {
-    if (!drag) return;
-    dragTo(e);
-    const d = endDrag();
     // If the track changed under the finger, the position belongs to the old one: drop it.
-    if (state && state.current === d.track) call('seek', { ms: d.ms });
+    if (state && d && state.current === d.track) call('seek', { ms: Number(e.target.value) });
     else render();
-  };
-  $('knob').onpointercancel = () => { if (drag) { endDrag(); render(); } };
-  function useFileInput() { $('pick').hidden = true; $('fallback').hidden = false; }
+  });
+  function useFileInput() { $('pick').hidden = true; $('file').hidden = false; }
   if (localStorage.getItem('rayplay.noDialog')) useFileInput();
   $('pick').onclick = async () => {
     $('status').textContent = 'choose a song…';
@@ -187,8 +177,8 @@
     }
     $('status').textContent = 'error: ' + reply.error;
   };
-  $('file').onchange = async (e) => {
-    const f = e.target.files && e.target.files[0];
+  $('file').addEventListener('change', async (e) => {
+    const f = e.target.files[0];
     if (!f) return;
     $('status').textContent = 'loading ' + f.name + '…';
     const buf = new Uint8Array(await f.arrayBuffer());
@@ -196,15 +186,16 @@
     for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
     // A plain string, not JSON: parsing a long JSON string costs the program ~55× its size.
     await request('add:' + f.name.replace(/\.(wav|aiff?|aifc|flac|mp3|m4a|ogg|oga|opus)$/i, '').replace(/\n/g, ' ') + '\n' + btoa(bin));
-    e.target.value = '';
-  };
+    // Assigning does not fire change: the zone is ready for the next song.
+    e.target.files = [];
+  });
 
   call('state');
   // The page only paints: while it is on screen it asks for the position; in the
   // background its timers stop, the program does not.
   setInterval(() => { if (!document.hidden) call('state'); }, 500);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) call('state'); });
-})();
+}
 </script>
 </body>
 </html>
