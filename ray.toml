@@ -14,7 +14,9 @@ version = "0.1.0"
 # so the app's own base64 decoder is gone.
 # 1.27.55: `audio.flush` cuts with a ramp at every rate on CoreAudio (#171, #173).
 # 1.27.58: `std/media` puts the player in the system's Now Playing (#170).
-raylang = "1.27.58"
+# 1.27.61: on Android `std/media` is safe from any fiber, so the audio actor can publish (#176);
+# Linux (MPRIS, 1.27.59) and Windows (SMTC, 1.27.60) were already covered.
+raylang = "1.27.61"
 
 # The page (www/) is plain HTML served by the process itself over ray://app; no Vite, no
 # local server. `ui.mount_embed_at("", "www")` puts www/index.html at ray://app/index.html.

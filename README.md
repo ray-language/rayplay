@@ -88,11 +88,12 @@ con `std/audio`, y la página es solo la interfaz.
   `ray.toml` (raylang 1.27.19, M324): sesión `playback` + `UIBackgroundModes = audio` en iOS,
   *foreground service* `mediaPlayback` en Android. La página deja de pedir el estado cuando no
   se ve (sus timers se paran igualmente); el programa ni se entera.
-- **Now Playing** (`std/media`, raylang 1.27.58, hallazgo #170): el actor publica la pista
+- **Now Playing** (`std/media`, raylang 1.27.58, hallazgo #170; en Android desde 1.27.61, #176):
+  en macOS, iOS, Android, Linux y Windows. El actor publica la pista
   —título, artista, álbum y carátula si el archivo los trae; si no, su nombre y «RayPlay»— cada
   vez que cambia lo que se ve (otra pista, pausa, reanudar, seek), nunca mientras suena, y no
-  antes de que suene algo. Los comandos de la pantalla de bloqueo, el Centro de Control, los
-  auriculares y las teclas multimedia llegan como eventos `media` y `remote` los pasa al actor
+  antes de que suene algo. Los comandos de la pantalla de bloqueo, el Centro de Control, la
+  notificación multimedia de Android, los auriculares y las teclas multimedia llegan como eventos `media` y `remote` los pasa al actor
   (`play`/`pause` a `Resume`/`Pause`, que no hacen nada si ya está en ese estado); el segundo
   `seek` de cada arrastre, que macOS manda repetido, se descarta. Las etiquetas las lee `tags`:
   ID3v2.2–2.4, comentarios y bloque `PICTURE` de FLAC, comentarios de Ogg Vorbis y Opus
@@ -147,6 +148,7 @@ el emulador Android.
 | Segundo plano en iPhone real | **verificado** (29 sep 2026): Play, cambio de app, vuelta: el audio sigue y el display muestra lo reproducido en segundo plano |
 | MP3, FLAC, AIFF, ALAC, AAC, Ogg Vorbis y Opus en iPhone real, hasta 24/192 | **verificado** (12 oct 2026, iPhone 12, app nativa): MP3 y FLAC de 24 bits y 5 min cargados con el `<input type=file>` suenan limpios, también en segundo plano; con la decodificación en streaming empiezan al momento y el seek funciona en ambos sentidos. Con raylang 1.27.49, lo mismo; y un AIFF de 24 bits de `afconvert` (13 oct 2026). Un ALAC de 16 bits (.m4a de `afconvert`) suena bien, con los WAV y AIFF ya leídos directamente del archivo (13 oct 2026). Un AAC-LC de 6 s a 128 kb/s y otro de 5 min a 256 kb/s (.m4a de `afconvert`) suenan bien y el seek funciona (13 oct 2026); lo mismo con el decodificador acelerado. Un Ogg Vorbis de 6 s (q0.4) y otro de 5 min (de libvorbis) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). FLAC y ALAC de 24 bits a 96 y 192 kHz (un groove sintético de 33 s, bit a bit iguales a ffmpeg al pasar a 16 bits) suenan bien; con música rítmica, cada salto dejaba oír medio segundo de la posición vieja encima de la nueva al cerrar y reabrir la salida, y ahora el salto sigue en la misma salida con fundidos de 10 ms: los saltos suenan naturales y la traza de audio no da cortes (13 oct 2026). Next, el paso solo de una pista a la siguiente, pausa y reanudación ya no se solapan: con la misma frecuencia y canales la salida sigue (sin hueco entre pistas) y si no, se cierra cuando ha sonado su cola (13 oct 2026). Con el dither de 24 a 16 bits, los FLAC y ALAC de 24 bits suenan como antes (13 oct 2026). Tres Opus de libopus (el groove a 128 y 24 kb/s, y entero a 96 kb/s) se eligen en el selector, suenan bien y el seek funciona (13 oct 2026). Con raylang 1.27.50 y la subida decodificada con `base64_decode_bytes`, una canción grande cargada con el botón entra y suena igual (13 oct 2026) |
 | Now Playing en iPhone real y en el Mac | **verificado** (15 oct 2026, iPhone 12, app nativa, raylang 1.27.58): la pantalla de bloqueo y el Centro de Control muestran la pista con título, artista y carátula (MP3 con ID3v2.3, FLAC de 24 bits y AAC en M4A, carátula PNG de 600×600); pausa, reanudar, siguiente, anterior, la barra y los AirPods mueven el reproductor y la página lo refleja; una publicación por cambio. En el Mac (repro con un tono sonando): Centro de Control, AirPods, teclado, barra, siguiente y anterior |
+| Now Playing en Android | **verificado** (16 oct 2026, emulador arm64, app nativa con la shell de raylang 1.27.61): al dar play la sesión sale `PLAYING` con la pista; la notificación multimedia muestra título, artista, anterior/pausa/siguiente y la barra; `cmd media_session dispatch` pause/play/next/previous, la tecla multimedia y arrastrar la barra mueven el reproductor. Con 1.27.59 y 1.27.60 la app moría al dar play (#176) |
 
 ## Limitaciones
 
@@ -177,8 +179,8 @@ el emulador Android.
   sin copiarlos (#161). Un WAV de 56 MB de 24 bits llega a unos 470 MB
   durante la subida (casi todo, la petición y su base64) y tarda 0,3 s en nativo; en la shell de desarrollo (VM) no cabe.
 - Sin cola persistente: la lista vuelve a las tres pistas al relanzar.
-- Now Playing solo en macOS e iOS: en Android y Linux `std/media` devuelve `Err` (aún no hay
-  `MediaSession` ni MPRIS) y la app sigue sin él. No se leen las etiquetas de WAV y AIFF (chunks
+- Now Playing en Linux y Windows solo se comprobó con un repro (MPRIS y SMTC), no con la app
+  entera, que en esas plataformas no se ha medido. No se leen las etiquetas de WAV y AIFF (chunks
   `LIST`/`id3 `), ni las de un MP3 con ID3v2 desincronizado entero (raro).
 
 ## Hallazgos de dogfood
@@ -238,3 +240,7 @@ Ver también `../findings/` (los números son los de allí) y el README de Ray80
     chasqueaba a 44,1 y 48 kHz (#171) y, con 1.27.54, a cualquier frecuencia (#173); desde 1.27.55
     lleva rampa a cualquier frecuencia, pero solo en CoreAudio (#174), y en los demás backends
     se mantienen los fundidos propios.
+13. **En Android, la app moría al dar play** (raylang 1.27.59): `std/media` llamado desde un
+    fiber de `spawn` tumbaba el proceso con SIGSEGV (en 1.27.60, con «stack corruption detected»
+    antes), y el reproductor publica desde su actor. Desde `main` funcionaba. Ver #176.
+    **Corregido en 1.27.61**: se puede llamar desde cualquier fiber.
