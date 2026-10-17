@@ -16,7 +16,9 @@ version = "0.1.0"
 # 1.27.58: `std/media` puts the player in the system's Now Playing (#170).
 # 1.27.61: on Android `std/media` is safe from any fiber, so the audio actor can publish (#176);
 # Linux (MPRIS, 1.27.59) and Windows (SMTC, 1.27.60) were already covered.
-raylang = "1.27.61"
+# 1.27.62: the Android shell follows the system's dark mode, so the ray-elements page does
+# too (#177).
+raylang = "1.27.62"
 
 # The page (www/) is plain HTML served by the process itself over ray://app; no Vite, no
 # local server. `ui.mount_embed_at("", "www")` puts www/index.html at ray://app/index.html.
@@ -39,4 +41,4 @@ background_audio = true
 background_audio = true
 
 [dependencies]
-elements = "^0.5.1"
+elements = "^0.5.2"

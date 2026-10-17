@@ -3,6 +3,6 @@
 
 [elements]
 url = "https://github.com/ray-language/elements"
-ref = "v0.5.1"
-commit = "428a05a0a702bc7fa825d35179e67adf6d5860d6"
-hash = "sha256:6949f556ab23e7ded3640a8bf2deca07c080f2921d88a0b9f7e975a1bc353ecc"
+ref = "v0.5.2"
+commit = "9ef8d524fba2c08ce817035655cdb33227c4a927"
+hash = "sha256:8b93b2dc6fd1b9bcfdb8ae82e4520a4371c0acad6f4d7570f0c20b2206794183"
